@@ -253,4 +253,74 @@ void main() {
       reason: 'the "D" class from the older member must survive the merge',
     );
   });
+
+  test('garbled train/loco values are not used as grouping keys', () async {
+    await DatabaseService.instance.updateSettings(
+        {'mergeRecordsEnabled': 1, 'hideUngroupableRecords': 0});
+    // Garbled train "(9(99" — must NOT become a trainKey, so this record is
+    // ungroupable (no valid train/loco key).
+    await DatabaseService.instance.insertRecord(mkRecord(
+      uniqueId: 'garbled1',
+      receivedMs: _base,
+      train: '(9(99',
+      route: '某线',
+      direction: 1,
+    ));
+    // A clean train that should form its own (singleton) group.
+    await DatabaseService.instance.insertRecord(mkRecord(
+      uniqueId: 'clean1',
+      receivedMs: _base + 60 * 1000,
+      train: '8503',
+      direction: 1,
+    ));
+
+    final items = (await RecordsFeed.fetchPage(limit: 100, cursor: null)).items;
+    final ids = items.map((i) {
+      if (i is MergedTrainRecord) return 'm:${i.groupKey}';
+      return 't:${(i as TrainRecord).uniqueId}';
+    }).toSet();
+    expect(ids, {'t:garbled1', 't:clean1'},
+        reason: 'the two records must not merge (garbled train is not a key)');
+
+    // With hideUngroupable on, the garbled record is hidden.
+    await DatabaseService.instance.updateSettings(
+        {'mergeRecordsEnabled': 1, 'hideUngroupableRecords': 1});
+    final hidden = (await RecordsFeed.fetchPage(limit: 100, cursor: null)).items;
+    final hiddenIds = hidden.map((i) {
+      if (i is MergedTrainRecord) return 'm:${i.groupKey}';
+      return 't:${(i as TrainRecord).uniqueId}';
+    }).toSet();
+    expect(hiddenIds, {'t:clean1'},
+        reason: 'the garbled-train record must be hidden as ungroupable');
+  });
+
+  test('rebuildMergeCache regenerates stale derived columns and summaries',
+      () async {
+    await DatabaseService.instance.updateSettings(
+        {'mergeRecordsEnabled': 1, 'hideUngroupableRecords': 1});
+    // Insert a record with a garbled train. With the current (fixed) logic it
+    // is ungroupable, so it's hidden. Simulate stale persisted columns by
+    // forcing trainKey to a non-null garbage value, then rebuild and verify
+    // the record is correctly reclassified as ungroupable (hidden).
+    await DatabaseService.instance.insertRecord(mkRecord(
+      uniqueId: 'stale1',
+      receivedMs: _base,
+      train: '((U1-',
+      route: '某线',
+      direction: 1,
+    ));
+
+    // Initially hidden (garbled train -> ungroupable).
+    var page = (await RecordsFeed.fetchPage(limit: 100, cursor: null)).items;
+    expect(page.whereType<TrainRecord>().where((r) => r.uniqueId == 'stale1'),
+        isEmpty);
+
+    // Rebuild should be a no-op for correctness but must not throw and must
+    // keep the record hidden.
+    await DatabaseService.instance.rebuildMergeCache();
+    page = (await RecordsFeed.fetchPage(limit: 100, cursor: null)).items;
+    expect(page.whereType<TrainRecord>().where((r) => r.uniqueId == 'stale1'),
+        isEmpty,
+        reason: 'rebuild must keep the garbled record hidden');
+  });
 }

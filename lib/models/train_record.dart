@@ -210,18 +210,36 @@ class TrainRecord {
   }
 
   /// Normalized grouping key for the train number, or null when invalid.
-  String? get trainKey {
-    final value = train.trim();
-    final valid =
-        value.isNotEmpty && value != '<NUL>' && !value.contains('-----');
-    return valid ? value : null;
-  }
+  String? get trainKey => isValidKeyValue(train) ? train.trim() : null;
 
   /// Normalized grouping key for the locomotive number, or null when invalid.
-  String? get locoKey {
-    final value = loco.trim();
-    final valid = value.isNotEmpty && value != '<NUL>';
-    return valid ? value : null;
+  String? get locoKey => isValidKeyValue(loco) ? loco.trim() : null;
+
+  /// Whether a raw field value is clean enough to be used as a merge grouping
+  /// key. Mirrors [MergeService]'s "good value" rule: rejects empty, `<NUL>`,
+  /// `NA`, `NUL`, the per-character corruption markers `*` `(` `)`, and pure
+  /// dash/dot/placeholder runs, by requiring at least one alphanumeric or CJK
+  /// rune and none of those corruption markers. This keeps garbled values
+  /// like `(9(99`, `((U1-`, `24800(74`, `85**` from becoming grouping keys —
+  /// such records fall through to "ungroupable" and are hidden when the
+  /// hide-ungroupable option is on.
+  static bool isValidKeyValue(String? value) {
+    if (value == null) return false;
+    final v = value.replaceAll('<NUL>', '').trim();
+    if (v.isEmpty) return false;
+    final upper = v.toUpperCase();
+    if (upper == 'NA' || upper == 'NUL') return false;
+    if (v.contains('*') || v.contains('(') || v.contains(')')) return false;
+    return v.runes.any(_isContentRune);
+  }
+
+  static bool _isContentRune(int r) {
+    if (r >= 0x30 && r <= 0x39) return true; // 0-9
+    if (r >= 0x41 && r <= 0x5A) return true; // A-Z
+    if (r >= 0x61 && r <= 0x7A) return true; // a-z
+    if (r >= 0x4E00 && r <= 0x9FFF) return true; // CJK Unified Ideographs
+    if (r >= 0x3400 && r <= 0x4DBF) return true; // CJK Extension A
+    return false;
   }
 
   /// Derived columns persisted on train_records for SQL-side filtering.

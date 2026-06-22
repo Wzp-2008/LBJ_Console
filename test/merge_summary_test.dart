@@ -64,6 +64,14 @@ void main() {
       '85**',
       '30°**.****′',
       'D*',
+      // Paren-corrupted / garbled values — `(9(99`, `((U1-` etc.
+      '(9(99',
+      '((U1-',
+      '4)-52',
+      '24800(74',
+      '1U(803-8',
+      '()02',
+      '4(',
     ];
     for (final v in bad) {
       test('rejects placeholder: ${v.isEmpty ? "(empty)" : v}', () {

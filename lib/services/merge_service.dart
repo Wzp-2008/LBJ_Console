@@ -7,35 +7,18 @@ class MergeService {
   /// Whether [value] carries real, displayable content.
   ///
   /// A value is "good" iff, after stripping `<NUL>` and trimming, it is
-  /// non-empty, not the `NA`/`NUL` sentinel, contains no `*` (the
-  /// per-character corruption marker the LBJ transmission uses for undecoded
-  /// chars — e.g. `笕杭****`, `**杭线`, `沪昆****`), and contains at least one
-  /// alphanumeric or CJK rune. This rejects every observed placeholder (`""`,
-  /// `"<NUL>"`, `"-----"`, `"----.-"`, `"*****"`, `"NA"`, mixed `"笕杭****"`)
-  /// by testing for real, uncorrupted content rather than enumerating bad
-  /// patterns. Real values never contain `*`.
-  static bool _isGoodValue(String? value) {
-    if (value == null) return false;
-    final v = value.replaceAll('<NUL>', '').trim();
-    if (v.isEmpty) return false;
-    final upper = v.toUpperCase();
-    if (upper == 'NA' || upper == 'NUL') return false;
-    if (v.contains('*')) return false;
-    return v.runes.any(_isContentRune);
-  }
+  /// non-empty, not the `NA`/`NUL` sentinel, contains none of the per-character
+  /// corruption markers the LBJ transmission emits for undecoded/garbled chars
+  /// (`*`, `(`, `)`), and contains at least one alphanumeric or CJK rune. This
+  /// rejects every observed placeholder and garbled value (`""`, `"<NUL>"`,
+  /// `"-----"`, `"----.-"`, `"*****"`, `"NA"`, mixed `"笕杭****"`, `"(9(99"`,
+  /// `"((U1-"`, `"24800(74"`) by testing for real, uncorrupted content rather
+  /// than enumerating bad patterns. Real values never contain `*`, `(` or `)`.
+  static bool _isGoodValue(String? value) => TrainRecord.isValidKeyValue(value);
 
   /// Test accessor for [_isGoodValue].
   @visibleForTesting
   static bool isGoodValue(String? value) => _isGoodValue(value);
-
-  static bool _isContentRune(int r) {
-    if (r >= 0x30 && r <= 0x39) return true; // 0-9
-    if (r >= 0x41 && r <= 0x5A) return true; // A-Z
-    if (r >= 0x61 && r <= 0x7A) return true; // a-z
-    if (r >= 0x4E00 && r <= 0x9FFF) return true; // CJK Unified Ideographs
-    if (r >= 0x3400 && r <= 0x4DBF) return true; // CJK Extension A
-    return false;
-  }
 
   /// Newest-first scan: returns the first record's value that is "good";
   /// if no member has a good value, returns `''` (the display layer skips

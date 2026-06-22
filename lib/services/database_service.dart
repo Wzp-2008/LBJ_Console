@@ -1154,15 +1154,19 @@ END)''';
 
   /// Rebuilds the merge-display cache from the current `train_records`.
   ///
-  /// Use after a logic change to `MergeService.buildSummaryRecord` (which
-  /// produces the cached `summaryJson`): existing cache rows still hold the
-  /// old summaries, so merged cards keep showing stale field values until the
-  /// cache is rebuilt. This regenerates every group + summary from scratch,
-  /// then notifies settings listeners so the history list reloads with the
-  /// fresh summaries.
+  /// Use after a logic change to `MergeService.buildSummaryRecord` or to
+  /// `TrainRecord.trainKey`/`locoKey` (which produce the cached `summaryJson`
+  /// and the persisted `trainKey`/`locoKey`/`isTimeOnly` columns): existing
+  /// cache rows still hold the old summaries, and existing `train_records`
+  /// rows still hold the old derived columns, so merged cards keep showing
+  /// stale field values and garbled keys (e.g. `(9(99`) keep records grouped
+  /// / visible until refreshed. This regenerates the derived columns from
+  /// scratch, then every group + summary, and notifies settings listeners so
+  /// the history list reloads with the fresh data.
   Future<void> rebuildMergeCache() async {
     await _runInDbQueue(() async {
       final db = await database;
+      await _backfillDerivedColumns(db);
       await DisplayGroupCache.rebuild(
         db,
         recordsTable: trainRecordsTable,
