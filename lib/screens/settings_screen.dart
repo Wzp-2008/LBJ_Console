@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/background_service.dart';
+import 'package:lbjconsole/services/notification_service.dart';
 import 'package:lbjconsole/services/audio_input_service.dart';
 import 'package:lbjconsole/services/rtl_tcp_service.dart';
 import 'package:lbjconsole/themes/app_theme.dart';
@@ -465,10 +466,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 Switch(
                   value: _notificationsEnabled,
-                  onChanged: (value) {
+                  onChanged: (value) async {
                     setState(() {
                       _notificationsEnabled = value;
                     });
+                    // Sync the user-intent flag so the toggle actually gates
+                    // notifications, then request the runtime permission when
+                    // turning on (Android 13+).
+                    await NotificationService.instance.enableNotifications(value);
+                    if (value) {
+                      final granted =
+                          await NotificationService.instance.requestPermission();
+                      if (!granted && mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content: Text('通知权限未授予，请在系统设置中开启通知权限')),
+                        );
+                      }
+                    }
                     _saveImmediately();
                   },
                   activeThumbColor: Theme.of(context).colorScheme.primary,

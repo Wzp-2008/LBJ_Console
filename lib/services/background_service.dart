@@ -5,6 +5,7 @@ import 'dart:ui';
 import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:lbjconsole/services/ble_service.dart';
+import 'package:lbjconsole/services/notification_service.dart';
 
 const String _notificationChannelId = 'lbj_console_channel';
 const String _notificationChannelName = 'LBJ Console 后台服务';
@@ -183,6 +184,11 @@ class BackgroundService {
     final service = FlutterBackgroundService();
 
     if (Platform.isAndroid) {
+      // The foreground service needs a persistent notification; on Android
+      // 13+ that requires the POST_NOTIFICATIONS runtime permission, so
+      // request it before starting (covers both the settings toggle and the
+      // auto-start path in MainScreen).
+      await NotificationService.instance.requestPermission();
       final isRunning = await service.isRunning();
       if (!isRunning) {
         service.startService();

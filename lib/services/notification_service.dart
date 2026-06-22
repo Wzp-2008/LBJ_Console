@@ -1,8 +1,12 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:lbjconsole/models/train_record.dart';
 
 class NotificationService {
+  static final NotificationService instance = NotificationService._();
+  NotificationService._();
+
   static const String channelId = 'lbj_messages';
   static const String channelName = 'LBJ Messages';
   static const String channelDescription = 'Receive LBJ messages';
@@ -10,7 +14,13 @@ class NotificationService {
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
   int _notificationId = 1000;
+
+  /// User intent: whether the user wants notifications (settings toggle).
   bool _notificationsEnabled = true;
+  /// System capability: whether the OS currently allows this app to post
+  /// notifications. On Android 13+ this reflects the POST_NOTIFICATIONS
+  /// runtime permission. Cached here and refreshed on init / request.
+  bool _permissionGranted = false;
 
   final StreamController<bool> _settingsController =
       StreamController<bool>.broadcast();
@@ -33,8 +43,9 @@ class NotificationService {
 
     await _createNotificationChannel();
 
-    _notificationsEnabled = await isNotificationEnabled();
-    _settingsController.add(_notificationsEnabled);
+    // Reflect the actual system permission (Android 13+ may have it denied).
+    _permissionGranted = await _systemNotificationsEnabled();
+    _settingsController.add(_permissionGranted);
   }
 
   Future<void> _createNotificationChannel() async {
@@ -53,8 +64,43 @@ class NotificationService {
         ?.createNotificationChannel(channel);
   }
 
+  /// Requests the Android POST_NOTIFICATIONS runtime permission (Android 13+).
+  /// Required for train notifications to actually show and for the background
+  /// foreground-service notification to display. Safe to call repeatedly —
+  /// the system only shows the prompt the first time; later calls return the
+  /// stored decision. Returns whether notifications may be shown.
+  Future<bool> requestPermission() async {
+    if (!Platform.isAndroid) {
+      _permissionGranted = true;
+      _settingsController.add(_permissionGranted);
+      return true;
+    }
+    final android = _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+    if (android == null) {
+      _permissionGranted = false;
+      _settingsController.add(_permissionGranted);
+      return false;
+    }
+    final granted = await android.requestNotificationsPermission() ?? false;
+    _permissionGranted = granted;
+    _settingsController.add(_permissionGranted);
+    return granted;
+  }
+
+  /// Whether the system currently allows this app to post notifications.
+  Future<bool> _systemNotificationsEnabled() async {
+    if (!Platform.isAndroid) return true;
+    final android = _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+    return await android?.areNotificationsEnabled() ?? false;
+  }
+
   Future<void> showTrainNotification(TrainRecord record) async {
     if (!_notificationsEnabled) return;
+    if (!_permissionGranted) return;
 
     if (!_isValidValue(record.train) ||
         !_isValidValue(record.route) ||

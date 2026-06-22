@@ -223,7 +223,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   late final BLEService _bleService;
   late final RtlTcpService _rtlTcpService;
-  final NotificationService _notificationService = NotificationService();
+  final NotificationService _notificationService = NotificationService.instance;
   final DatabaseService _databaseService = DatabaseService.instance;
 
   StreamSubscription? _connectionSubscription;
@@ -431,6 +431,17 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   Future<void> _initializeServices() async {
     await _notificationService.initialize();
+
+    // Sync the user's notification preference (settings toggle) into the
+    // service so the toggle actually gates notifications across restarts, and
+    // ensure the Android 13+ runtime permission is granted when the user has
+    // notifications enabled (idempotent — the system only prompts once).
+    final settings = await DatabaseService.instance.getAllSettings() ?? {};
+    final notificationsOn = (settings['notificationEnabled'] ?? 1) == 1;
+    _notificationService.enableNotifications(notificationsOn);
+    if (notificationsOn) {
+      await _notificationService.requestPermission();
+    }
 
     _dataSubscription = _bleService.dataStream.listen((record) {
       if (_inputSource == InputSource.bluetooth) {
