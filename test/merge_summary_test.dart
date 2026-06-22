@@ -55,6 +55,15 @@ void main() {
       '-.-.-',
       '......',
       '///',
+      // Per-character corruption markers (`*` = undecoded char) — the value
+      // has real content but is partially corrupted, so a clean sibling value
+      // should win.
+      '笕杭****',
+      '**杭线',
+      '沪昆****',
+      '85**',
+      '30°**.****′',
+      'D*',
     ];
     for (final v in bad) {
       test('rejects placeholder: ${v.isEmpty ? "(empty)" : v}', () {
@@ -236,6 +245,54 @@ void main() {
         'D11',
         reason: 'the class prefix from the older member must survive',
       );
+    });
+
+    test('a star-corrupted route is skipped in favor of a clean sibling', () {
+      // The reported 8503 scenario: 4 records merge (same train). Two carry a
+      // clean route "笕杭线"; the others carry star-corrupted "笕杭****". The
+      // summary must show "笕杭线", not "笕杭****".
+      final records = [
+        _rec(uniqueId: 'a', receivedMs: 4000, train: '8503', route: '笕杭****'),
+        _rec(uniqueId: 'b', receivedMs: 3000, train: '8503', route: '笕杭线'),
+        _rec(uniqueId: 'c', receivedMs: 2000, train: '8503', route: '笕杭****'),
+        _rec(uniqueId: 'd', receivedMs: 1000, train: '8503', route: '笕杭线'),
+      ];
+      final s = MergeService.buildSummaryRecord(records);
+      expect(s.route, '笕杭线',
+          reason: 'star-corrupted route must not shadow the clean value');
+    });
+
+    test('a star-corrupted train is skipped in favor of a clean train', () {
+      final records = [
+        _rec(uniqueId: 'a', receivedMs: 1000, train: '85**', lbjClass: 'D'),
+        _rec(uniqueId: 'b', receivedMs: 900, train: '8503', lbjClass: 'D'),
+      ];
+      final s = MergeService.buildSummaryRecord(records);
+      expect(s.train, '8503');
+      expect(s.lbjClass, 'D');
+      expect(TrainRecord.computeFullTrainNumber(s.lbjClass, s.train), 'D8503');
+    });
+
+    test('star-corrupted positionInfo / loco are skipped', () {
+      final records = [
+        _rec(
+          uniqueId: 'a',
+          receivedMs: 1000,
+          train: '8503',
+          loco: '24700***',
+          positionInfo: '30°**.****′ 120°**.****′',
+        ),
+        _rec(
+          uniqueId: 'b',
+          receivedMs: 900,
+          train: '8503',
+          loco: '24700331',
+          positionInfo: '30°17.9731′ 120°10.9305′',
+        ),
+      ];
+      final s = MergeService.buildSummaryRecord(records);
+      expect(s.loco, '24700331');
+      expect(s.positionInfo, '30°17.9731′ 120°10.9305′');
     });
 
     test('direction prefers 0/1 over 3 (未知)', () {

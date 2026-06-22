@@ -1106,8 +1106,7 @@ END)''';
     };
   }
 
-  Future<String?> backupDatabase() async {
-    try {
+  Future<String?> backupDatabase() async {try {
       final db = await database;
       final directory = await getApplicationDocumentsDirectory();
       final originalPath = db.path;
@@ -1151,6 +1150,28 @@ END)''';
       );
       _notifyRecordDeleted(uniqueIds);
     });
+  }
+
+  /// Rebuilds the merge-display cache from the current `train_records`.
+  ///
+  /// Use after a logic change to `MergeService.buildSummaryRecord` (which
+  /// produces the cached `summaryJson`): existing cache rows still hold the
+  /// old summaries, so merged cards keep showing stale field values until the
+  /// cache is rebuilt. This regenerates every group + summary from scratch,
+  /// then notifies settings listeners so the history list reloads with the
+  /// fresh summaries.
+  Future<void> rebuildMergeCache() async {
+    await _runInDbQueue(() async {
+      final db = await database;
+      await DisplayGroupCache.rebuild(
+        db,
+        recordsTable: trainRecordsTable,
+      );
+    });
+    final currentSettings = await getAllSettings();
+    if (currentSettings != null) {
+      _notifySettingsChanged(currentSettings);
+    }
   }
 
   final List<Function(List<String>)> _recordDeleteListeners = [];

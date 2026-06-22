@@ -7,19 +7,20 @@ class MergeService {
   /// Whether [value] carries real, displayable content.
   ///
   /// A value is "good" iff, after stripping `<NUL>` and trimming, it is
-  /// non-empty, not the `NA`/`NUL` sentinel, and contains at least one
-  /// alphanumeric or CJK rune. Testing for the *presence of real content*
-  /// rejects every observed placeholder (`""`, `"<NUL>"`, `"-----"`,
-  /// `"----.-"`, `"*****"`, `"NA"`, `"NUL"`, …) without enumerating them, so
-  /// new dash/asterisk variants are rejected automatically. Real values
-  /// (`"57908"`, `"K"`, `"京九线"`, `"30°18.1522′ 120°10.9625′"`, `"5"`,
-  /// `"41010559"`) always contain an alphanumeric or CJK rune.
+  /// non-empty, not the `NA`/`NUL` sentinel, contains no `*` (the
+  /// per-character corruption marker the LBJ transmission uses for undecoded
+  /// chars — e.g. `笕杭****`, `**杭线`, `沪昆****`), and contains at least one
+  /// alphanumeric or CJK rune. This rejects every observed placeholder (`""`,
+  /// `"<NUL>"`, `"-----"`, `"----.-"`, `"*****"`, `"NA"`, mixed `"笕杭****"`)
+  /// by testing for real, uncorrupted content rather than enumerating bad
+  /// patterns. Real values never contain `*`.
   static bool _isGoodValue(String? value) {
     if (value == null) return false;
     final v = value.replaceAll('<NUL>', '').trim();
     if (v.isEmpty) return false;
     final upper = v.toUpperCase();
     if (upper == 'NA' || upper == 'NUL') return false;
+    if (v.contains('*')) return false;
     return v.runes.any(_isContentRune);
   }
 
@@ -67,16 +68,8 @@ class MergeService {
   static TrainRecord? _recordWithBestFullTrain(List<TrainRecord> records) {
     TrainRecord? trainOnly;
     for (final record in records) {
-      final train = record.train.trim();
-      if (train.isEmpty ||
-          train == '<NUL>' ||
-          train.contains('-----') ||
-          train.toUpperCase() == 'NA') {
-        continue;
-      }
-      final cls = record.lbjClass.trim();
-      final hasClass = cls.isNotEmpty && cls.toUpperCase() != 'NA';
-      if (hasClass) {
+      if (!_isGoodValue(record.train)) continue;
+      if (_isGoodValue(record.lbjClass)) {
         // Newest member with a complete class+train form.
         return record;
       }

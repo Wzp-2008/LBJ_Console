@@ -609,6 +609,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 12),
             _buildActionButton(
+              icon: Icons.cached,
+              title: '重建合并缓存',
+              subtitle: '修复合并卡片显示陈旧/错误数据',
+              onTap: _rebuildMergeCache,
+            ),
+            const SizedBox(height: 12),
+            _buildActionButton(
               icon: Icons.clear_all,
               title: '清空数据',
               subtitle: '删除所有记录和设置',
@@ -839,8 +846,42 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  Future<void> _clearAllData() async {
+  Future<void> _rebuildMergeCache() async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
+
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Text('正在重建合并缓存...'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    try {
+      await _databaseService.rebuildMergeCache();
+      if (mounted) Navigator.pop(context);
+      scaffoldMessenger.showSnackBar(
+        const SnackBar(content: Text('合并缓存已重建')),
+      );
+      // Trigger the history list to reload with the fresh summaries.
+      widget.onSettingsChanged?.call();
+    } catch (e) {
+      if (mounted) Navigator.pop(context);
+      scaffoldMessenger.showSnackBar(
+        SnackBar(content: Text('重建错误：$e')),
+      );
+    }
+  }
+
+  Future<void> _clearAllData() async {final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     final result = await showDialog<bool>(
       context: context,
