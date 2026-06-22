@@ -615,29 +615,32 @@ class HistoryScreenState extends State<HistoryScreen> {
         final start = rowIndex * cols;
         final end = math.min(start + cols, _displayItems.length);
 
-        // Build per-cell widgets (each an Expanded + horizontal padding +
-        // KeyedSubtree(card)) shared by both layouts below.
-        Widget cell(int col, Object item) => Expanded(
+        // One grid slot: Expanded (equal column width) + horizontal gutter
+        // padding + a KeyedSubtree carrying the stable display key so each
+        // card's state survives reordering. [visible] false renders an
+        // invisible slot that still reserves the column's width — used to keep
+        // column alignment across the two overlayed rows below.
+        Widget slot(int col, Object item, {bool visible = true}) => Expanded(
               child: Padding(
                 padding: EdgeInsets.only(
                     left: col > 0 ? 4.0 : 0, right: col < cols - 1 ? 4.0 : 0),
-                child: KeyedSubtree(
-                  key: _displayItemKey(item),
-                  child: _buildCardForItem(item),
-                ),
+                child: visible
+                    ? KeyedSubtree(
+                        key: _displayItemKey(item),
+                        child: _buildCardForItem(item),
+                      )
+                    : const SizedBox.shrink(),
               ),
             );
 
-        // Detect whether any card in this row is expanded while building the
-        // shared cell list.
+        // Detect whether any card in this row is expanded.
         var hasExpanded = false;
-        final cells = <Widget>[];
         for (var col = 0; col < cols; col++) {
           final idx = start + col;
-          if (idx >= end) continue;
-          final item = _displayItems[idx];
-          if (_isCardExpanded(item)) hasExpanded = true;
-          cells.add(cell(col, item));
+          if (idx < end && _isCardExpanded(_displayItems[idx])) {
+            hasExpanded = true;
+            break;
+          }
         }
 
         final Widget row;
@@ -648,21 +651,57 @@ class HistoryScreenState extends State<HistoryScreen> {
           row = IntrinsicHeight(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: cells,
+              children: [
+                for (var col = 0; col < cols; col++)
+                  if (start + col < end) slot(col, _displayItems[start + col]),
+              ],
             ),
           );
         } else {
-          // A card is expanded: top-align instead of stretching so each card
-          // keeps its natural height. Collapsed siblings stay short instead of
-          // stretching to the expanded card's tall (map) height, and every
-          // card stays in its original grid column. No IntrinsicHeight here —
-          // the Row sizes its own height to the tallest child, and the
-          // expanded card's map lives in a fixed-height SizedBox, so the
-          // unbounded-height intrinsic pass is well-defined either way; we
-          // skip it just to avoid the extra measurement cost on this path.
-          row = Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: cells,
+          // A card is expanded. We want the collapsed siblings to share one
+          // height (the tallest collapsed card, same as the all-collapsed
+          // case) WITHOUT being stretched to the expanded card's taller map
+          // height — and every card must stay in its original grid column.
+          //
+          // A single Row can't do this: IntrinsicHeight+stretch would size the
+          // row to the expanded card and drag the collapsed cards up to it. So
+          // overlay two full-width rows in a Stack, each carrying all `cols`
+          // slots (the matching per-column gutters keep them aligned):
+          //   - collapsed layer: IntrinsicHeight + stretch → collapsed cards
+          //     share one height (their own tallest), staying short.
+          //   - expanded layer: start-aligned, no IntrinsicHeight → expanded
+          //     card(s) take their natural taller height.
+          // Both layers are top-aligned; each card renders in its own column,
+          // so collapsed cards stay equal-height and short while the expanded
+          // card rises above them.
+          final collapsedSlots = <Widget>[];
+          final expandedSlots = <Widget>[];
+          for (var col = 0; col < cols; col++) {
+            final idx = start + col;
+            if (idx >= end) continue;
+            final item = _displayItems[idx];
+            if (_isCardExpanded(item)) {
+              expandedSlots.add(slot(col, item));
+              collapsedSlots.add(slot(col, item, visible: false));
+            } else {
+              collapsedSlots.add(slot(col, item));
+              expandedSlots.add(slot(col, item, visible: false));
+            }
+          }
+          row = Stack(
+            alignment: Alignment.topLeft,
+            children: [
+              IntrinsicHeight(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: collapsedSlots,
+                ),
+              ),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: expandedSlots,
+              ),
+            ],
           );
         }
 
