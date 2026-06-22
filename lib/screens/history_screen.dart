@@ -632,22 +632,19 @@ class HistoryScreenState extends State<HistoryScreen> {
           );
         });
 
-        // When every card in the row is collapsed, stretch them to the row's
-        // tallest card so all cards share one height (no uneven gaps). When
-        // any card is expanded — which may contain a flutter_map with no
-        // intrinsic height — fall back to natural heights; expanded rows are
-        // allowed to be uneven.
-        final row = _rowHasExpandedCard(start, end)
-            ? Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: cells,
-              )
-            : IntrinsicHeight(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: cells,
-                ),
-              );
+        // Stretch every card in the row to the tallest one's height so all
+        // cards share one height (no uneven gaps). Safe even when a card is
+        // expanded — its flutter_map lives in a fixed-height SizedBox, so the
+        // intrinsic-height pass is well-defined. The expanded card is the
+        // tallest, so it stays its natural height; collapsed siblings stretch
+        // to match it (consistent, content top+bottom justified via the card's
+        // Column mainAxisAlignment).
+        final row = IntrinsicHeight(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: cells,
+          ),
+        );
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 8.0),
@@ -655,21 +652,6 @@ class HistoryScreenState extends State<HistoryScreen> {
         );
       },
     );
-  }
-
-  bool _isCardExpanded(Object item) {
-    if (item is TrainRecord) return _expandedStates[item.uniqueId] == true;
-    if (item is MergedTrainRecord) {
-      return _expandedStates[item.groupKey] == true;
-    }
-    return false;
-  }
-
-  bool _rowHasExpandedCard(int start, int end) {
-    for (var i = start; i < end; i++) {
-      if (_isCardExpanded(_displayItems[i])) return true;
-    }
-    return false;
   }
 
   @override
@@ -784,6 +766,9 @@ class HistoryScreenState extends State<HistoryScreen> {
                 padding: const EdgeInsets.all(16.0),
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: isExpanded
+                        ? MainAxisAlignment.start
+                        : MainAxisAlignment.spaceBetween,
                     children: [
                       _buildRecordHeader(displayRecord, isMerged: true),
                       if (mergedRecord.recordCount > 1)
@@ -1037,6 +1022,7 @@ class HistoryScreenState extends State<HistoryScreen> {
   Widget _buildRecordCard(TrainRecord record,
       {bool isSubCard = false, Key? key}) {
     final isSelected = _selectedRecords.contains(record.uniqueId);
+    final isExpanded = _expandedStates[record.uniqueId] ?? false;
 
     return Card(
         key: key,
@@ -1084,12 +1070,14 @@ class HistoryScreenState extends State<HistoryScreen> {
                 padding: const EdgeInsets.all(16.0),
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: isExpanded
+                        ? MainAxisAlignment.start
+                        : MainAxisAlignment.spaceBetween,
                     children: [
                       _buildRecordHeader(record),
                       _buildPositionAndSpeed(record),
                       _buildLocoInfo(record),
-                      if (_expandedStates[record.uniqueId] ?? false)
-                        _buildExpandedContent(record),
+                      if (isExpanded) _buildExpandedContent(record),
                     ]))));
   }
 
