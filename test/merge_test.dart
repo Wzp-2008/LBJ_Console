@@ -207,4 +207,50 @@ void main() {
     expect(s.positionInfo, '30°18.1522′ 120°10.9625′');
     expect(s.direction, 1);
   });
+
+  test('merged card keeps the lbjClass prefix when only an older member has it',
+      () async {
+    // The exact reported scenario: two records merge via train "11" within
+    // 1h. The newer member has an empty lbjClass; the older carries "D".
+    // The collapsed card's summary must show "D11", not "11".
+    await DatabaseService.instance.insertRecord(mkRecord(
+      uniqueId: '1782098408000_2451',
+      receivedMs: 1782098408000,
+      train: '11',
+      lbjClass: 'D',
+      loco: '24700331',
+      locoType: 'FXD1-J',
+      route: '笕杭',
+      direction: 3,
+      speed: '95',
+      position: '195.4',
+    ));
+    await DatabaseService.instance.insertRecord(mkRecord(
+      uniqueId: '1782098432000_8040',
+      receivedMs: 1782098432000, // 24s later -> merges
+      train: '11',
+      lbjClass: '', // newer, no class
+      direction: 3,
+      speed: '101',
+      position: '196.0',
+    ));
+
+    final item = await RecordsFeed.itemContaining(mkRecord(
+      uniqueId: '1782098432000_8040',
+      receivedMs: 1782098432000,
+      train: '11',
+    ));
+    expect(item, isNotNull);
+    final merged = item as MergedTrainRecord;
+    final s = merged.summaryRecord;
+
+    expect(merged.recordCount, 2);
+    expect(s.train, '11');
+    expect(s.lbjClass, 'D');
+    expect(
+      TrainRecord.computeFullTrainNumber(s.lbjClass, s.train),
+      'D11',
+      reason: 'the "D" class from the older member must survive the merge',
+    );
+  });
 }

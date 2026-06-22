@@ -199,6 +199,45 @@ void main() {
       expect(TrainRecord.computeFullTrainNumber(s.lbjClass, s.train), 'D1234');
     });
 
+    test('a newer member with an empty lbjClass must not drop the class',
+        () {
+      // Reproduces the reported bug: two records merge (same train "11", same
+      // loco within 1h). The NEWER member has train "11" but an EMPTY
+      // lbjClass; the OLDER member carries the real class "D". The summary must
+      // surface "D11", not degrade to "11".
+      final records = [
+        _rec(
+          uniqueId: '1782098432000_8040',
+          receivedMs: 1782098432000,
+          train: '11',
+          lbjClass: '', // newer, no class
+          direction: 3,
+          speed: '101',
+          position: '196.0',
+        ),
+        _rec(
+          uniqueId: '1782098408000_2451',
+          receivedMs: 1782098408000,
+          train: '11',
+          lbjClass: 'D', // older, real class
+          loco: '24700331',
+          locoType: 'FXD1-J',
+          route: '笕杭',
+          direction: 3,
+          speed: '95',
+          position: '195.4',
+        ),
+      ];
+      final s = MergeService.buildSummaryRecord(records);
+      expect(s.train, '11');
+      expect(s.lbjClass, 'D');
+      expect(
+        TrainRecord.computeFullTrainNumber(s.lbjClass, s.train),
+        'D11',
+        reason: 'the class prefix from the older member must survive',
+      );
+    });
+
     test('direction prefers 0/1 over 3 (未知)', () {
       final records = [
         _rec(uniqueId: 'a', receivedMs: 1000, direction: 3),

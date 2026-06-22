@@ -51,14 +51,38 @@ class MergeService {
     return '';
   }
 
+  /// Picks the member that contributes `train` + `lbjClass` to the summary, so
+  /// the two stay sourced from one record (no Frankenstein full train
+  /// number).
+  ///
+  /// Preference order (newest-first within each tier):
+  /// 1. A record with both a valid train AND a real (non-empty, non-NA)
+  ///    lbjClass — i.e. a complete combined form like "D11".
+  /// 2. A record with a valid train but no class (form like "11").
+  /// 3. null — no member has a usable train.
+  ///
+  /// Tier 1 over tier 2 is what keeps the class prefix: a newer member with
+  /// an empty lbjClass must not shadow an older member that carries the real
+  /// class (otherwise "D11" degrades to "11").
   static TrainRecord? _recordWithBestFullTrain(List<TrainRecord> records) {
+    TrainRecord? trainOnly;
     for (final record in records) {
-      if (TrainRecord.computeFullTrainNumber(record.lbjClass, record.train)
-          .isNotEmpty) {
+      final train = record.train.trim();
+      if (train.isEmpty ||
+          train == '<NUL>' ||
+          train.contains('-----') ||
+          train.toUpperCase() == 'NA') {
+        continue;
+      }
+      final cls = record.lbjClass.trim();
+      final hasClass = cls.isNotEmpty && cls.toUpperCase() != 'NA';
+      if (hasClass) {
+        // Newest member with a complete class+train form.
         return record;
       }
+      trainOnly ??= record;
     }
-    return null;
+    return trainOnly;
   }
 
   /// Builds the aggregated summary shown on a merged card. [records] must be
