@@ -1,5 +1,7 @@
 import 'package:flutter/services.dart';
 
+import 'package:lbjconsole/util/loco_type_util.dart';
+
 class LocoInfoUtil {
   static final List<LocoInfo> _locoData = [];
   static bool _initialized = false;
@@ -63,27 +65,70 @@ class LocoInfoUtil {
     return fields;
   }
 
+  static int? _parseLocoNumber(String number) {
+    final cleanNumber = number.trim().replaceAll('-', '').replaceAll(' ', '');
+    if (cleanNumber.isEmpty) return null;
+
+    if (cleanNumber.length <= 6) {
+      return int.tryParse(cleanNumber);
+    }
+
+    return int.tryParse(cleanNumber.substring(cleanNumber.length - 4));
+  }
+
+  static String _formatInfo(LocoInfo info) {
+    final buffer = StringBuffer(info.owner);
+    if (info.alias.isNotEmpty) {
+      buffer.write(' - ${info.alias}');
+    }
+    if (info.manufacturer.isNotEmpty) {
+      buffer.write(' - ${info.manufacturer}');
+    }
+    return buffer.toString();
+  }
+
+  static LocoInfo? _findMatchingInfo(String model, int numberInt) {
+    for (final info in _locoData) {
+      if (info.model == model &&
+          numberInt >= info.start &&
+          numberInt <= info.end) {
+        return info;
+      }
+    }
+    return null;
+  }
+
+  /// Resolve owner info from raw loco number, aligned with [LocoTypeUtil.queryTypeNameAndId].
+  static String? getLocoInfoForRecord({
+    required String locoType,
+    required String loco,
+  }) {
+    final locoNo = loco.trim();
+    if (locoNo.isEmpty || locoNo == '<NUL>') return null;
+
+    final parsed = LocoTypeUtil().queryTypeNameAndId(locoNo);
+    if (parsed != null) {
+      final result = getLocoInfoDisplay(parsed.$1, parsed.$2);
+      if (result != null) return result;
+    }
+
+    final type = locoType.trim();
+    if (type.isNotEmpty && type != '<NUL>') {
+      return getLocoInfoDisplay(type, locoNo);
+    }
+
+    return null;
+  }
+
   static LocoInfo? findLocoInfo(String model, String number) {
     if (!_initialized || model.isEmpty || number.isEmpty) {
       return null;
     }
 
-    try {
-      final cleanNumber = number.trim().replaceAll('-', '').replaceAll(' ', '');
-      final num = cleanNumber.length > 4
-          ? int.parse(cleanNumber.substring(cleanNumber.length - 4))
-          : int.parse(cleanNumber);
+    final numberInt = _parseLocoNumber(number);
+    if (numberInt == null) return null;
 
-      for (final info in _locoData) {
-        if (info.model == model && num >= info.start && num <= info.end) {
-          return info;
-        }
-      }
-    } catch (e) {
-      return null;
-    }
-
-    return null;
+    return _findMatchingInfo(model.trim(), numberInt);
   }
 
   static String? getLocoInfoDisplay(String model, String number) {
@@ -94,39 +139,17 @@ class LocoInfoUtil {
 
     if (modelTrimmed.isEmpty ||
         numberTrimmed.isEmpty ||
-        numberTrimmed == "<NUL>") {
+        numberTrimmed == '<NUL>') {
       return null;
     }
 
-    final cleanNumber = numberTrimmed.replaceAll('-', '').replaceAll(' ', '');
-    final numberSuffix = cleanNumber.length >= 4
-        ? cleanNumber.substring(cleanNumber.length - 4)
-        : cleanNumber.padLeft(4, '0');
+    final numberInt = _parseLocoNumber(numberTrimmed);
+    if (numberInt == null) return null;
 
-    final numberInt = int.tryParse(numberSuffix);
-    if (numberInt == null) {
-      return null;
-    }
+    final info = _findMatchingInfo(modelTrimmed, numberInt);
+    if (info == null) return null;
 
-    for (final info in _locoData) {
-      if (info.model == modelTrimmed &&
-          numberInt >= info.start &&
-          numberInt <= info.end) {
-        final buffer = StringBuffer();
-        buffer.write(info.owner);
-
-        if (info.alias.isNotEmpty) {
-          buffer.write(' - ${info.alias}');
-        }
-
-        if (info.manufacturer.isNotEmpty) {
-          buffer.write(' - ${info.manufacturer}');
-        }
-
-        return buffer.toString();
-      }
-    }
-    return null;
+    return _formatInfo(info);
   }
 }
 

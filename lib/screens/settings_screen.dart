@@ -2,13 +2,13 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:io';
 
-import 'package:lbjconsole/models/merged_record.dart';
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/background_service.dart';
 import 'package:lbjconsole/services/audio_input_service.dart';
 import 'package:lbjconsole/services/rtl_tcp_service.dart';
 import 'package:lbjconsole/themes/app_theme.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:url_launcher_platform_interface/url_launcher_platform_interface.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -30,17 +30,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _rtlTcpPortController;
 
   bool _settingsLoaded = false;
-  
+  Timer? _saveDebounceTimer;
+
   String _deviceName = '';
   bool _backgroundServiceEnabled = false;
   bool _notificationsEnabled = true;
   int _recordCount = 0;
   bool _mergeRecordsEnabled = false;
-  bool _hideTimeOnlyRecords = false;
   bool _hideUngroupableRecords = false;
-  GroupBy _groupBy = GroupBy.trainAndLoco;
-  TimeWindow _timeWindow = TimeWindow.unlimited;
-  String _mapType = 'map';
 
   InputSource _inputSource = InputSource.bluetooth;
 
@@ -60,7 +57,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _loadSettings() async {
     final settingsMap = await _databaseService.getAllSettings() ?? {};
-    final settings = MergeSettings.fromMap(settingsMap);
     if (mounted) {
       setState(() {
         _deviceName = settingsMap['deviceName'] ?? 'LBJReceiver';
@@ -68,12 +64,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _backgroundServiceEnabled =
             (settingsMap['backgroundServiceEnabled'] ?? 0) == 1;
         _notificationsEnabled = (settingsMap['notificationEnabled'] ?? 1) == 1;
-        _mergeRecordsEnabled = settings.enabled;
-        _hideTimeOnlyRecords = (settingsMap['hideTimeOnlyRecords'] ?? 0) == 1;
-        _hideUngroupableRecords = settings.hideUngroupableRecords;
-        _groupBy = settings.groupBy;
-        _timeWindow = settings.timeWindow;
-        _mapType = settingsMap['mapType']?.toString() ?? 'webview';
+        _mergeRecordsEnabled = (settingsMap['mergeRecordsEnabled'] ?? 0) == 1;
+        _hideUngroupableRecords =
+            (settingsMap['hideUngroupableRecords'] ?? 0) == 1;
 
         _rtlTcpHost = settingsMap['rtlTcpHost']?.toString() ?? '127.0.0.1';
         _rtlTcpPort = settingsMap['rtlTcpPort']?.toString() ?? '14423';
@@ -93,22 +86,30 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _saveSettings() async {
     if (!_settingsLoaded) return;
-    
+
     await _databaseService.updateSettings({
       'deviceName': _deviceName,
       'backgroundServiceEnabled': _backgroundServiceEnabled ? 1 : 0,
       'notificationEnabled': _notificationsEnabled ? 1 : 0,
       'mergeRecordsEnabled': _mergeRecordsEnabled ? 1 : 0,
-      'hideTimeOnlyRecords': _hideTimeOnlyRecords ? 1 : 0,
       'hideUngroupableRecords': _hideUngroupableRecords ? 1 : 0,
-      'groupBy': _groupBy.name,
-      'timeWindow': _timeWindow.name,
-      'mapType': _mapType,
       'inputSource': _inputSource.name,
       'rtlTcpHost': _rtlTcpHost,
       'rtlTcpPort': _rtlTcpPort,
     });
     widget.onSettingsChanged?.call();
+  }
+
+  void _scheduleSave() {
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+      _saveImmediately();
+    });
+  }
+
+  Future<void> _saveImmediately() async {
+    _saveDebounceTimer?.cancel();
+    await _saveSettings();
   }
 
   Future<void> _switchInputSource(InputSource newSource) async {
@@ -129,11 +130,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         break;
     }
 
-    _saveSettings();
+    _saveImmediately();
   }
 
   @override
   void dispose() {
+    _saveDebounceTimer?.cancel();
     _deviceNameController.dispose();
     _rtlTcpHostController.dispose();
     _rtlTcpPortController.dispose();
@@ -222,7 +224,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   setState(() {
                     _deviceName = value;
                   });
-                  _saveSettings();
+                  _scheduleSave();
                 },
               ),
             ],
@@ -255,8 +257,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   setState(() {
                     _rtlTcpHost = value;
                   });
-                  _saveSettings();
+                  _scheduleSave();
                 },
+                enabled: !RtlTcpService().isConnected,
               ),
               const SizedBox(height: 16),
               TextField(
@@ -286,19 +289,59 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   setState(() {
                     _rtlTcpPort = value;
                   });
-                  _saveSettings();
+                  _scheduleSave();
                 },
+                enabled: !RtlTcpService().isConnected,
               ),
               const SizedBox(height: 16),
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
                   onPressed: () {
-                    RtlTcpService()
-                        .connect(host: _rtlTcpHost, port: _rtlTcpPort);
+                    final service = RtlTcpService();
+                    if (service.isEnabled) {
+                      service.disconnect();
+                      return;
+                    }
+                    service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
                   },
-                  icon: const Icon(Icons.refresh),
-                  label: const Text("重新连接 RTL-TCP"),
+                  icon: Icon(RtlTcpService().isEnabled ? Icons.circle : Icons.refresh, color: RtlTcpService().isConnected ? Colors.green : RtlTcpService().isEnabled ? Colors.orange : Colors.white),
+                  label: Text(RtlTcpService().isConnected ? "已连接" : RtlTcpService().isEnabled ? "正在连接..." : "连接 RTL-TCP"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.secondaryBlack,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () async {
+                    final service = RtlTcpService();
+                    if (service.isEnabled) {
+                      return;
+                    }
+                    final result = await UrlLauncherPlatform.instance.launchUrl(
+                        "iqsrc://-a $_rtlTcpHost -p $_rtlTcpPort -f 821237500 -s 240000 -T 0 -g 600",
+                        const LaunchOptions()
+                    );
+                    if (result) {
+                      service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
+                      return;
+                    }
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('启动失败，请重试')),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.auto_mode),
+                  label: const Text("调用驱动自动连接"),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: AppTheme.secondaryBlack,
                     foregroundColor: Colors.white,
@@ -316,9 +359,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
-                  color: Colors.blue.withOpacity(0.1),
+                  color: Colors.blue.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.blue.withOpacity(0.3)),
+                  border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
                 ),
                 child: const Row(
                   children: [
@@ -382,6 +425,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
             const SizedBox(height: 16),
+            Platform.isWindows ? const SizedBox() :
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -409,7 +453,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ],
             ),
-            const SizedBox(height: 16),
+            SizedBox(height: Platform.isWindows ? 0 : 16),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
@@ -425,65 +469,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     setState(() {
                       _notificationsEnabled = value;
                     });
-                    _saveSettings();
-                  },
-                  activeThumbColor: Theme.of(context).colorScheme.primary,
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('地图组件类型', style: AppTheme.bodyLarge),
-                  ],
-                ),
-                DropdownButton<String>(
-                  value: _mapType,
-                  items: const [
-                    DropdownMenuItem(
-                      value: 'webview',
-                      child: Text('矢量铁路地图', style: AppTheme.bodyMedium),
-                    ),
-                    DropdownMenuItem(
-                      value: 'map',
-                      child: Text('栅格铁路地图', style: AppTheme.bodyMedium),
-                    ),
-                  ],
-                  onChanged: (value) {
-                    if (value != null) {
-                      setState(() {
-                        _mapType = value;
-                      });
-                      _saveSettings();
-                    }
-                  },
-                  dropdownColor: AppTheme.secondaryBlack,
-                  style: AppTheme.bodyMedium,
-                  underline: Container(height: 0),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('隐藏只有时间有效的记录', style: AppTheme.bodyLarge),
-                  ],
-                ),
-                Switch(
-                  value: _hideTimeOnlyRecords,
-                  onChanged: (value) {
-                    setState(() {
-                      _hideTimeOnlyRecords = value;
-                    });
-                    _saveSettings();
+                    _saveImmediately();
                   },
                   activeThumbColor: Theme.of(context).colorScheme.primary,
                 ),
@@ -531,7 +517,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     setState(() {
                       _mergeRecordsEnabled = value;
                     });
-                    _saveSettings();
+                    _saveImmediately();
                   },
                   activeThumbColor: Theme.of(context).colorScheme.primary,
                 ),
@@ -542,82 +528,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('分组方式', style: AppTheme.bodyLarge),
-                      DropdownButton<GroupBy>(
-                        value: _groupBy,
-                        items: const [
-                          DropdownMenuItem(
-                              value: GroupBy.trainOnly,
-                              child: Text('仅车次号', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: GroupBy.locoOnly,
-                              child: Text('仅机车号', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: GroupBy.trainOrLoco,
-                              child: Text('车次号或机车号', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: GroupBy.trainAndLoco,
-                              child: Text('车次号与机车号', style: AppTheme.bodyMedium)),
-                        ],
-                        onChanged: (value) {
-                          if (value != null) {
-                            setState(() {
-                              _groupBy = value;
-                            });
-                            _saveSettings();
-                          }
-                        },
-                        dropdownColor: AppTheme.secondaryBlack,
-                        style: AppTheme.bodyMedium,
-                        underline: Container(height: 0),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('时间窗口', style: AppTheme.bodyLarge),
-                      DropdownButton<TimeWindow>(
-                        value: _timeWindow,
-                        items: const [
-                          DropdownMenuItem(
-                              value: TimeWindow.oneHour,
-                              child: Text('1小时内', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: TimeWindow.twoHours,
-                              child: Text('2小时内', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: TimeWindow.sixHours,
-                              child: Text('6小时内', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: TimeWindow.twelveHours,
-                              child: Text('12小时内', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: TimeWindow.oneDay,
-                              child: Text('24小时内', style: AppTheme.bodyMedium)),
-                          DropdownMenuItem(
-                              value: TimeWindow.unlimited,
-                              child: Text('不限时间', style: AppTheme.bodyMedium)),
-                        ],
-                        onChanged: (value) {
-                          if (value != null) {
-                            setState(() {
-                              _timeWindow = value;
-                            });
-                            _saveSettings();
-                          }
-                        },
-                        dropdownColor: AppTheme.secondaryBlack,
-                        style: AppTheme.bodyMedium,
-                        underline: Container(height: 0),
-                      ),
-                    ],
-                  ),
                   const SizedBox(height: 16),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -634,7 +544,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           setState(() {
                             _hideUngroupableRecords = value;
                           });
-                          _saveSettings();
+                          _saveImmediately();
                         },
                         activeThumbColor: Theme.of(context).colorScheme.primary,
                       ),
@@ -711,12 +621,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
         padding: const EdgeInsets.all(12.0),
         decoration: BoxDecoration(
           color: isDestructive
-              ? Colors.red.withOpacity(0.1)
+              ? Colors.red.withValues(alpha: 0.1)
               : AppTheme.secondaryBlack,
           borderRadius: BorderRadius.circular(12.0),
           border: Border.all(
             color: isDestructive
-                ? Colors.red.withOpacity(0.3)
+                ? Colors.red.withValues(alpha: 0.3)
                 : Colors.transparent,
             width: 1,
           ),
@@ -797,16 +707,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       try {
         final exportedPath = await _databaseService.exportDataAsJson();
-        Navigator.pop(context);
+        if (mounted) {
+          Navigator.pop(context);
+        }
 
         if (exportedPath != null) {
           final file = File(exportedPath);
-
-          await Share.shareXFiles(
-            [XFile(file.path)],
-            subject: 'LBJ Console Data',
-            text: '',
-          );
+          await SharePlus.instance.share(ShareParams(
+            subject: "LBJ Console Data",
+            files: [XFile(file.path)],
+          ));
         } else {
           scaffoldMessenger.showSnackBar(
             const SnackBar(
@@ -815,7 +725,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           );
         }
       } catch (e) {
-        Navigator.pop(context);
+        if (mounted) {
+          Navigator.pop(context);
+        }
         scaffoldMessenger.showSnackBar(
           SnackBar(
             content: Text('分享错误：$e'),
@@ -862,24 +774,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (resultFile == null) return;
     final selectedFile = resultFile.files.single.path;
     if (selectedFile == null) return;
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 16),
-            Text('正在导入数据...'),
-          ],
+    if (mounted){
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Text('正在导入数据...'),
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    }
 
     try {
       final success = await _databaseService.importDataFromJson(selectedFile);
-      Navigator.pop(context);
+      if (mounted) {
+        Navigator.pop(context);
+      }
 
       if (success) {
         scaffoldMessenger.showSnackBar(
@@ -899,7 +814,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         );
       }
     } catch (e) {
-      Navigator.pop(context);
+      if (mounted) {
+        Navigator.pop(context);
+      }
       scaffoldMessenger.showSnackBar(
         SnackBar(
           content: Text('导入错误：$e'),
@@ -932,19 +849,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     if (result != true) return;
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 16),
-            Text('正在清空数据...'),
-          ],
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Text('正在清空数据...'),
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    }
 
     try {
       await _databaseService.deleteAllRecords();
@@ -953,12 +872,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         'backgroundServiceEnabled': 0,
         'notificationEnabled': 1,
         'mergeRecordsEnabled': 0,
-        'groupBy': 'trainAndLoco',
-        'timeWindow': 'unlimited',
+        'hideUngroupableRecords': 0,
         'inputSource': 'bluetooth',
       });
 
-      Navigator.pop(context);
+      if (mounted) {
+        Navigator.pop(context);
+      }
 
       scaffoldMessenger.showSnackBar(
         const SnackBar(
@@ -970,7 +890,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await _loadRecordCount();
       setState(() {});
     } catch (e) {
-      Navigator.pop(context);
+      if (mounted) {
+        Navigator.pop(context);
+      }
       scaffoldMessenger.showSnackBar(
         SnackBar(
           content: Text('清空错误：$e'),

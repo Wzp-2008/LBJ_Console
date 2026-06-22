@@ -1,15 +1,15 @@
 import 'dart:math' as math;
 import 'dart:isolate';
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:scrollview_observer/scrollview_observer.dart';
 import '../models/merged_record.dart';
 import '../services/database_service.dart';
+import '../services/records_feed.dart';
 import '../models/train_record.dart';
-import '../services/merge_service.dart';
 import '../models/map_state.dart';
 import '../services/map_state_service.dart';
 
@@ -28,21 +28,42 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class HistoryScreenState extends State<HistoryScreen> {
+  static const int _batchSize = 100;
+  static const double _scrollThreshold = 200.0;
+  static const int _searchDebounceMs = 300;
+  static const int _minVisibleItems = 15;
+
   final List<Object> _displayItems = [];
-  bool _isLoading = true;
+  bool _isInitialLoading = true;
+  bool _isLoadingMore = false;
+  bool _isSearchRefreshing = false;
+  bool _hasMoreRecords = true;
+  // Keyset cursor for the non-search path (null = first page). Replaces the
+  // old offset counter for the main list, fixing the offset/dedup drift bug
+  // on a live stream. [_currentOffset] is now search-only.
+  PageCursor? _displayCursor;
+  int _currentOffset = 0;
   bool _isEditMode = false;
-  int? _anchorIndex;
-  double? _anchorOffset;
-  double? _oldCardHeight;
-  double? _oldScrollOffset;
   final Set<String> _selectedRecords = {};
   final Map<String, bool> _expandedStates = {};
+  final Map<String, bool> _mergedDetailsLoading = {};
   final ScrollController _scrollController = ScrollController();
-  final ListObserverController _observerController =
-      ListObserverController(controller: null)..cacheJumpIndexOffset = false;
-  late final ChatScrollObserver _chatObserver;
   bool _isAtTop = true;
-  MergeSettings _mergeSettings = MergeSettings();
+  String? _displaySettingsSignature;
+
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  final ValueNotifier<bool> _searchRefreshingNotifier = ValueNotifier(false);
+  final ValueNotifier<int?> _searchCountNotifier = ValueNotifier(null);
+  final ValueNotifier<int?> _searchLoadedCountNotifier = ValueNotifier(null);
+  String _searchQuery = '';
+  int? _searchTotalCount;
+  Timer? _searchDebounce;
+  Timer? _scrollLoadDebounce;
+  int _searchGeneration = 0;
+
+  StreamSubscription? _recordDeleteSubscription;
+  StreamSubscription? _settingsSubscription;
 
   final Map<String, double> _mapOptimalZoom = {};
   final Map<String, bool> _mapCalculating = {};
@@ -53,7 +74,6 @@ class HistoryScreenState extends State<HistoryScreen> {
 
   int getSelectedCount() => _selectedRecords.length;
   Set<String> getSelectedRecordIds() => _selectedRecords;
-  List<Object> getDisplayItems() => _displayItems;
   void clearSelection() => setState(() => _selectedRecords.clear());
 
   void setEditMode(bool isEditing) {
@@ -67,337 +87,616 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> reloadRecords() async {
-    await loadRecords(scrollToTop: false);
+    await _loadFirstPage();
   }
 
   @override
   void initState() {
     super.initState();
-    _chatObserver = ChatScrollObserver(_observerController)
-      ..toRebuildScrollViewCallback = () {
-        if (mounted) {
-          setState(() {});
-        }
-      };
-    _scrollController.addListener(() {
-      if (_scrollController.position.atEdge) {
-        if (_scrollController.position.pixels == 0) {
-          if (!_isAtTop) {
-            setState(() => _isAtTop = true);
-          }
-        }
-      } else {
-        if (_isAtTop) {
-          setState(() => _isAtTop = false);
-        }
-      }
-    });
+    _scrollController.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
-        loadRecords();
+        _loadFirstPage();
         _startLocationUpdates();
+        _setupRecordDeleteListener();
+        _setupSettingsListener();
       }
+    });
+  }
+
+  String _displaySettingsSignatureFrom(Map<String, dynamic> settingsMap) {
+    return [
+      settingsMap['mergeRecordsEnabled'] ?? 0,
+      settingsMap['hideUngroupableRecords'] ?? 0,
+    ].join('|');
+  }
+
+  void _setupSettingsListener() {
+    _settingsSubscription =
+        DatabaseService.instance.onSettingsChanged((settings) {
+      if (!mounted) return;
+      final signature = _displaySettingsSignatureFrom(settings);
+      if (signature == _displaySettingsSignature) return;
+      _displaySettingsSignature = signature;
+      _loadFirstPage();
+    });
+  }
+
+  void _setupRecordDeleteListener() {
+    _recordDeleteSubscription =
+        DatabaseService.instance.onRecordDeleted((deletedIds) {
+      if (!mounted) return;
+      for (final id in deletedIds) {
+        _selectedRecords.remove(id);
+        _expandedStates.remove(id);
+      }
+      _loadFirstPage();
     });
   }
 
   @override
   void dispose() {
     _scrollController.dispose();
-    _observerController.controller?.dispose();
     _locationTimer?.cancel();
+    _searchDebounce?.cancel();
+    _scrollLoadDebounce?.cancel();
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    _searchRefreshingNotifier.dispose();
+    _searchCountNotifier.dispose();
+    _searchLoadedCountNotifier.dispose();
+    _recordDeleteSubscription?.cancel();
+    _settingsSubscription?.cancel();
     super.dispose();
   }
 
-  Future<void> loadRecords({bool scrollToTop = true}) async {
-    try {
-      final allRecords = await DatabaseService.instance.getAllRecords();
-      final settingsMap = await DatabaseService.instance.getAllSettings() ?? {};
-      _mergeSettings = MergeSettings.fromMap(settingsMap);
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (position.atEdge && position.pixels == 0) {
+      _isAtTop = true;
+    } else {
+      _isAtTop = false;
+    }
+    if (position.pixels >= position.maxScrollExtent - _scrollThreshold) {
+      _scrollLoadDebounce?.cancel();
+      _scrollLoadDebounce = Timer(const Duration(milliseconds: 80), () {
+        if (mounted) _loadNextPage();
+      });
+    }
+  }
 
-      List<TrainRecord> filteredRecords = allRecords;
-      if ((settingsMap['hideTimeOnlyRecords'] ?? 0) == 1) {
-        filteredRecords = allRecords.where((record) {
-          bool isFieldMeaningful(String field) {
-            if (field.isEmpty) {
-              return false;
-            }
-            String cleaned = field.replaceAll('<NUL>', '').trim();
-            if (cleaned.isEmpty) {
-              return false;
-            }
-            if (cleaned.runes
-                .every((r) => r == '*'.runes.first || r == ' '.runes.first)) {
-              return false;
-            }
-            return true;
-          }
+  bool _computeHasMore({required int lastBatchSize}) {
+    if (lastBatchSize < _batchSize) return false;
+    if (_searchQuery.isNotEmpty && _searchTotalCount != null) {
+      return _currentOffset < _searchTotalCount!;
+    }
+    return true;
+  }
 
-          final hasTrainNumber = isFieldMeaningful(record.fullTrainNumber) &&
-              !record.fullTrainNumber.contains("-----");
-
-          final hasDirection = record.direction == 1 || record.direction == 3;
-
-          final hasLocoInfo = isFieldMeaningful(record.locoType) ||
-              isFieldMeaningful(record.loco);
-
-          final hasRoute = isFieldMeaningful(record.route);
-
-          final hasPosition = isFieldMeaningful(record.position);
-
-          final hasSpeed =
-              isFieldMeaningful(record.speed) && record.speed != "NUL";
-
-          final hasPositionInfo = isFieldMeaningful(record.positionInfo);
-
-          final hasTrainType =
-              isFieldMeaningful(record.trainType) && record.trainType != "未知";
-
-          final hasLbjClass =
-              isFieldMeaningful(record.lbjClass) && record.lbjClass != "NA";
-
-          final hasTrain = isFieldMeaningful(record.train) &&
-              !record.train.contains("-----");
-
-          final shouldShow = hasTrainNumber ||
-              hasDirection ||
-              hasLocoInfo ||
-              hasRoute ||
-              hasPosition ||
-              hasSpeed ||
-              hasPositionInfo ||
-              hasTrainType ||
-              hasLbjClass ||
-              hasTrain;
-
-          return shouldShow;
-        }).toList();
-      }
-
-      final items = MergeService.getMixedList(filteredRecords, _mergeSettings);
-
-      if (mounted) {
-        final hasDataChanged = _hasDataChanged(items);
-
-        if (hasDataChanged) {
-          setState(() {
-            _displayItems.clear();
-            _displayItems.addAll(items);
-            _isLoading = false;
-          });
-
-          if (scrollToTop && _isAtTop && _scrollController.hasClients) {
-            _scrollController.jumpTo(0.0);
-          }
+  void _onSearchChanged(String value) {
+    _searchDebounce?.cancel();
+    final trimmed = value.trim();
+    _searchDebounce = Timer(const Duration(milliseconds: _searchDebounceMs), () async {
+      if (!mounted) return;
+      if (_searchQuery != trimmed) {
+        final retainFocus = trimmed.isEmpty && _searchFocusNode.hasFocus;
+        _searchQuery = trimmed;
+        if (trimmed.isNotEmpty) {
+          await _loadFirstPage(keepStaleResults: true);
         } else {
-          if (_isLoading) {
-            setState(() => _isLoading = false);
-          }
+          await _loadFirstPage(keepStaleResults: false);
+        }
+        if (retainFocus && mounted) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && !_searchFocusNode.hasFocus) {
+              _searchFocusNode.requestFocus();
+            }
+          });
         }
       }
+    });
+  }
+
+  Future<void> _loadFirstPage({bool keepStaleResults = false}) async {
+    _searchDebounce?.cancel();
+    final generation = ++_searchGeneration;
+    final query = _searchQuery;
+
+    if (keepStaleResults) {
+      _currentOffset = 0;
+      _searchTotalCount = null;
+      _hasMoreRecords = true;
+      _isSearchRefreshing = true;
+      _searchRefreshingNotifier.value = true;
+    } else {
+      setState(() {
+        _isInitialLoading = _displayItems.isEmpty;
+        _isLoadingMore = false;
+        _isSearchRefreshing = false;
+        _displayItems.clear();
+        _currentOffset = 0;
+        _displayCursor = null;
+        _searchTotalCount = null;
+        _hasMoreRecords = true;
+      });
+      _searchRefreshingNotifier.value = false;
+      _searchCountNotifier.value = null;
+      _searchLoadedCountNotifier.value = null;
+    }
+
+    try {
+      final settingsMap = await DatabaseService.instance.getAllSettings() ?? {};
+      _displaySettingsSignature = _displaySettingsSignatureFrom(settingsMap);
+
+      if (query.isNotEmpty) {
+        if (!keepStaleResults) {
+          _searchRefreshingNotifier.value = true;
+        }
+        _searchCountNotifier.value = null;
+        _searchLoadedCountNotifier.value = null;
+
+        final items = await RecordsFeed.fetchSearchPage(
+          query: query,
+          limit: _batchSize,
+          offset: 0,
+        );
+        if (!mounted || generation != _searchGeneration || query != _searchQuery) {
+          return;
+        }
+
+        final total = await RecordsFeed.countSearch(query);
+        if (!mounted || generation != _searchGeneration || query != _searchQuery) {
+          return;
+        }
+
+        setState(() {
+          _displayItems
+            ..clear()
+            ..addAll(items);
+          _isInitialLoading = false;
+          _isSearchRefreshing = false;
+          _searchTotalCount = total;
+          _currentOffset = items.length;
+          _hasMoreRecords = _computeHasMore(lastBatchSize: items.length);
+        });
+        _searchRefreshingNotifier.value = false;
+        _searchCountNotifier.value = total;
+        _searchLoadedCountNotifier.value = _currentOffset;
+        _ensureEnoughContent();
+        return;
+      }
+
+      final result = await RecordsFeed.fetchPage(
+        limit: _batchSize,
+        cursor: null,
+      );
+      if (!mounted || generation != _searchGeneration) return;
+
+      setState(() {
+        _displayItems
+          ..clear()
+          ..addAll(result.items);
+        _isInitialLoading = false;
+        _isSearchRefreshing = false;
+        _searchTotalCount = null;
+        _displayCursor = result.nextCursor;
+        _hasMoreRecords = result.nextCursor != null;
+      });
+      _searchRefreshingNotifier.value = false;
+      _searchCountNotifier.value = null;
+      _searchLoadedCountNotifier.value = null;
+      _ensureEnoughContent();
     } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
+      if (mounted && generation == _searchGeneration) {
+        setState(() {
+          _isInitialLoading = false;
+          _isSearchRefreshing = false;
+        });
+        _searchRefreshingNotifier.value = false;
       }
     }
+  }
+
+  Future<void> _loadNextPage() async {
+    if (_isLoadingMore || !_hasMoreRecords) return;
+    setState(() => _isLoadingMore = true);
+    final generation = _searchGeneration;
+    final isSearch = _searchQuery.isNotEmpty;
+
+    try {
+      if (isSearch) {
+        final page = await RecordsFeed.fetchSearchPage(
+          query: _searchQuery,
+          limit: _batchSize,
+          offset: _currentOffset,
+        );
+        if (!mounted || generation != _searchGeneration) return;
+
+        // New records arriving at the top shift offsets; drop duplicates.
+        final existing = _displayItemIdentities(_displayItems);
+        final fresh = page
+            .where((item) => !existing.contains(_displayItemIdentity(item)))
+            .toList();
+
+        setState(() {
+          _displayItems.addAll(fresh);
+          _currentOffset += page.length;
+          _hasMoreRecords = _computeHasMore(lastBatchSize: page.length);
+          _isLoadingMore = false;
+        });
+        _searchLoadedCountNotifier.value = _currentOffset;
+        _ensureEnoughContent();
+        return;
+      }
+
+      // Keyset: fetch strictly after the last shown item. New live records
+      // land above the cursor, so they never re-appear on the next page —
+      // this is what keeps the list growing with fresh (post-merge) items
+      // instead of stalling on already-shown groups.
+      final result = await RecordsFeed.fetchPage(
+        limit: _batchSize,
+        cursor: _displayCursor,
+      );
+      if (!mounted || generation != _searchGeneration) return;
+
+      final existing = _displayItemIdentities(_displayItems);
+      final fresh = result.items
+          .where((item) => !existing.contains(_displayItemIdentity(item)))
+          .toList();
+
+      setState(() {
+        _displayItems.addAll(fresh);
+        _displayCursor = result.nextCursor;
+        _hasMoreRecords = result.nextCursor != null;
+        _isLoadingMore = false;
+      });
+      _ensureEnoughContent();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLoadingMore = false);
+      }
+    }
+  }
+
+  String _displayItemIdentity(Object item) {
+    if (item is TrainRecord) return 't:${item.uniqueId}';
+    if (item is MergedTrainRecord) return 'm:${item.groupKey}';
+    return 'x:${item.hashCode}';
+  }
+
+  Set<String> _displayItemIdentities(List<Object> items) {
+    return items.map(_displayItemIdentity).toSet();
+  }
+
+  void _ensureEnoughContent() {
+    if (!_hasMoreRecords || _isLoadingMore) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final position = _scrollController.position;
+      final searchNeedsMore = _searchQuery.isNotEmpty &&
+          _searchTotalCount != null &&
+          _currentOffset < _searchTotalCount!;
+      final needsMore = position.maxScrollExtent <= 0 ||
+          _displayItems.length < _minVisibleItems ||
+          (searchNeedsMore && _displayItems.length < _searchTotalCount!);
+      if (needsMore) {
+        _loadNextPage();
+      }
+    });
+  }
+
+  void _removeIntersectingItems(Object newItem) {
+    final memberIds = newItem is MergedTrainRecord
+        ? newItem.memberUniqueIds.toSet()
+        : {(newItem as TrainRecord).uniqueId};
+    final identity = _displayItemIdentity(newItem);
+    _displayItems.removeWhere((existing) {
+      if (_displayItemIdentity(existing) == identity) return true;
+      if (existing is TrainRecord) return memberIds.contains(existing.uniqueId);
+      if (existing is MergedTrainRecord) {
+        return existing.memberUniqueIds.any(memberIds.contains);
+      }
+      return false;
+    });
   }
 
   Future<void> addNewRecord(TrainRecord newRecord) async {
     try {
-      final settingsMap = await DatabaseService.instance.getAllSettings() ?? {};
-      _mergeSettings = MergeSettings.fromMap(settingsMap);
+      if (!mounted || _searchQuery.isNotEmpty) return;
 
-      if ((settingsMap['hideTimeOnlyRecords'] ?? 0) == 1) {}
+      // The record is already merged into the cache by insertRecord; just
+      // fetch the up-to-date display item that contains it.
+      final item = await RecordsFeed.itemContaining(newRecord);
+      if (item == null || !mounted || _searchQuery.isNotEmpty) return;
 
-      final isNewRecord = !_displayItems.any((item) {
-        if (item is TrainRecord) {
-          return item.uniqueId == newRecord.uniqueId;
-        } else if (item is MergedTrainRecord) {
-          return item.records.any((r) => r.uniqueId == newRecord.uniqueId);
-        }
-        return false;
+      final wasAtTop = _isAtTop;
+      final savedOffset =
+          _scrollController.hasClients ? _scrollController.offset : 0.0;
+
+      setState(() {
+        // Prepend the up-to-date display item. The keyset cursor is
+        // unaffected: newer items live above it and are never re-fetched.
+        _removeIntersectingItems(item);
+        _displayItems.insert(0, item);
       });
-      if (!isNewRecord) return;
 
-      if (mounted) {
-        if (_isAtTop) {
-          setState(() {
-            List<TrainRecord> allRecords = [];
-            Set<String> selectedRecordIds = {};
-
-            for (final item in _displayItems) {
-              if (item is MergedTrainRecord) {
-                allRecords.addAll(item.records);
-                if (_selectedRecords.contains(item.records.first.uniqueId)) {
-                  selectedRecordIds.addAll(item.records.map((r) => r.uniqueId));
-                }
-              } else if (item is TrainRecord) {
-                allRecords.add(item);
-                if (_selectedRecords.contains(item.uniqueId)) {
-                  selectedRecordIds.add(item.uniqueId);
-                }
-              }
-            }
-
-            allRecords.insert(0, newRecord);
-
-            final mergedItems =
-                MergeService.getMixedList(allRecords, _mergeSettings);
-
-            _displayItems.clear();
-            _displayItems.addAll(mergedItems);
-
-            _selectedRecords.clear();
-            for (final item in _displayItems) {
-              if (item is MergedTrainRecord) {
-                if (item.records
-                    .any((r) => selectedRecordIds.contains(r.uniqueId))) {
-                  _selectedRecords.addAll(item.records.map((r) => r.uniqueId));
-                }
-              } else if (item is TrainRecord) {
-                if (selectedRecordIds.contains(item.uniqueId)) {
-                  _selectedRecords.add(item.uniqueId);
-                }
-              }
-            }
-          });
-          if (_scrollController.hasClients) {
-            _scrollController.jumpTo(0.0);
-          }
-          return;
+      if (wasAtTop) {
+        if (_scrollController.hasClients) {
+          _scrollController.jumpTo(0.0);
         }
-
-        final anchorModel = _observerController.observeFirstItem();
-        if (anchorModel == null) {
-          return;
-        }
-
-        _anchorIndex = anchorModel.index;
-        if (_anchorIndex! > 0) {
-          _anchorOffset = anchorModel.layoutOffset;
-        } else {
-          _oldCardHeight = anchorModel.size.height;
-          _oldScrollOffset = _scrollController.offset;
-        }
-
-        bool isMerge = false;
-        Object? mergeResult;
-        final firstItem = _displayItems.first;
-        List<TrainRecord> tempRecords = [newRecord];
-        if (firstItem is MergedTrainRecord) {
-          tempRecords.addAll(firstItem.records);
-        } else if (firstItem is TrainRecord) {
-          tempRecords.add(firstItem);
-        }
-        final mergeCheckResult =
-            MergeService.getMixedList(tempRecords, _mergeSettings);
-        if (mergeCheckResult.length == 1 &&
-            mergeCheckResult.first is MergedTrainRecord) {
-          isMerge = true;
-          mergeResult = mergeCheckResult.first;
-        }
-
-        setState(() {
-          if (isMerge) {
-            _displayItems[0] = mergeResult!;
-          } else {
-            _displayItems.insert(0, newRecord);
-          }
-        });
-
+      } else {
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (!mounted || _anchorIndex == null) return;
-
-          if (_anchorIndex! > 0) {
-            final newAnchorIndex = isMerge ? _anchorIndex! : _anchorIndex! + 1;
-            final newAnchorModel =
-                _observerController.observeItem(index: newAnchorIndex);
-            if (newAnchorModel != null && _anchorOffset != null) {
-              final newOffset = newAnchorModel.layoutOffset;
-              final delta = newOffset - _anchorOffset!;
-              if (delta.abs() > 0.1) {
-                _scrollController.jumpTo(_scrollController.offset + delta);
-              }
-            }
-          } else {
-            final newAnchorModel = _observerController.observeItem(index: 0);
-            if (newAnchorModel != null &&
-                _oldCardHeight != null &&
-                _oldScrollOffset != null) {
-              final newHeight = newAnchorModel.size.height;
-              final heightDelta = newHeight - _oldCardHeight!;
-              if (heightDelta.abs() > 0.1) {
-                _scrollController.jumpTo(_oldScrollOffset! + heightDelta);
-              }
-            }
+          if (!mounted || !_scrollController.hasClients) return;
+          final newMax = _scrollController.position.maxScrollExtent;
+          final adjustedOffset = savedOffset.clamp(0.0, newMax);
+          if ((_scrollController.offset - adjustedOffset).abs() > 0.5) {
+            _scrollController.jumpTo(adjustedOffset);
           }
-
-          _anchorIndex = null;
-          _anchorOffset = null;
-          _oldCardHeight = null;
-          _oldScrollOffset = null;
         });
       }
-    } catch (e) {}
+    } catch (e) {
+      developer.log('addNewRecord error: $e', name: 'HistoryScreen');
+    }
   }
 
 
-  bool _hasDataChanged(List<Object> newItems) {
-    if (_displayItems.length != newItems.length) return true;
-
-    for (int i = 0; i < _displayItems.length; i++) {
-      final oldItem = _displayItems[i];
-      final newItem = newItems[i];
-
-      if (oldItem.runtimeType != newItem.runtimeType) return true;
-
-      if (oldItem is TrainRecord && newItem is TrainRecord) {
-        if (oldItem.uniqueId != newItem.uniqueId) return true;
-      } else if (oldItem is MergedTrainRecord && newItem is MergedTrainRecord) {
-        if (oldItem.groupKey != newItem.groupKey) return true;
-        if (oldItem.records.length != newItem.records.length) return true;
-      }
-    }
-    return false;
+  static int _getCrossAxisCount(double width) {
+    // Responsive grid: min 1 column, max 5, adapting to screen width.
+    if (width >= 1600) return 5;
+    if (width >= 1200) return 4;
+    if (width >= 800) return 3;
+    if (width >= 500) return 2;
+    return 1;
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (_isLoading && _displayItems.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
-    }
-    if (_displayItems.isEmpty) {
-      return const Center(
-          child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(Icons.history, size: 64, color: Colors.grey),
-        SizedBox(height: 16),
-        Text('暂无记录', style: TextStyle(color: Colors.white, fontSize: 18))
-      ]));
-    }
-    return ListViewObserver(
-      controller: _observerController,
-      child: ListView.builder(
-        controller: _scrollController,
-        physics: ChatObserverClampingScrollPhysics(observer: _chatObserver),
-        shrinkWrap: _chatObserver.isShrinkWrap,
-        padding: const EdgeInsets.all(16.0),
-        itemCount: _displayItems.length,
-        itemBuilder: (context, index) {
-          final item = _displayItems[index];
-          if (item is MergedTrainRecord) {
-            return _buildMergedRecordCard(item);
-          } else if (item is TrainRecord) {
-            return _buildRecordCard(item, key: ValueKey(item.uniqueId));
-          }
-          return const SizedBox.shrink();
-        },
+  /// Test accessor for [_getCrossAxisCount].
+  @visibleForTesting
+  static int crossAxisCountForWidth(double width) =>
+      _getCrossAxisCount(width);
+
+  double _getMapHeight() {
+    final width = MediaQuery.of(context).size.width;
+    if (width >= 1200) return 320;
+    if (width >= 800) return 280;
+    return 220;
+  }
+
+  Key _displayItemKey(Object item) {
+    if (item is TrainRecord) return ValueKey('t:${item.uniqueId}');
+    if (item is MergedTrainRecord) return ValueKey('m:${item.groupKey}');
+    return ValueKey(item.hashCode);
+  }
+
+  Widget _buildCardForItem(Object item) {
+    final card = item is MergedTrainRecord
+        ? _buildMergedRecordCard(item)
+        : item is TrainRecord
+            ? _buildRecordCard(item, key: ValueKey(item.uniqueId))
+            : const SizedBox.shrink();
+    return RepaintBoundary(child: card);
+  }
+
+  Widget _buildLoadMoreIndicator() {
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 16),
+      child: Center(
+        child: SizedBox(
+          width: 24, height: 24,
+          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blue),
+        ),
       ),
     );
   }
 
+  Widget _buildSearchBar() {
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        _searchRefreshingNotifier,
+        _searchCountNotifier,
+        _searchLoadedCountNotifier,
+      ]),
+      builder: (context, _) {
+        final isRefreshing = _searchRefreshingNotifier.value;
+        final resultCount = _searchCountNotifier.value;
+        final loadedCount = _searchLoadedCountNotifier.value;
+        String resultText = '搜索中...';
+        if (resultCount != null) {
+          if (loadedCount != null && loadedCount < resultCount) {
+            resultText = '找到 $resultCount 条，已加载 $loadedCount 条';
+          } else {
+            resultText = '找到 $resultCount 条匹配记录';
+          }
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+              child: TextField(
+                controller: _searchController,
+                focusNode: _searchFocusNode,
+                style: const TextStyle(color: Colors.white, fontSize: 14),
+                decoration: InputDecoration(
+                  hintText: '搜索车次/机车...',
+                  hintStyle: const TextStyle(color: Colors.grey, fontSize: 14),
+                  prefixIcon: const Icon(Icons.search, color: Colors.grey, size: 20),
+                  suffixIcon: _searchController.text.isNotEmpty
+                      ? IconButton(
+                          icon: const Icon(Icons.clear, color: Colors.grey, size: 20),
+                          onPressed: () {
+                            _searchController.clear();
+                            _searchFocusNode.unfocus();
+                            _onSearchChanged('');
+                          },
+                        )
+                      : null,
+                  filled: true,
+                  fillColor: const Color(0xFF1E1E1E),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide.none,
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide.none,
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: Colors.blue, width: 1),
+                  ),
+                ),
+                onChanged: _onSearchChanged,
+              ),
+            ),
+            if (_searchController.text.trim().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        resultText,
+                        style: const TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ),
+                    if (isRefreshing)
+                      const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blue),
+                      ),
+                  ],
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildRecordList(int crossAxisCount) {
+    // Single column: a plain item-by-item list (no Row wrapper).
+    if (crossAxisCount <= 1) {
+      return ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.all(16.0),
+        addRepaintBoundaries: true,
+        addAutomaticKeepAlives: false,
+        cacheExtent: 800,
+        itemCount: _displayItems.length + (_isLoadingMore ? 1 : 0),
+        itemBuilder: (context, index) {
+          if (index >= _displayItems.length) return _buildLoadMoreIndicator();
+          final item = _displayItems[index];
+          return KeyedSubtree(
+            key: _displayItemKey(item),
+            child: _buildCardForItem(item),
+          );
+        },
+      );
+    }
+
+    final cols = crossAxisCount;
+
+    return ListView.builder(
+      controller: _scrollController,
+      padding: const EdgeInsets.all(16.0),
+      addRepaintBoundaries: true,
+      addAutomaticKeepAlives: false,
+      cacheExtent: 800,
+      itemCount:
+          (_displayItems.length / cols).ceil() + (_isLoadingMore ? 1 : 0),
+      itemBuilder: (context, rowIndex) {
+        final rowCount = (_displayItems.length / cols).ceil();
+        // Trailing row renders a full-width centered load-more spinner.
+        if (rowIndex >= rowCount) return _buildLoadMoreIndicator();
+
+        final start = rowIndex * cols;
+        final end = math.min(start + cols, _displayItems.length);
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8.0),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: List.generate(cols, (col) {
+              final itemIdx = start + col;
+              if (itemIdx >= end) return const Expanded(child: SizedBox.shrink());
+              final item = _displayItems[itemIdx];
+              return Expanded(
+                child: Padding(
+                  padding: EdgeInsets.only(
+                      left: col > 0 ? 4.0 : 0,
+                      right: col < cols - 1 ? 4.0 : 0),
+                  child: KeyedSubtree(
+                    key: _displayItemKey(item),
+                    child: _buildCardForItem(item),
+                  ),
+                ),
+              );
+            }),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isInitialLoading && _displayItems.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (!_isInitialLoading && _displayItems.isEmpty) {
+      return Column(children: [
+        _buildSearchBar(),
+        Expanded(
+          child: Center(
+            child: _isSearchRefreshing
+                ? const CircularProgressIndicator(color: Colors.blue)
+                : const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.history, size: 64, color: Colors.grey),
+                    SizedBox(height: 16),
+                    Text('暂无记录', style: TextStyle(color: Colors.white, fontSize: 18))
+                  ]),
+          ),
+        ),
+      ]);
+    }
+    final screenWidth = MediaQuery.of(context).size.width;
+    final crossAxisCount = _getCrossAxisCount(screenWidth);
+
+    return Column(children: [
+      _buildSearchBar(),
+      Expanded(child: _buildRecordList(crossAxisCount)),
+    ]);
+  }
+
+  Future<void> _loadMergedDetails(MergedTrainRecord merged) async {
+    if (!mounted || merged.hasLoadedDetails || merged.recordCount <= 1) return;
+    if (_mergedDetailsLoading[merged.groupKey] == true) return;
+
+    setState(() => _mergedDetailsLoading[merged.groupKey] = true);
+
+    try {
+      final loaded = await DatabaseService.instance.getRecordsByUniqueIds(
+        merged.memberUniqueIds,
+      );
+      if (!mounted) return;
+      merged.setDetailRecords(loaded);
+    } catch (e) {
+      developer.log('loadMergedDetails error: $e', name: 'HistoryScreen');
+    } finally {
+      if (mounted) {
+        setState(() => _mergedDetailsLoading.remove(merged.groupKey));
+      }
+    }
+  }
+
   Widget _buildMergedRecordCard(MergedTrainRecord mergedRecord) {
-    final bool isSelected =
-        mergedRecord.records.any((r) => _selectedRecords.contains(r.uniqueId));
+    final bool isSelected = mergedRecord.memberUniqueIds
+        .any((id) => _selectedRecords.contains(id));
     final isExpanded = _expandedStates[mergedRecord.groupKey] ?? false;
+    final displayRecord = mergedRecord.summaryRecord;
     return Card(
         key: ValueKey(mergedRecord.groupKey),
         color: isSelected && _isEditMode
@@ -417,8 +716,7 @@ class HistoryScreenState extends State<HistoryScreen> {
             onTap: () {
               if (_isEditMode) {
                 setState(() {
-                  final allIdsInGroup =
-                      mergedRecord.records.map((r) => r.uniqueId).toSet();
+                  final allIdsInGroup = mergedRecord.memberUniqueIds.toSet();
                   if (isSelected) {
                     _selectedRecords.removeAll(allIdsInGroup);
                   } else {
@@ -428,8 +726,7 @@ class HistoryScreenState extends State<HistoryScreen> {
                 });
               } else {
                 if (isExpanded) {
-                  final mapId =
-                      mergedRecord.records.map((r) => r.uniqueId).join('_');
+                  final mapId = mergedRecord.memberUniqueIds.join('_');
                   setState(() {
                     _expandedStates[mergedRecord.groupKey] = false;
                     _mapOptimalZoom.remove(mapId);
@@ -439,6 +736,7 @@ class HistoryScreenState extends State<HistoryScreen> {
                   setState(() {
                     _expandedStates[mergedRecord.groupKey] = true;
                   });
+                  _loadMergedDetails(mergedRecord);
                 }
               }
             },
@@ -447,9 +745,7 @@ class HistoryScreenState extends State<HistoryScreen> {
                 setEditMode(true);
               }
               setState(() {
-                final allIdsInGroup =
-                    mergedRecord.records.map((r) => r.uniqueId).toSet();
-                _selectedRecords.addAll(allIdsInGroup);
+                _selectedRecords.addAll(mergedRecord.memberUniqueIds);
                 widget.onSelectionChanged();
               });
             },
@@ -458,29 +754,54 @@ class HistoryScreenState extends State<HistoryScreen> {
                 child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _buildRecordHeader(mergedRecord.latestRecord,
-                          isMerged: true),
-                      _buildPositionAndSpeed(mergedRecord.latestRecord),
-                      _buildLocoInfo(mergedRecord.latestRecord),
+                      _buildRecordHeader(displayRecord, isMerged: true),
+                      if (mergedRecord.recordCount > 1)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            '共 ${mergedRecord.recordCount} 条 · 点击展开',
+                            style: const TextStyle(
+                              color: Colors.grey,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      _buildPositionAndSpeed(displayRecord),
+                      _buildLocoInfo(displayRecord),
                       if (isExpanded) _buildMergedExpandedContent(mergedRecord)
                     ]))));
   }
 
   Widget _buildMergedExpandedContent(MergedTrainRecord mergedRecord) {
+    final loading = _mergedDetailsLoading[mergedRecord.groupKey] ?? false;
+    if (loading ||
+        (!mergedRecord.hasLoadedDetails && mergedRecord.recordCount > 1)) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Center(
+          child: SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blue),
+          ),
+        ),
+      );
+    }
+
+    final details = mergedRecord.records;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _buildExpandedMapForAll(mergedRecord.records, mergedRecord.groupKey),
+        _buildExpandedMapForAll(details, mergedRecord.groupKey),
         const Divider(color: Colors.white24, height: 24),
-        ...mergedRecord.records.map((record) => _buildSubRecordItem(
-            record, mergedRecord.latestRecord, _mergeSettings.groupBy)),
+        ...details.map((record) =>
+            _buildSubRecordItem(record, mergedRecord.latestRecord)),
       ],
     );
   }
 
-  Widget _buildSubRecordItem(
-      TrainRecord record, TrainRecord latest, GroupBy groupBy) {
-    String differingInfo = _getDifferingInfo(record, latest, groupBy);
+  Widget _buildSubRecordItem(TrainRecord record, TrainRecord latest) {
+    String differingInfo = _getDifferingInfo(record, latest);
     String locationInfo = _getLocationInfo(record);
 
     return Padding(
@@ -524,64 +845,26 @@ class HistoryScreenState extends State<HistoryScreen> {
     );
   }
 
-  String _formatLocoInfo(TrainRecord record) {
-    final locoType = record.locoType.trim();
-    final loco = record.loco.trim();
+  String _formatLocoInfo(TrainRecord record) => record.formattedLocoDisplay;
 
-    if (locoType.isNotEmpty && loco.isNotEmpty) {
-      final shortLoco =
-          loco.length > 5 ? loco.substring(loco.length - 5) : loco;
-      return "$locoType-$shortLoco";
-    } else if (locoType.isNotEmpty) {
-      return locoType;
-    } else if (loco.isNotEmpty) {
-      return loco;
-    }
-    return "";
-  }
-
-  String _getDifferingInfo(
-      TrainRecord record, TrainRecord latest, GroupBy groupBy) {
+  String _getDifferingInfo(TrainRecord record, TrainRecord latest) {
     final train = record.train.trim();
     final loco = record.loco.trim();
     final latestTrain = latest.train.trim();
     final latestLoco = latest.loco.trim();
 
-    switch (groupBy) {
-      case GroupBy.trainOnly:
-        if (loco != latestLoco && loco.isNotEmpty) {
-          return _formatLocoInfo(record);
-        }
-        return "";
-      case GroupBy.locoOnly:
-        return train != latestTrain && train.isNotEmpty ? train : "";
-      case GroupBy.trainOrLoco:
-        final trainDiff = train.isNotEmpty && train != latestTrain ? train : "";
-        final locoDiff = loco.isNotEmpty && loco != latestLoco
-            ? _formatLocoInfo(record)
-            : "";
+    final trainDiff = train.isNotEmpty && train != latestTrain ? train : "";
+    final locoDiff =
+        loco.isNotEmpty && loco != latestLoco ? _formatLocoInfo(record) : "";
 
-        if (trainDiff.isNotEmpty && locoDiff.isNotEmpty) {
-          return "$trainDiff $locoDiff";
-        } else if (trainDiff.isNotEmpty) {
-          return trainDiff;
-        } else if (locoDiff.isNotEmpty) {
-          return locoDiff;
-        }
-        return "";
-      case GroupBy.trainAndLoco:
-        if (train.isNotEmpty && train != latestTrain) {
-          final locoInfo = _formatLocoInfo(record);
-          if (locoInfo.isNotEmpty) {
-            return "$train $locoInfo";
-          }
-          return train;
-        }
-        if (loco.isNotEmpty && loco != latestLoco) {
-          return _formatLocoInfo(record);
-        }
-        return "";
+    if (trainDiff.isNotEmpty && locoDiff.isNotEmpty) {
+      return "$trainDiff $locoDiff";
+    } else if (trainDiff.isNotEmpty) {
+      return trainDiff;
+    } else if (locoDiff.isNotEmpty) {
+      return locoDiff;
     }
+    return "";
   }
 
   String _getLocationInfo(TrainRecord record) {
@@ -619,7 +902,8 @@ class HistoryScreenState extends State<HistoryScreen> {
       _mapCalculating[mapId] = true;
 
       _calculateOptimalZoomAsync(positions,
-              containerWidth: 400, containerHeight: 220)
+              containerWidth: MediaQuery.of(context).size.width / _getCrossAxisCount(MediaQuery.of(context).size.width) - 40,
+              containerHeight: _getMapHeight())
           .then((optimalZoom) {
         if (mounted) {
           setState(() {
@@ -652,7 +936,7 @@ class HistoryScreenState extends State<HistoryScreen> {
     return Column(children: [
       const SizedBox(height: 8),
       Container(
-          height: 220,
+          height: _getMapHeight(),
           margin: const EdgeInsets.symmetric(vertical: 4),
           decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(8), color: Colors.grey[900]),
@@ -780,17 +1064,7 @@ class HistoryScreenState extends State<HistoryScreen> {
 
   Widget _buildRecordHeader(TrainRecord record, {bool isMerged = false}) {
     final trainType = record.trainType;
-    String formattedLocoInfo = "";
-    if (record.locoType.isNotEmpty && record.loco.isNotEmpty) {
-      final shortLoco = record.loco.length > 5
-          ? record.loco.substring(record.loco.length - 5)
-          : record.loco;
-      formattedLocoInfo = "${record.locoType}-$shortLoco";
-    } else if (record.locoType.isNotEmpty) {
-      formattedLocoInfo = record.locoType;
-    } else if (record.loco.isNotEmpty) {
-      formattedLocoInfo = record.loco;
-    }
+    final formattedLocoInfo = record.formattedLocoDisplay;
 
     if (record.fullTrainNumber.isEmpty && formattedLocoInfo.isEmpty) {
       return Text(
@@ -806,7 +1080,6 @@ class HistoryScreenState extends State<HistoryScreen> {
     final hasLocoInfo =
         formattedLocoInfo.isNotEmpty && formattedLocoInfo != "<NUL>";
     final shouldShowTrainRow = hasTrainNumber || hasDirection || hasLocoInfo;
-    final hasPosition = _parsePosition(record.positionInfo) != null;
 
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
@@ -1253,7 +1526,7 @@ class _DelayedMapWithMarkerState extends State<_DelayedMapWithMarker> {
         mapController: _mapController,
         children: [
           TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
               userAgentPackageName: 'org.noxylva.lbjconsole'),
           MarkerLayer(markers: markers),
         ],
@@ -1267,7 +1540,7 @@ class _DelayedMapWithMarkerState extends State<_DelayedMapWithMarker> {
       mapController: _mapController,
       children: [
         TileLayer(
-            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
             userAgentPackageName: 'org.noxylva.lbjconsole'),
         MarkerLayer(markers: markers),
       ],
@@ -1396,7 +1669,7 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
       mapController: _mapController,
       children: [
         TileLayer(
-          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
           userAgentPackageName: 'org.noxylva.lbjconsole',
         ),
         MarkerLayer(markers: markers),

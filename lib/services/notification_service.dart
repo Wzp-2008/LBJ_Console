@@ -22,11 +22,12 @@ class NotificationService {
 
     const InitializationSettings initializationSettings =
         InitializationSettings(
-      android: initializationSettingsAndroid,
+            android: initializationSettingsAndroid,
+            windows: WindowsInitializationSettings(appName: "LBJReceiver", appUserModelId: "LBJReceiver", guid: "194022DA-0502-4B90-8D31-14B3ECE27391")
     );
 
     await _notificationsPlugin.initialize(
-      initializationSettings,
+      settings: initializationSettings,
       onDidReceiveNotificationResponse: (details) {},
     );
 
@@ -79,10 +80,10 @@ class NotificationService {
         NotificationDetails(android: androidPlatformChannelSpecifics);
 
     await _notificationsPlugin.show(
-      _notificationId++,
-      title,
-      body,
-      platformChannelSpecifics,
+      id: _notificationId++,
+      title: title,
+      body: body,
+      notificationDetails: platformChannelSpecifics,
       payload: 'train_${record.train}',
     );
   }
@@ -101,15 +102,8 @@ class NotificationService {
       buffer.write(' ${record.positionInfo}');
     }
     buffer.writeln();
-    if (_isValidValue(record.locoType) && _isValidValue(record.loco)) {
-      final shortLoco = record.loco.length > 5
-          ? record.loco.substring(record.loco.length - 5)
-          : record.loco;
-      buffer.write('${record.locoType}-$shortLoco');
-    } else if (_isValidValue(record.locoType)) {
-      buffer.write(record.locoType);
-    } else if (_isValidValue(record.loco)) {
-      buffer.write(record.loco);
+    if (_isValidValue(record.loco) || _isValidValue(record.locoType)) {
+      buffer.write(record.formattedLocoDisplay);
     }
 
     if (_isValidValue(record.speed)) {

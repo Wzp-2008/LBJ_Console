@@ -166,3 +166,8 @@ macos/Flutter/ephemeral/flutter_export_environment.sh
 macos/Flutter/ephemeral/Flutter-Generated.xcconfig
 *.py
 PDW
+# Secrets and large sample data (not committed)
+android-key
+*.keystore
+*.jks
+LBJ_Console_output.json

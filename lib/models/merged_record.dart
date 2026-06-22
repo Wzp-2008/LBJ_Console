@@ -2,61 +2,49 @@ import 'package:lbjconsole/models/train_record.dart';
 
 class MergedTrainRecord {
   final String groupKey;
-  final List<TrainRecord> records;
   final TrainRecord latestRecord;
+  final TrainRecord summaryRecord;
+  final List<String> memberUniqueIds;
+  List<TrainRecord>? _detailRecords;
 
   MergedTrainRecord({
     required this.groupKey,
-    required this.records,
     required this.latestRecord,
-  });
+    required this.summaryRecord,
+    required this.memberUniqueIds,
+    List<TrainRecord>? detailRecords,
+  }) : _detailRecords = detailRecords;
 
-  int get recordCount => records.length;
-}
+  int get recordCount => memberUniqueIds.length;
 
-class MergeSettings {
-  final bool enabled;
-  final GroupBy groupBy;
-  final TimeWindow timeWindow;
-  final bool hideUngroupableRecords;
-  MergeSettings({
-    this.enabled = true,
-    this.groupBy = GroupBy.trainAndLoco,
-    this.timeWindow = TimeWindow.unlimited,
-    this.hideUngroupableRecords = false,
-  });
+  bool get hasLoadedDetails =>
+      _detailRecords != null &&
+      _detailRecords!.length >= memberUniqueIds.length;
 
-  factory MergeSettings.fromMap(Map<String, dynamic> map) {
-    return MergeSettings(
-      enabled: (map['mergeRecordsEnabled'] ?? 0) == 1,
-      groupBy: GroupBy.values.firstWhere(
-        (e) => e.name == map['groupBy'],
-        orElse: () => GroupBy.trainAndLoco,
-      ),
-      timeWindow: TimeWindow.values.firstWhere(
-        (e) => e.name == map['timeWindow'],
-        orElse: () => TimeWindow.unlimited,
-      ),
-      hideUngroupableRecords: (map['hideUngroupableRecords'] ?? 0) == 1,
-    );
+  /// Collapsed card / lightweight access — latest only until expanded.
+  List<TrainRecord> get records {
+    if (hasLoadedDetails) return _detailRecords!;
+    return [latestRecord];
+  }
+
+  void setDetailRecords(List<TrainRecord> loaded) {
+    _detailRecords = loaded;
+  }
+
+  bool containsRecordId(String uniqueId) => memberUniqueIds.contains(uniqueId);
+
+  /// Resolve from in-memory page cache without hitting the database.
+  List<TrainRecord> resolveFromCache(List<TrainRecord> cache) {
+    if (hasLoadedDetails) return _detailRecords!;
+    final fromCache =
+        cache.where((r) => memberUniqueIds.contains(r.uniqueId)).toList();
+    if (fromCache.length >= memberUniqueIds.length) {
+      fromCache.sort(
+        (a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp),
+      );
+      return fromCache;
+    }
+    return records;
   }
 }
 
-enum GroupBy {
-  trainOnly,
-  locoOnly,
-  trainOrLoco,
-  trainAndLoco,
-}
-
-enum TimeWindow {
-  oneHour(Duration(hours: 1)),
-  twoHours(Duration(hours: 2)),
-  sixHours(Duration(hours: 6)),
-  twelveHours(Duration(hours: 12)),
-  oneDay(Duration(days: 1)),
-  unlimited(null);
-
-  final Duration? duration;
-  const TimeWindow(this.duration);
-}

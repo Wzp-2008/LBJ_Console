@@ -103,10 +103,10 @@ class BackgroundService {
               ?.createNotificationChannel(channel);
 
           await flutterLocalNotificationsPlugin.show(
-            _notificationId,
-            'LBJ Console',
-            '蓝牙连接监控中',
-            const NotificationDetails(
+            id: _notificationId,
+            title: 'LBJ Console',
+            body: '蓝牙连接监控中',
+            notificationDetails: const NotificationDetails(
               android: AndroidNotificationDetails(
                 _notificationChannelId,
                 _notificationChannelName,
@@ -142,10 +142,10 @@ class BackgroundService {
             final flutterLocalNotificationsPlugin =
                 FlutterLocalNotificationsPlugin();
             await flutterLocalNotificationsPlugin.show(
-              _notificationId,
-              'LBJ Console',
-              isConnected ? '蓝牙已连接 - $deviceStatus' : '蓝牙未连接 - 自动重连中',
-              const NotificationDetails(
+              id: _notificationId,
+              title: 'LBJ Console',
+              body: isConnected ? '蓝牙已连接 - $deviceStatus' : '蓝牙未连接 - 自动重连中',
+              notificationDetails: const NotificationDetails(
                 android: AndroidNotificationDetails(
                   _notificationChannelId,
                   _notificationChannelName,
@@ -178,6 +178,7 @@ class BackgroundService {
   }
 
   static Future<void> startService() async {
+    if (Platform.isWindows) return;
     await initialize();
     final service = FlutterBackgroundService();
 
@@ -192,16 +193,19 @@ class BackgroundService {
   }
 
   static Future<void> stopService() async {
+    if (Platform.isWindows) return;
     final service = FlutterBackgroundService();
     service.invoke('stopService');
   }
 
   static Future<bool> isRunning() async {
+    if (Platform.isWindows) return false;
     final service = FlutterBackgroundService();
     return await service.isRunning();
   }
 
   static void setForegroundMode(bool isForeground) {
+    if (Platform.isWindows) return;
     final service = FlutterBackgroundService();
     if (isForeground) {
       service.invoke('setAsForeground');

@@ -1,20 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
 import 'package:lbjconsole/models/train_record.dart';
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/rtl_tcp_service.dart';
 
 class BLEService {
   static final BLEService _instance = BLEService._internal();
+
   factory BLEService() => _instance;
+
   BLEService._internal() {
     _rtlTcpService = RtlTcpService();
   }
 
   late final RtlTcpService _rtlTcpService;
+
   RtlTcpService? get rtlTcpService => _rtlTcpService;
 
   static const String TAG = "LBJ_BT_FLUTTER";
@@ -37,13 +41,17 @@ class BLEService {
       StreamController<DateTime?>.broadcast();
 
   Stream<String> get statusStream => _statusController.stream;
+
   Stream<TrainRecord> get dataStream => _dataController.stream;
+
   Stream<bool> get connectionStream => _connectionController.stream;
+
   Stream<DateTime?> get lastReceivedTimeStream =>
       _lastReceivedTimeController.stream;
 
   String _deviceStatus = "未连接";
   String? _lastKnownDeviceAddress;
+  String? _lastKnownDeviceDisplayName;
   String _targetDeviceName = "LBJReceiver";
   DateTime? _lastReceivedTime;
 
@@ -65,6 +73,12 @@ class BLEService {
       }
     });
     _startHeartbeat();
+    // Check immediately — don't wait for adapter state change event
+    FlutterBluePlus.adapterState.first.then((state) {
+      if (state == BluetoothAdapterState.on) {
+        ensureConnection();
+      }
+    });
   }
 
   void _startHeartbeat() {
@@ -79,6 +93,7 @@ class BLEService {
       final settings = await DatabaseService.instance.getAllSettings();
       if (settings != null) {
         _targetDeviceName = settings['deviceName'] ?? 'LBJReceiver';
+        _lastKnownDeviceAddress = settings['specifiedDeviceAddress'] as String?;
       }
     } catch (e) {}
   }
@@ -91,20 +106,28 @@ class BLEService {
   }
 
   Future<void> _tryReconnectDirectly() async {
-    if (_lastKnownDeviceAddress == null) {
-      startScan();
-      return;
-    }
-
     _isConnecting = true;
     _statusController.add("正在重连...");
 
     try {
-      final connected = await FlutterBluePlus.connectedSystemDevices;
-      final matchingDevices =
-          connected.where((d) => d.remoteId.str == _lastKnownDeviceAddress);
-      BluetoothDevice? target =
-          matchingDevices.isNotEmpty ? matchingDevices.first : null;
+      final connected = FlutterBluePlus.connectedDevices;
+
+      // First: try match by last known address
+      BluetoothDevice? target;
+      if (_lastKnownDeviceAddress != null) {
+        target = connected.cast<BluetoothDevice?>().firstWhere(
+          (d) => d!.remoteId.str == _lastKnownDeviceAddress,
+          orElse: () => null,
+        );
+      }
+
+      // Second: try match by device name (OS may have maintained the connection but with a different handle)
+      if (target == null) {
+        target = connected.cast<BluetoothDevice?>().firstWhere(
+          (d) => d!.platformName.toLowerCase() == _targetDeviceName.toLowerCase(),
+          orElse: () => null,
+        );
+      }
 
       if (target != null) {
         await connect(target);
@@ -124,7 +147,7 @@ class BLEService {
     Function(List<BluetoothDevice>)? onScanResults,
   }) async {
     if (FlutterBluePlus.isScanningNow) {
-      return;
+      await FlutterBluePlus.stopScan();
     }
 
     _targetDeviceName = targetName ?? _targetDeviceName;
@@ -159,7 +182,10 @@ class BLEService {
     });
 
     try {
-      await FlutterBluePlus.startScan(timeout: timeout);
+      await FlutterBluePlus.startScan(
+        timeout: timeout,
+        withServices: [Guid.fromString("0000FFE0-0000-1000-8000-00805F9B34FB")],
+      );
     } catch (e) {
       _statusController.add("扫描失败");
     }
@@ -201,7 +227,16 @@ class BLEService {
         }
       });
 
-      await device.connect(timeout: const Duration(seconds: 15));
+      // If already connected at OS level, skip connect() and go straight to service discovery
+      final systemConnected = FlutterBluePlus.connectedDevices;
+      final alreadyConnected = systemConnected.any((d) => d.remoteId == device.remoteId);
+
+      if (!alreadyConnected) {
+        await device.connect(timeout: const Duration(seconds: 15));
+      } else if (Platform.isWindows) {
+        // WinBle needs a short settle time before GATT discovery on existing links.
+        await Future.delayed(const Duration(milliseconds: 400));
+      }
       await _onConnected(device);
     } catch (e) {
       _onDisconnected();
@@ -209,31 +244,82 @@ class BLEService {
   }
 
   Future<void> _onConnected(BluetoothDevice device) async {
-    _connectedDevice = device;
-    _lastKnownDeviceAddress = device.remoteId.str;
+    _rememberDeviceIdentity(device);
     await _discoverServicesAndSetupNotifications(device);
   }
 
-  void _onDisconnected() {
-    final wasConnected = isConnected;
-    _updateConnectionState(false, "连接已断开");
-    _connectionStateSubscription?.cancel();
-
-    if (wasConnected && !_isManualDisconnect) {
-      ensureConnection();
+  void _rememberDeviceIdentity(BluetoothDevice device) {
+    final address = device.remoteId.str;
+    if (address.isNotEmpty) {
+      _lastKnownDeviceAddress = address;
+      DatabaseService.instance.setSetting('specifiedDeviceAddress', address);
     }
-    _isConnecting = false;
+    final name = device.platformName.trim();
+    if (name.isNotEmpty) {
+      _lastKnownDeviceDisplayName = name;
+    }
+  }
+
+  Future<List<BluetoothService>> _discoverServicesWithRetry(
+    BluetoothDevice device, {
+    int attempts = 3,
+  }) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      try {
+        if (attempt > 0) {
+          await Future.delayed(Duration(milliseconds: 350 * attempt));
+        }
+        return await device.discoverServices();
+      } catch (e) {
+        lastError = e;
+        if (!Platform.isWindows || attempt >= attempts - 1) {
+          rethrow;
+        }
+      }
+    }
+    throw lastError ?? Exception('discoverServices failed');
+  }
+
+  Future<void> _writeTimeSyncToWritableCharacteristics(
+    List<BluetoothService> services,
+  ) async {
+    final now = DateTime.now();
+    final formatted =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} '
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+    final payload = utf8.encode('TIME:$formatted');
+
+    for (final service in services) {
+      for (final c in service.characteristics) {
+        try {
+          bool write =
+              c.properties.write || c.properties.writeWithoutResponse;
+          if (Platform.isWindows) {
+            final prop = (c as BluetoothCharacteristicWindows).propertiesWinBle;
+            write = prop.write == true || prop.writeWithoutResponse == true;
+          }
+          if (write) {
+            await c.write(payload);
+          }
+        } catch (_) {}
+      }
+    }
   }
 
   Future<void> _discoverServicesAndSetupNotifications(
-      BluetoothDevice device) async {
+    BluetoothDevice device,
+  ) async {
     try {
-      final services = await device.discoverServices();
+      final services = await _discoverServicesWithRetry(device);
+      await _writeTimeSyncToWritableCharacteristics(services);
+
       for (var service in services) {
         if (service.uuid == serviceUuid) {
           for (var char in service.characteristics) {
             if (char.uuid == charUuid) {
               _characteristic = char;
+              _connectedDevice = device;
               await device.requestMtu(512);
               await char.setNotifyValue(true);
               _valueSubscription = char.lastValueStream.listen(_onDataReceived);
@@ -245,10 +331,28 @@ class BLEService {
           }
         }
       }
-      await device.disconnect();
+      throw Exception('LBJ GATT service not found');
     } catch (e) {
-      await device.disconnect();
+      _isConnecting = false;
+      await _valueSubscription?.cancel();
+      _valueSubscription = null;
+      _characteristic = null;
+      try {
+        await device.disconnect();
+      } catch (_) {}
+      _onDisconnected(attemptReconnect: true);
     }
+  }
+
+  void _onDisconnected({bool attemptReconnect = true}) {
+    final wasConnected = isConnected;
+    _updateConnectionState(false, "连接已断开");
+    _connectionStateSubscription?.cancel();
+
+    if ((wasConnected || attemptReconnect) && !_isManualDisconnect) {
+      ensureConnection();
+    }
+    _isConnecting = false;
   }
 
   Future<void> connectManually(BluetoothDevice device) async {
@@ -264,11 +368,18 @@ class BLEService {
 
     await _connectionStateSubscription?.cancel();
     await _valueSubscription?.cancel();
+    _valueSubscription = null;
 
-    if (_connectedDevice != null) {
-      await _connectedDevice!.disconnect();
+    final device = _connectedDevice;
+    _characteristic = null;
+    _connectedDevice = null;
+
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
     }
-    _onDisconnected();
+    _onDisconnected(attemptReconnect: false);
   }
 
   void _onDataReceived(List<int> value) {
@@ -366,11 +477,32 @@ class BLEService {
     _isAutoConnectBlocked = blocked;
   }
 
-  bool get isConnected => _connectedDevice != null;
+  bool get isConnected => _characteristic != null;
+
   String get deviceStatus => _deviceStatus;
-  String? get deviceAddress => _connectedDevice?.remoteId.str;
+
+  String? get deviceAddress => connectedDeviceAddress;
+
+  String get connectedDeviceName {
+    final liveName = _connectedDevice?.platformName.trim();
+    if (liveName != null && liveName.isNotEmpty) return liveName;
+    if (_lastKnownDeviceDisplayName != null &&
+        _lastKnownDeviceDisplayName!.isNotEmpty) {
+      return _lastKnownDeviceDisplayName!;
+    }
+    return _targetDeviceName;
+  }
+
+  String? get connectedDeviceAddress {
+    final liveAddress = _connectedDevice?.remoteId.str;
+    if (liveAddress != null && liveAddress.isNotEmpty) return liveAddress;
+    return _lastKnownDeviceAddress;
+  }
+
   bool get isScanning => FlutterBluePlus.isScanningNow;
+
   BluetoothDevice? get connectedDevice => _connectedDevice;
+
   bool get isManualDisconnect => _isManualDisconnect;
 
   void dispose() {

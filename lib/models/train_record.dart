@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:lbjconsole/util/train_type_util.dart';
 import 'package:lbjconsole/util/loco_info_util.dart';
+import 'package:lbjconsole/util/loco_type_util.dart';
 
 class TrainRecord {
   final String uniqueId;
@@ -80,7 +81,161 @@ class TrainRecord {
     };
   }
 
-  Map<String, dynamic> toDatabaseJson() {
+  static bool _isMeaningfulSearchToken(String value) {
+    if (value.isEmpty || value == '<NUL>' || value == 'NUL') return false;
+    final cleaned = value.replaceAll('<NUL>', '').trim();
+    if (cleaned.isEmpty || cleaned.contains('-----')) return false;
+    if (cleaned.runes.every((r) => r == '*'.runes.first || r == ' '.runes.first)) {
+      return false;
+    }
+    return true;
+  }
+
+  static String? _normalizeSearchToken(String value) {
+    if (!_isMeaningfulSearchToken(value)) return null;
+    return value.replaceAll('<NUL>', '').replaceAll('-', '').trim().toLowerCase();
+  }
+
+  static String computeFullTrainNumber(String lbjClass, String train) {
+    final lbjClassValue = lbjClass.trim();
+    final trainValue = train.trim();
+    if (trainValue == '<NUL>' || trainValue.contains('-----')) {
+      return '';
+    }
+    if (lbjClassValue.isEmpty || lbjClassValue == 'NA') {
+      return trainValue;
+    }
+    return '$lbjClassValue$trainValue';
+  }
+
+  static String buildSearchText({
+    required String lbjClass,
+    required String train,
+    required String locoType,
+    required String loco,
+    String route = '',
+    String positionInfo = '',
+  }) {
+    final tokens = <String>{};
+    void add(String? value) {
+      final token = value == null ? null : _normalizeSearchToken(value);
+      if (token != null && token.isNotEmpty) {
+        tokens.add(token);
+      }
+    }
+
+    add(computeFullTrainNumber(lbjClass, train));
+    add(lbjClass + train);
+    add(train);
+    add(lbjClass);
+    add(locoType + loco);
+    add(locoType);
+    add(loco);
+    add(route);
+    add(positionInfo);
+
+    return tokens.join(' ');
+  }
+
+  /// Whether [normalizedQuery] is already lower-case with dashes removed.
+  static bool matchesSearchQuery(TrainRecord record, String normalizedQuery) {
+    if (normalizedQuery.isEmpty) return false;
+
+    bool containsNormalized(String value) {
+      final token = _normalizeSearchToken(value);
+      return token != null && token.contains(normalizedQuery);
+    }
+
+    if (containsNormalized(computeFullTrainNumber(record.lbjClass, record.train))) {
+      return true;
+    }
+    if (containsNormalized(record.lbjClass + record.train)) return true;
+    if (containsNormalized(record.route)) return true;
+    if (containsNormalized(record.positionInfo)) return true;
+
+    final trainLike = RegExp(r'^[a-z]{1,4}\d+$').hasMatch(normalizedQuery);
+    if (!trainLike) {
+      if (containsNormalized(record.locoType + record.loco)) return true;
+      if (containsNormalized(record.loco)) return true;
+      if (record.searchText.toLowerCase().contains(normalizedQuery)) return true;
+    }
+
+    return false;
+  }
+
+  String get searchText => buildSearchText(
+        lbjClass: lbjClass,
+        train: train,
+        locoType: locoType,
+        loco: loco,
+        route: route,
+        positionInfo: positionInfo,
+      );
+
+  static bool _isFieldMeaningful(String field) {
+    if (field.isEmpty) return false;
+    final cleaned = field.replaceAll('<NUL>', '').trim();
+    if (cleaned.isEmpty) return false;
+    if (cleaned.runes
+        .every((r) => r == '*'.runes.first || r == ' '.runes.first)) {
+      return false;
+    }
+    return true;
+  }
+
+  /// A record is "time-only" when every informative field is invalid;
+  /// such records never enter the merge cache and are always hidden.
+  bool get isTimeOnly {
+    final hasTrainNumber =
+        _isFieldMeaningful(fullTrainNumber) && !fullTrainNumber.contains('-----');
+    final hasDirection = direction == 1 || direction == 3;
+    final hasLocoInfo = _isFieldMeaningful(locoType) || _isFieldMeaningful(loco);
+    final hasRoute = _isFieldMeaningful(route);
+    final hasPosition = _isFieldMeaningful(position);
+    final hasSpeed = _isFieldMeaningful(speed) && speed != 'NUL';
+    final hasPositionInfo = _isFieldMeaningful(positionInfo);
+    final hasTrainType = _isFieldMeaningful(trainType) && trainType != '未知';
+    final hasLbjClass = _isFieldMeaningful(lbjClass) && lbjClass != 'NA';
+    final hasTrain = _isFieldMeaningful(train) && !train.contains('-----');
+    return !(hasTrainNumber ||
+        hasDirection ||
+        hasLocoInfo ||
+        hasRoute ||
+        hasPosition ||
+        hasSpeed ||
+        hasPositionInfo ||
+        hasTrainType ||
+        hasLbjClass ||
+        hasTrain);
+  }
+
+  /// Normalized grouping key for the train number, or null when invalid.
+  String? get trainKey {
+    final value = train.trim();
+    final valid =
+        value.isNotEmpty && value != '<NUL>' && !value.contains('-----');
+    return valid ? value : null;
+  }
+
+  /// Normalized grouping key for the locomotive number, or null when invalid.
+  String? get locoKey {
+    final value = loco.trim();
+    final valid = value.isNotEmpty && value != '<NUL>';
+    return valid ? value : null;
+  }
+
+  /// Derived columns persisted on train_records for SQL-side filtering.
+  Map<String, dynamic> derivedColumns() {
+    return {
+      'isTimeOnly': isTimeOnly ? 1 : 0,
+      'trainKey': trainKey,
+      'locoKey': locoKey,
+    };
+  }
+
+  /// Lightweight JSON for isolate transfer / caching — skips the costly
+  /// [searchText] computation, which is only needed for real DB writes.
+  Map<String, dynamic> toTransferJson() {
     return {
       'uniqueId': uniqueId,
       'timestamp': timestamp.millisecondsSinceEpoch,
@@ -96,6 +251,13 @@ class TrainRecord {
       'route': route,
       'positionInfo': positionInfo,
       'rssi': rssi,
+    };
+  }
+
+  Map<String, dynamic> toDatabaseJson() {
+    return {
+      ...toTransferJson(),
+      'searchText': searchText,
     };
   }
 
@@ -142,23 +304,14 @@ class TrainRecord {
   }
 
   String? get locoInfo {
-    return LocoInfoUtil.getLocoInfoDisplay(locoType, train);
+    return LocoInfoUtil.getLocoInfoForRecord(locoType: locoType, loco: loco);
   }
 
-  String get fullTrainNumber {
-    final lbjClassValue = lbjClass.trim();
-    final trainValue = train.trim();
+  String get formattedLocoDisplay =>
+      LocoTypeUtil.formatLocoDisplay(locoType, loco);
 
-    if (trainValue == "<NUL>" || trainValue.contains("-----")) {
-      return "";
-    }
-
-    if (lbjClassValue.isEmpty || lbjClassValue == "NA") {
-      return trainValue;
-    } else {
-      return "$lbjClassValue$trainValue";
-    }
-  }
+  String get fullTrainNumber =>
+      TrainRecord.computeFullTrainNumber(lbjClass, train);
 
   String get lbjClassText {
     if (lbjClass.isEmpty) return '未知';

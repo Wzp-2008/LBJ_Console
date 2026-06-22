@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:gbk_codec/gbk_codec.dart';
 import 'package:lbjconsole/models/train_record.dart';
 import 'package:lbjconsole/services/database_service.dart';
+import 'package:lbjconsole/util/loco_type_util.dart';
 
 const String _lbjInfoAddr = "1234000";
 const String _lbjInfo2Addr = "1234002";
@@ -183,14 +184,14 @@ class _LbJState {
     }
 
     String kmPosition = positionKm.replaceAll(' <NUL>', '');
-
+    String locoResult = loco.replaceAll('<NUL>', '');
     final jsonData = {
       'uniqueId': '${now.millisecondsSinceEpoch}_${Random().nextInt(9999)}',
       'receivedTimestamp': now.millisecondsSinceEpoch,
       'timestamp': now.millisecondsSinceEpoch,
       'rssi': finalRssi,
       'train': train.replaceAll('<NUL>', ''),
-      'loco': loco.replaceAll('<NUL>', ''),
+      'loco': locoResult,
       'speed': speed.replaceAll('NUL', ''),
       'position': kmPosition,
       'positionInfo': gpsPosition,
@@ -198,7 +199,7 @@ class _LbJState {
       'lbjClass': lbjClass.replaceAll('NA', ''),
       'time': time.replaceAll('<NUL>', ''),
       'direction': (direction == 1 || direction == 3) ? direction : 0,
-      'locoType': "",
+      'locoType': locoResult.length >= 3 ? LocoTypeUtil().getLocoTypeByLocoNumber(locoResult) : "Unknown",
     };
     return jsonData;
   }

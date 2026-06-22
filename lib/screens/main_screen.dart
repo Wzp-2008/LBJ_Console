@@ -2,11 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:developer' as developer;
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
 import 'package:lbjconsole/screens/history_screen.dart';
-import 'package:lbjconsole/screens/map_screen.dart';
-import 'package:lbjconsole/screens/map_webview_screen.dart';
-import 'package:lbjconsole/screens/realtime_screen.dart';
 import 'package:lbjconsole/screens/settings_screen.dart';
 import 'package:lbjconsole/services/ble_service.dart';
 import 'package:lbjconsole/services/database_service.dart';
@@ -223,7 +220,6 @@ class MainScreen extends StatefulWidget {
 
 class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   int _currentIndex = 0;
-  String _mapType = 'webview';
 
   late final BLEService _bleService;
   late final RtlTcpService _rtlTcpService;
@@ -246,13 +242,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool _isHistoryEditMode = false;
   
   InputSource _inputSource = InputSource.bluetooth;
+  int _recordCount = 0;
   
   bool _rtlTcpConnected = false;
   bool _isConnected = false;
   final GlobalKey<HistoryScreenState> _historyScreenKey =
       GlobalKey<HistoryScreenState>();
-  final GlobalKey<RealtimeScreenState> _realtimeScreenKey =
-      GlobalKey<RealtimeScreenState>();
 
   @override
   void initState() {
@@ -267,15 +262,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _setupConnectionListener();
     _setupLastReceivedTimeListener();
     _setupSettingsListener();
-    _loadMapType();
+    _loadRecordCount();
   }
 
-  Future<void> _loadMapType() async {
-    final settings = await DatabaseService.instance.getAllSettings();
+  Future<void> _loadRecordCount() async {
+    final count = await DatabaseService.instance.getRecordCount();
     if (mounted) {
-      setState(() {
-        _mapType = settings?['mapType']?.toString() ?? 'webview';
-      });
+      setState(() => _recordCount = count);
     }
   }
 
@@ -376,9 +369,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             break;
         }
         
-        if (_currentIndex == 1) {
-          _realtimeScreenKey.currentState?.loadRecords(scrollToTop: false);
-        }
+        _historyScreenKey.currentState?.reloadRecords();
       }
     });
   }
@@ -435,7 +426,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _bleService.onAppResume();
-      _loadMapType();
     }
   }
 
@@ -464,7 +454,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void _processRecord(record) {
     _notificationService.showTrainNotification(record);
     _historyScreenKey.currentState?.addNewRecord(record);
-    _realtimeScreenKey.currentState?.addNewRecord(record);
+    _recordCount++;
+    if (mounted) setState(() {});
   }
 
   void _showConnectionDialog() {
@@ -519,7 +510,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       backgroundColor: AppTheme.primaryBlack,
       elevation: 0,
       title: Text(
-        ['列车记录', '数据监控', '位置地图', '设置'][_currentIndex],
+        '${['列车记录', '设置'][_currentIndex]}${_currentIndex == 0 ? ' ($_recordCount)' : ''}',
         style: const TextStyle(
             color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
       ),
@@ -599,8 +590,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       await DatabaseService.instance.deleteRecords(idsToDelete);
 
       historyState.setEditMode(false);
-
-      historyState.loadRecords(scrollToTop: false);
+      historyState.reloadRecords();
+      _loadRecordCount();
     }
   }
 
@@ -619,14 +610,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         onEditModeChanged: _handleHistoryEditModeChanged,
         onSelectionChanged: _handleSelectionChanged,
       ),
-      RealtimeScreen(
-        key: _realtimeScreenKey,
-      ),
-      _mapType == 'map' ? const MapScreen() : const MapWebViewScreen(),
       SettingsScreen(
-        onSettingsChanged: () {
-          _loadMapType();
-        },
+        onSettingsChanged: () {},
       ),
     ];
 
@@ -644,12 +629,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         onDestinationSelected: (index) {
           if (index == 0) {
             _historyScreenKey.currentState?.reloadRecords();
-          }
-          if (index == 1) {
-            _realtimeScreenKey.currentState?.loadRecords(scrollToTop: false);
-          }
-          if (_currentIndex == 3 && index == 2) {
-            _loadMapType();
+            _loadRecordCount();
           }
           setState(() {
             if (_isHistoryEditMode) _isHistoryEditMode = false;
@@ -659,8 +639,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         destinations: const [
           NavigationDestination(
               icon: Icon(Icons.directions_railway), label: '列车记录'),
-          NavigationDestination(icon: Icon(Icons.speed), label: '数据监控'),
-          NavigationDestination(icon: Icon(Icons.location_on), label: '位置地图'),
           NavigationDestination(icon: Icon(Icons.settings), label: '设置'),
         ],
       ),
@@ -725,8 +703,8 @@ class _PixelPerfectBluetoothDialogState
     if (_scanState == _ScanState.scanning) return;
     if (mounted) {
       setState(() {
-        _devices.clear();
         _scanState = _ScanState.scanning;
+        _devices.clear();
       });
     }
     await widget.bleService.startScan(
@@ -786,10 +764,11 @@ class _PixelPerfectBluetoothDialogState
               .titleMedium
               ?.copyWith(fontWeight: FontWeight.bold)),
       const SizedBox(height: 4),
-      Text(device?.platformName ?? '未知设备', textAlign: TextAlign.center),
-      Text(device?.remoteId.str ?? '',
-          style: Theme.of(context).textTheme.bodySmall,
-          textAlign: TextAlign.center),
+      Text(widget.bleService.connectedDeviceName, textAlign: TextAlign.center),
+      if (widget.bleService.connectedDeviceAddress != null)
+        Text(widget.bleService.connectedDeviceAddress!,
+            style: Theme.of(context).textTheme.bodySmall,
+            textAlign: TextAlign.center),
       const SizedBox(height: 16),
       ElevatedButton.icon(
           onPressed: _disconnect,
@@ -839,9 +818,9 @@ class _PixelPerfectBluetoothDialogState
   }
 
   Widget _buildAudioInputView(BuildContext context) {
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      const SizedBox(height: 8),
-      const AudioWaterfallWidget(),
+    return const Column(mainAxisSize: MainAxisSize.min, children: [
+      SizedBox(height: 8),
+      AudioWaterfallWidget(),
     ]);
   }
 
