@@ -538,35 +538,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ],
             ),
-            Visibility(
-              visible: _mergeRecordsEnabled,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const SizedBox(height: 16),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('隐藏不可分组记录', style: AppTheme.bodyLarge),
-                        ],
-                      ),
-                      Switch(
-                        value: _hideUngroupableRecords,
-                        onChanged: (value) {
-                          setState(() {
-                            _hideUngroupableRecords = value;
-                          });
-                          _saveImmediately();
-                        },
-                        activeThumbColor: Theme.of(context).colorScheme.primary,
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const SizedBox(height: 16),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('隐藏不可分组记录', style: AppTheme.bodyLarge),
+                        Text('无车次和机车号的记录',
+                            style: TextStyle(color: Colors.grey, fontSize: 12)),
+                      ],
+                    ),
+                    Switch(
+                      value: _hideUngroupableRecords,
+                      onChanged: (value) {
+                        setState(() {
+                          _hideUngroupableRecords = value;
+                        });
+                        _saveImmediately();
+                      },
+                      activeThumbColor: Theme.of(context).colorScheme.primary,
+                    ),
+                  ],
+                ),
+              ],
             ),
           ],
         ),

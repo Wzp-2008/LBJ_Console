@@ -796,15 +796,22 @@ END)''';
   }
 
   /// Paged raw records (merge disabled path), newest first (keyset
-  /// pagination). Time-only records are excluded.
+  /// pagination). Time-only records are excluded. When [hideUngroupable] is
+  /// set, records with neither a train key nor a loco key are also excluded
+  /// (the same "ungroupable" definition used by the merged path), so the
+  /// option works regardless of merge mode.
   Future<DisplayPageResult> fetchPlainPage({
     required int limit,
     PageCursor? cursor,
+    bool hideUngroupable = false,
   }) async {
     return _runInDbQueue(() async {
       final db = await database;
       final where = <String>['isTimeOnly = 0'];
       final args = <dynamic>[];
+      if (hideUngroupable) {
+        where.add('(trainKey IS NOT NULL OR locoKey IS NOT NULL)');
+      }
       if (cursor != null) {
         where.add(
           '(receivedTimestamp < ? OR (receivedTimestamp = ? AND uniqueId < ?))',
@@ -1241,7 +1248,9 @@ END)''';
         return Sqflite.firstIntValue(r) ?? 0;
       }
       final r = await db.rawQuery(
-        'SELECT COUNT(*) AS cnt FROM $trainRecordsTable WHERE isTimeOnly = 0',
+        'SELECT COUNT(*) AS cnt FROM $trainRecordsTable '
+        "WHERE isTimeOnly = 0 "
+        "${hideUngroupable ? 'AND (trainKey IS NOT NULL OR locoKey IS NOT NULL) ' : ''}",
       );
       return Sqflite.firstIntValue(r) ?? 0;
     });

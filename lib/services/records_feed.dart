@@ -55,6 +55,7 @@ class RecordsFeed {
     return DatabaseService.instance.fetchPlainPage(
       limit: limit,
       cursor: cursor,
+      hideUngroupable: settings.hideUngroupable,
     );
   }
 
