@@ -615,30 +615,61 @@ class HistoryScreenState extends State<HistoryScreen> {
         final start = rowIndex * cols;
         final end = math.min(start + cols, _displayItems.length);
 
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 8.0),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: List.generate(cols, (col) {
-              final itemIdx = start + col;
-              if (itemIdx >= end) return const Expanded(child: SizedBox.shrink());
-              final item = _displayItems[itemIdx];
-              return Expanded(
-                child: Padding(
-                  padding: EdgeInsets.only(
-                      left: col > 0 ? 4.0 : 0,
-                      right: col < cols - 1 ? 4.0 : 0),
-                  child: KeyedSubtree(
-                    key: _displayItemKey(item),
-                    child: _buildCardForItem(item),
-                  ),
+        final cells = List.generate(cols, (col) {
+          final itemIdx = start + col;
+          if (itemIdx >= end) return const Expanded(child: SizedBox.shrink());
+          final item = _displayItems[itemIdx];
+          return Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(
+                  left: col > 0 ? 4.0 : 0,
+                  right: col < cols - 1 ? 4.0 : 0),
+              child: KeyedSubtree(
+                key: _displayItemKey(item),
+                child: _buildCardForItem(item),
+              ),
+            ),
+          );
+        });
+
+        // When every card in the row is collapsed, stretch them to the row's
+        // tallest card so all cards share one height (no uneven gaps). When
+        // any card is expanded — which may contain a flutter_map with no
+        // intrinsic height — fall back to natural heights; expanded rows are
+        // allowed to be uneven.
+        final row = _rowHasExpandedCard(start, end)
+            ? Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: cells,
+              )
+            : IntrinsicHeight(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: cells,
                 ),
               );
-            }),
-          ),
+
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 8.0),
+          child: row,
         );
       },
     );
+  }
+
+  bool _isCardExpanded(Object item) {
+    if (item is TrainRecord) return _expandedStates[item.uniqueId] == true;
+    if (item is MergedTrainRecord) {
+      return _expandedStates[item.groupKey] == true;
+    }
+    return false;
+  }
+
+  bool _rowHasExpandedCard(int start, int end) {
+    for (var i = start; i < end; i++) {
+      if (_isCardExpanded(_displayItems[i])) return true;
+    }
+    return false;
   }
 
   @override
