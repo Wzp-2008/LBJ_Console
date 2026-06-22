@@ -615,36 +615,56 @@ class HistoryScreenState extends State<HistoryScreen> {
         final start = rowIndex * cols;
         final end = math.min(start + cols, _displayItems.length);
 
-        final cells = List.generate(cols, (col) {
-          final itemIdx = start + col;
-          if (itemIdx >= end) return const Expanded(child: SizedBox.shrink());
-          final item = _displayItems[itemIdx];
-          return Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(
-                  left: col > 0 ? 4.0 : 0,
-                  right: col < cols - 1 ? 4.0 : 0),
-              child: KeyedSubtree(
-                key: _displayItemKey(item),
-                child: _buildCardForItem(item),
+        // Build per-cell widgets (each an Expanded + horizontal padding +
+        // KeyedSubtree(card)) shared by both layouts below.
+        Widget cell(int col, Object item) => Expanded(
+              child: Padding(
+                padding: EdgeInsets.only(
+                    left: col > 0 ? 4.0 : 0, right: col < cols - 1 ? 4.0 : 0),
+                child: KeyedSubtree(
+                  key: _displayItemKey(item),
+                  child: _buildCardForItem(item),
+                ),
               ),
+            );
+
+        // Detect whether any card in this row is expanded while building the
+        // shared cell list.
+        var hasExpanded = false;
+        final cells = <Widget>[];
+        for (var col = 0; col < cols; col++) {
+          final idx = start + col;
+          if (idx >= end) continue;
+          final item = _displayItems[idx];
+          if (_isCardExpanded(item)) hasExpanded = true;
+          cells.add(cell(col, item));
+        }
+
+        final Widget row;
+        if (!hasExpanded) {
+          // All collapsed: stretch every card to the tallest one so the row
+          // shares one height (content top+bottom justified via the card's
+          // Column mainAxisAlignment). Safe — no maps in collapsed cards.
+          row = IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: cells,
             ),
           );
-        });
-
-        // Stretch every card in the row to the tallest one's height so all
-        // cards share one height (no uneven gaps). Safe even when a card is
-        // expanded — its flutter_map lives in a fixed-height SizedBox, so the
-        // intrinsic-height pass is well-defined. The expanded card is the
-        // tallest, so it stays its natural height; collapsed siblings stretch
-        // to match it (consistent, content top+bottom justified via the card's
-        // Column mainAxisAlignment).
-        final row = IntrinsicHeight(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+        } else {
+          // A card is expanded: top-align instead of stretching so each card
+          // keeps its natural height. Collapsed siblings stay short instead of
+          // stretching to the expanded card's tall (map) height, and every
+          // card stays in its original grid column. No IntrinsicHeight here —
+          // the Row sizes its own height to the tallest child, and the
+          // expanded card's map lives in a fixed-height SizedBox, so the
+          // unbounded-height intrinsic pass is well-defined either way; we
+          // skip it just to avoid the extra measurement cost on this path.
+          row = Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: cells,
-          ),
-        );
+          );
+        }
 
         return Padding(
           padding: const EdgeInsets.only(bottom: 8.0),
@@ -652,6 +672,14 @@ class HistoryScreenState extends State<HistoryScreen> {
         );
       },
     );
+  }
+
+  bool _isCardExpanded(Object item) {
+    if (item is TrainRecord) return _expandedStates[item.uniqueId] == true;
+    if (item is MergedTrainRecord) {
+      return _expandedStates[item.groupKey] == true;
+    }
+    return false;
   }
 
   @override
