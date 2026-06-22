@@ -42,8 +42,16 @@ class WindowsTrayService with WindowListener, TrayListener {
   }
 
   Future<void> exitApp() async {
+    // Remove the tray icon first so the user gets immediate feedback, then
+    // terminate the process. The native message loop
+    // (windows/runner/main.cpp) runs with SetQuitOnClose(false) for tray
+    // mode, so windowManager.destroy() would destroy the window WITHOUT
+    // posting WM_QUIT — leaving the process lingering ~5-10s (and an open
+    // window "Not Responding" during Flutter teardown). exit(0) ends the
+    // process promptly; Windows tears down the window. SQLite WAL is
+    // crash-safe on abrupt exit, so there is no database corruption.
     await trayManager.destroy();
-    await windowManager.destroy();
+    exit(0);
   }
 
   @override
