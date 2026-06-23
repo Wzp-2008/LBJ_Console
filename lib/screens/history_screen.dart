@@ -47,6 +47,11 @@ class HistoryScreenState extends State<HistoryScreen> {
   final Set<String> _selectedRecords = {};
   final Map<String, bool> _expandedStates = {};
   final Map<String, bool> _mergedDetailsLoading = {};
+  /// groupKeys whose last [_loadMergedDetails] attempt threw. Caps the
+  /// build-triggered self-heal in [_buildMergedRecordCard] to a single
+  /// attempt per need-state so a persistently-failing DB query cannot
+  /// busy-loop. Cleared on a manual expand-tap so the user can retry.
+  final Set<String> _mergedDetailsLoadFailed = {};
   final ScrollController _scrollController = ScrollController();
   bool _isAtTop = true;
   String? _displaySettingsSignature;
@@ -219,6 +224,10 @@ class HistoryScreenState extends State<HistoryScreen> {
         _displayCursor = null;
         _searchTotalCount = null;
         _hasMoreRecords = true;
+        // A full reload replaces every instance with a fresh one — give each
+        // expanded merged card a fresh detail-load attempt even if a prior
+        // attempt failed (transient DB error / short result).
+        _mergedDetailsLoadFailed.clear();
       });
       _searchRefreshingNotifier.value = false;
       _searchCountNotifier.value = null;
@@ -762,9 +771,21 @@ class HistoryScreenState extends State<HistoryScreen> {
         merged.memberUniqueIds,
       );
       if (!mounted) return;
-      merged.setDetailRecords(loaded);
+      if (loaded.length < merged.memberUniqueIds.length) {
+        // Short result (no throw): some members are missing from
+        // train_records — an orphaned cache member, or a record deleted
+        // between building the display item and this fetch. Don't latch
+        // partial data; flag the group so the build self-heal doesn't
+        // retry-loop on a result that will keep coming up short. Recovery
+        // is a manual collapse+expand or a full reload (_loadFirstPage),
+        // both of which clear the flag.
+        _mergedDetailsLoadFailed.add(merged.groupKey);
+      } else {
+        merged.setDetailRecords(loaded);
+      }
     } catch (e) {
       developer.log('loadMergedDetails error: $e', name: 'HistoryScreen');
+      _mergedDetailsLoadFailed.add(merged.groupKey);
     } finally {
       if (mounted) {
         setState(() => _mergedDetailsLoading.remove(merged.groupKey));
@@ -776,6 +797,46 @@ class HistoryScreenState extends State<HistoryScreen> {
     final bool isSelected = mergedRecord.memberUniqueIds
         .any((id) => _selectedRecords.contains(id));
     final isExpanded = _expandedStates[mergedRecord.groupKey] ?? false;
+    // Self-heal an already-expanded merged card whose instance was swapped
+    // for a fresh one. This happens when a new record merges INTO the
+    // expanded group (addNewRecord), on a full reload (_loadFirstPage, via
+    // settings change / record delete), or when an in-flight
+    // _loadMergedDetails had its captured instance replaced mid-flight. A
+    // fresh instance has hasLoadedDetails == false, and the detail load is
+    // otherwise only triggered by the expand-tap gesture — which never
+    // fires for an already-expanded card, so without this the card would
+    // spin forever (closing and re-opening was the only recovery). Re-arm
+    // the load from build instead. The guards keep at most one in-flight
+    // load per group and prevent any retry storm:
+    //   - _mergedDetailsLoading==true  -> a load is already running
+    //   - _mergedDetailsLoadFailed      -> last attempt failed (threw, or
+    //     returned fewer records than members); cleared by a manual
+    //     collapse+expand or a full reload (_loadFirstPage)
+    //   - hasLoadedDetails              -> already done
+    if (isExpanded &&
+        mergedRecord.recordCount > 1 &&
+        !mergedRecord.hasLoadedDetails &&
+        _mergedDetailsLoading[mergedRecord.groupKey] != true &&
+        !_mergedDetailsLoadFailed.contains(mergedRecord.groupKey)) {
+      final groupKey = mergedRecord.groupKey;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // Operate on whichever instance currently backs this group — it may
+        // have been swapped again between this build and the callback.
+        MergedTrainRecord? current;
+        for (final it in _displayItems) {
+          if (it is MergedTrainRecord && it.groupKey == groupKey) {
+            current = it;
+            break;
+          }
+        }
+        if (current == null) return;
+        if (current.hasLoadedDetails) return;
+        if (_mergedDetailsLoading[groupKey] == true) return;
+        if (_mergedDetailsLoadFailed.contains(groupKey)) return;
+        _loadMergedDetails(current);
+      });
+    }
     final displayRecord = mergedRecord.summaryRecord;
     return Card(
         key: ValueKey(mergedRecord.groupKey),
@@ -815,6 +876,7 @@ class HistoryScreenState extends State<HistoryScreen> {
                 } else {
                   setState(() {
                     _expandedStates[mergedRecord.groupKey] = true;
+                    _mergedDetailsLoadFailed.remove(mergedRecord.groupKey);
                   });
                   _loadMergedDetails(mergedRecord);
                 }
