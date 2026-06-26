@@ -17,12 +17,8 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.35.2'
+          flutter-version: '3.41.6'
           channel: 'stable'
-
-      - name: Update compileSdkVersion
-        run: |
-          sed -i 's/compileSdk = 35/compileSdk = 36/g' android/app/build.gradle
 
       - name: Get dependencies
         run: flutter pub get
@@ -32,7 +28,7 @@ jobs:
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Build APK
-        run: flutter build apk --release --split-per-abi
+        run: flutter build apk --release
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -42,19 +38,23 @@ jobs:
       - name: Rename split APKs with tag
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          # --split-per-abi emits one APK per ABI instead of a single fat
-          # universal APK; copy each under a tagged, ABI-suffixed name.
-          for abi in armeabi-v7a arm64-v8a x86_64; do
-            cp "build/app/outputs/flutter-apk/app-${abi}-release.apk" "LBJ_Console_${TAG_NAME}_android_${abi}_release.apk"
+          # Gradle splits emit one APK per ABI under flutter-apk/ as
+          # app-<abi>-release.apk (arm64-v8a, armeabi-v7a, x86, x86_64). The
+          # glob excludes the universal app-release.apk (no -<abi>- segment);
+          # with isUniversalApk=false in build.gradle.kts it isn't built
+          # anyway. Copy each under a tagged, ABI-suffixed name.
+          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
+            name=$(basename "$apk")
+            abi=${name#app-}
+            abi=${abi%-release.apk}
+            cp "$apk" "LBJ_Console_${TAG_NAME}_android_${abi}_release.apk"
           done
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            LBJ_Console_${{ github.ref_name }}_android_armeabi-v7a_release.apk
-            LBJ_Console_${{ github.ref_name }}_android_arm64-v8a_release.apk
-            LBJ_Console_${{ github.ref_name }}_android_x86_64_release.apk
+            LBJ_Console_${{ github.ref_name }}_android_*_release.apk
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
@@ -70,7 +70,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.35.2'
+          flutter-version: '3.41.6'
           channel: 'stable'
 
       - name: Get dependencies
