@@ -32,6 +32,13 @@ class HistoryScreenState extends State<HistoryScreen> {
   static const double _scrollThreshold = 200.0;
   static const int _searchDebounceMs = 300;
   static const int _minVisibleItems = 15;
+  /// Cap on how many sub-records an expanded merged card renders. Details
+  /// load newest-first (getRecordsByUniqueIds orders by receivedTimestamp
+  /// DESC), so this keeps the most recent [_maxExpandedSubRecords] members
+  /// and shows a "仅显示前 N 条" hint when a group is larger — a very large
+  /// group otherwise renders an enormous scroll list. The expanded map still
+  /// plots every member's position regardless of this cap.
+  static const int _maxExpandedSubRecords = 100;
 
   final List<Object> _displayItems = [];
   bool _isInitialLoading = true;
@@ -934,13 +941,30 @@ class HistoryScreenState extends State<HistoryScreen> {
     }
 
     final details = mergedRecord.records;
+    // Cap the rendered sub-record list so a very large group doesn't produce
+    // a huge scroll list. Details are newest-first, so this keeps the most
+    // recent members; the map above still plots every member's position.
+    final bool truncated = details.length > _maxExpandedSubRecords;
+    final List<TrainRecord> shownDetails = truncated
+        ? details.sublist(0, _maxExpandedSubRecords)
+        : details;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _buildExpandedMapForAll(details, mergedRecord.groupKey),
         const Divider(color: Colors.white24, height: 24),
-        ...details.map((record) =>
+        ...shownDetails.map((record) =>
             _buildSubRecordItem(record, mergedRecord.latestRecord)),
+        if (truncated)
+          Padding(
+            padding: const EdgeInsets.only(top: 8.0),
+            child: Center(
+              child: Text(
+                '仅显示前 $_maxExpandedSubRecords 条，共 ${details.length} 条',
+                style: const TextStyle(color: Colors.grey, fontSize: 12),
+              ),
+            ),
+          ),
       ],
     );
   }
