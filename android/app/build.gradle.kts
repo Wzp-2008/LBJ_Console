@@ -51,15 +51,9 @@ android {
             signingConfig = signingConfigs.getByName("release")
         }
     }
-    splits {
-        abi {
-            isEnable = true
-            reset()
-            include("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-            // No fat universal APK — each ABI ships as its own release asset.
-            isUniversalApk = false
-        }
-    }
+    // Per-ABI APKs are built via `flutter build apk --split-per-abi` in CI.
+    // A splits { abi { ... } } block here conflicts with the Flutter Gradle
+    // plugin's injected ndk.abiFilters, so it's intentionally absent.
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")

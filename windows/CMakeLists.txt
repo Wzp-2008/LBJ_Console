@@ -32,6 +32,12 @@ set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
+# MSVC 14.51+ (Visual Studio 18, 2026) hard-errors on <experimental/coroutine>
+# (STL1011), which several Windows plugins still include. Silence the
+# deprecation until those plugins migrate to C++20 <coroutine>. Global so it
+# reaches plugin targets too.
+add_definitions(-D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by

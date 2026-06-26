@@ -28,7 +28,7 @@ jobs:
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Build APK
-        run: flutter build apk --release
+        run: flutter build apk --release --split-per-abi
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -38,11 +38,10 @@ jobs:
       - name: Rename split APKs with tag
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          # Gradle splits emit one APK per ABI under flutter-apk/ as
-          # app-<abi>-release.apk (arm64-v8a, armeabi-v7a, x86, x86_64). The
-          # glob excludes the universal app-release.apk (no -<abi>- segment);
-          # with isUniversalApk=false in build.gradle.kts it isn't built
-          # anyway. Copy each under a tagged, ABI-suffixed name.
+          # --split-per-abi emits one APK per ABI under flutter-apk/ as
+          # app-<abi>-release.apk (arm64-v8a, armeabi-v7a, x86_64) and no
+          # universal APK. The glob still excludes any app-release.apk by
+          # design (no -<abi>- segment). Copy each under a tagged name.
           for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
             name=$(basename "$apk")
             abi=${name#app-}
