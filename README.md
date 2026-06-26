@@ -20,38 +20,50 @@ LBJ Console 依赖以下数据文件，位于 `assets` 目录，用于支持机�
 
 # 本分支补充改动
 
-以下改动在原项目（原作者 noxylva）之后追加，作为对原项目的补充（自 0.10.0-flutter 起）。修改的代码全部由 Claude 进行编写。
+以下改动在原项目（原作者 noxylva）之后追加，作为对原项目的补充（自 0.10.0-flutter 起）。修改的代码全部由 Claude 进行编写。下述内容依据实际代码变更核对，而非仅凭提交信息。
+
+## 架构与构建
+
+- Android 构建从 Groovy `build.gradle` 迁移到 Kotlin DSL `build.gradle.kts`，JDK 升至 17；`compileSdk`/`ndkVersion` 改用 `flutter.compileSdkVersion`/`flutter.ndkVersion`。
+- 启用 Windows 桌面端：引入 `window_manager`、`tray_manager`、`sqlite3`/`sqlite3_flutter_libs`/`sqflite_common_ffi`、`flutter_blue_plus_windows` 等依赖，支持系统托盘常驻、关闭窗口后驻留托盘。
+- 记录分组抽取为独立的 `display_group_cache`：会话窗口（按 train 或 loco 键、1 小时窗口）合并、稳定的 groupId（乱序到达不改变卡片身份）、增量插入/删除而非全量重建、大规模重建在 isolate 中完成。
+- trainKey/locoKey/isTimeOnly 作为派生列持久化到数据库，供 SQL 侧过滤，无需每次查询重算。
+- 数据库开启 WAL 及 PRAGMA 调优（`synchronous=NORMAL`、`temp_store=MEMORY`、`cache_size`），并通过串行化队列串行化所有访问以避免并发竞争。
 
 ## 列表与分页
 
 - 记录列表改用 keyset（游标）分页，修复大数据量下分页偏移/去重漂移、导致列表不显示记录的问题；新记录落在游标上方，翻页不会重复出现。
 - 合并卡片展开时按需从数据库加载成员详情；对已展开但实例被替换的卡片做自愈加载，避免一直转圈。
-- 新增数据库与合并逻辑相关的测试套件。
+- 搜索改为防抖（300ms）并实时显示"找到 N 条，已加载 M 条"。
+- 新增测试套件：分页、CRUD、合并摘要、网格断点、hideUngroupable、性能预算等。
 
 ## 合并与数据质量
 
-- 合并摘要改为"取最正确数据"策略：逐字段取最新有效值，剔除 `<NUL>`、`NA` 及纯占位符等无效内容；车次与机车类型取自信息最完整的成员。
-- 仅较老成员拥有 lbjClass 前缀时也予以保留；将被污染（如 `*`）的值视为无效。
-- 拒绝乱码分组键；"重建缓存"按钮会重新生成派生列。
+- 合并摘要改为"取最正确数据"策略：逐字段取最新有效值，剔除 `<NUL>`、`NA` 及纯占位符（`-----`、`*****` 等）；车次与 lbjClass 前缀取自信息最完整的成员。
+- 仅较老成员拥有 lbjClass 前缀时也予以保留；将被污染（含 `*`、`(`、`)` 等）的值视为无效。
+- 拒绝乱码分组键的记录标记为不可分组；"重建合并缓存"按钮会重新生成派生列并重建分组缓存。
 - `hideUngroupable` 在合并关闭模式下同样生效。
 
-## 界面（网格卡片）
+## 界面
 
-- 折叠状态下同行卡片共享统一高度（内容顶部+底部对齐）。
-- 某张卡片展开时，折叠的兄弟卡片保持等高、不被拉伸到展开卡片的高度。
+- 移除了独立的地图页、地图 WebView 页与实时页；地图可视化改为在记录卡片展开时内联展示（flutter_map），支持多标记点与相机状态记忆。导航栏现仅"列车记录"与"设置"两页。
+- 响应式多列网格（1–5 列按宽度）；折叠状态下同行卡片共享统一高度（内容顶部+底部对齐），某张卡片展开时折叠的兄弟卡片保持等高、不被拉伸。
 - 合并分组在展开期间成员发生变化时，重新加载其详情。
-- 展开的合并卡片成员超过 100 条时，仅显示前 100 条并提示"仅显示前 100 条，共 N 条"。
+- 展开的合并卡片成员超过 100 条时，仅显示前 100 条并提示"仅显示前 100 条，共 N 条"（地图仍绘制全部成员位置）。
+- 记录多选编辑模式：批量选择与删除。
+- 地图最优缩放以多 isolate 并行计算包围盒。
 
 ## 平台修复
 
-- Android：为通知与前台服务申请 `POST_NOTIFICATIONS` 权限。
-- Windows：修复托盘退出时进程残留 5–10 秒、窗口卡住的问题。
+- Android：在显示通知与启动前台服务前，运行时申请 `POST_NOTIFICATIONS` 权限（清单中的权限声明为原项目已有）。
+- Windows：修复托盘退出时进程残留 5–10 秒、窗口卡住的问题（先销毁托盘再 `exit(0)`）。
+- Windows 构建：为新版 MSVC（VS 18）下 `<experimental/coroutine>` 硬错误加 `_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS`。
 
 ## 发布与 CI
 
 - 新增 Windows release 构建（将 `Release` 目录打包为 zip 发布）。
 - Android 改为按 ABI 拆分发布（arm64-v8a / armeabi-v7a / x86_64），不再发布过大的融合 APK。
-- 修复 CI 中失效的 compileSdk 改写步骤、Android splits 与 ndk.abiFilters 冲突、Windows MSVC `<experimental/coroutine>` 硬错误。
+- 修复 CI 中失效的 compileSdk 改写步骤、Android splits 与 ndk.abiFilters 冲突。
 - CI 的 Flutter 版本对齐开发环境（3.41.6）；新增 pub 包与 Gradle 依赖缓存。
 
 # 致谢
