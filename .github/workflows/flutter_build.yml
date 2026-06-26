@@ -32,23 +32,68 @@ jobs:
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Build APK
-        run: flutter build apk --release
+        run: flutter build apk --release --split-per-abi
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
 
-      - name: Rename APK with tag
+      - name: Rename split APKs with tag
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          cp build/app/outputs/flutter-apk/app-release.apk LBJ_Console_${TAG_NAME}_android_release.apk
+          # --split-per-abi emits one APK per ABI instead of a single fat
+          # universal APK; copy each under a tagged, ABI-suffixed name.
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            cp "build/app/outputs/flutter-apk/app-${abi}-release.apk" "LBJ_Console_${TAG_NAME}_android_${abi}_release.apk"
+          done
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            LBJ_Console_${{ github.ref_name }}_android_release.apk
+            LBJ_Console_${{ github.ref_name }}_android_armeabi-v7a_release.apk
+            LBJ_Console_${{ github.ref_name }}_android_arm64-v8a_release.apk
+            LBJ_Console_${{ github.ref_name }}_android_x86_64_release.apk
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.35.2'
+          channel: 'stable'
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Build Windows
+        run: flutter build windows --release
+
+      # Flutter emits a folder (exe + DLLs + data/); zip its contents so the
+      # archive extracts to a runnable directory. windows-latest ships the VS
+      # build tools Flutter's Windows backend needs, so no extra setup.
+      - name: Package Windows release
+        shell: pwsh
+        run: |
+          $tag = $Env:GITHUB_REF_NAME
+          Compress-Archive -Path build/windows/x64/runner/Release/* `
+            -DestinationPath "LBJ_Console_${tag}_windows_release.zip" -Force
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            LBJ_Console_${{ github.ref_name }}_windows_release.zip
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
