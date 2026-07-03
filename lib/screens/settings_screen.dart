@@ -607,6 +607,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
               subtitle: '从 JSON 文件导入记录和设置',
               onTap: _importData,
             ),
+            if (Platform.isWindows) ...[
+              const SizedBox(height: 12),
+              _buildActionButton(
+                icon: Icons.usb,
+                title: '从盘符导入 CSV',
+                subtitle: '读取 U 盘 CSVTEST 文件夹中的所有 CSV 文件',
+                onTap: _importCsvFromDrive,
+              ),
+            ],
             const SizedBox(height: 12),
             _buildActionButton(
               icon: Icons.cached,
@@ -846,6 +855,77 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _importCsvFromDrive() async {
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+
+    // CSV import replaces all existing data, same as the JSON import above.
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('从盘符导入 CSV'),
+        content: const Text('导入将替换所有现有数据，是否继续？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('继续'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    if (!mounted) return;
+
+    // Pick a drive letter: scans A-Z for drives whose CSVTEST folder holds at
+    // least one .csv; falls back to manual entry if detection misses.
+    final drive = await showDialog<String>(
+      context: context,
+      builder: (context) => const _DrivePickerDialog(),
+    );
+    if (drive == null || drive.isEmpty) return;
+
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 16),
+              Text('正在读取并导入 CSV...'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    try {
+      final result = await _databaseService.importCsvFromDrive(drive);
+      if (mounted) {
+        Navigator.pop(context);
+      }
+      scaffoldMessenger.showSnackBar(
+        SnackBar(content: Text(result.message)),
+      );
+      if (result.success) {
+        await _loadSettings();
+        await _loadRecordCount();
+        setState(() {});
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.pop(context);
+      }
+      scaffoldMessenger.showSnackBar(
+        SnackBar(content: Text('导入错误：$e')),
+      );
+    }
+  }
+
   Future<void> _rebuildMergeCache() async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
@@ -1005,6 +1085,123 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Drive-letter picker for the CSV import. Scans A-Z for drives whose
+/// `CSVTEST` folder contains at least one `.csv` and lists them as tappable
+/// tiles; a manual-entry field covers drives the scan misses (a slow-to-report
+/// drive, or a non-standard letter).
+class _DrivePickerDialog extends StatefulWidget {
+  const _DrivePickerDialog();
+
+  @override
+  State<_DrivePickerDialog> createState() => _DrivePickerDialogState();
+}
+
+class _DrivePickerDialogState extends State<_DrivePickerDialog> {
+  final _manualController = TextEditingController();
+  List<String> _drives = [];
+  bool _scanning = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _scanDrives();
+  }
+
+  @override
+  void dispose() {
+    _manualController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _scanDrives() async {
+    final found = <String>[];
+    for (final letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')) {
+      final dir = Directory('$letter:\\CSVTEST');
+      try {
+        if (await dir.exists() && await _hasCsvFile(dir)) {
+          found.add(letter);
+        }
+      } catch (_) {
+        // Drive not ready / inaccessible (e.g. empty card slot) → skip.
+      }
+      if (!mounted) return;
+    }
+    if (mounted) {
+      setState(() {
+        _drives = found;
+        _scanning = false;
+      });
+    }
+  }
+
+  Future<bool> _hasCsvFile(Directory dir) async {
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is File && entity.path.toLowerCase().endsWith('.csv')) {
+          return true;
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('选择盘符'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: _scanning
+            ? const Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 12),
+                  Text('正在扫描盘符...'),
+                ],
+              )
+            : Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (_drives.isEmpty)
+                    const Text('未发现含 CSVTEST 文件夹的盘符，可手动输入盘符：')
+                  else
+                    ..._drives.map((d) => ListTile(
+                          dense: true,
+                          leading: const Icon(Icons.usb),
+                          title: Text('$d 盘'),
+                          subtitle: Text('$d:\\CSVTEST'),
+                          onTap: () => Navigator.pop(context, d),
+                        )),
+                  const Divider(),
+                  const Text('手动输入盘符：'),
+                  TextField(
+                    controller: _manualController,
+                    decoration: const InputDecoration(hintText: '例如 A'),
+                    maxLength: 1,
+                    textCapitalization: TextCapitalization.characters,
+                  ),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, null),
+          child: const Text('取消'),
+        ),
+        TextButton(
+          onPressed: () {
+            final v = _manualController.text.trim().toUpperCase();
+            Navigator.pop(context, v.isEmpty ? null : v);
+          },
+          child: const Text('导入'),
+        ),
+      ],
     );
   }
 }

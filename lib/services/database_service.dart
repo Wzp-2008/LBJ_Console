@@ -3,11 +3,13 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/foundation.dart' show compute, visibleForTesting;
+import 'package:flutter/services.dart' show rootBundle;
 import 'dart:io';
 import 'dart:convert';
 import 'dart:developer' as developer;
 
 import 'package:lbjconsole/models/train_record.dart';
+import 'package:lbjconsole/services/csv_import_service.dart';
 import 'package:lbjconsole/services/display_group_cache.dart';
 import 'package:lbjconsole/services/sqflite_initializer.dart';
 
@@ -1325,7 +1327,19 @@ END)''';
       final rawRecords = importData['records'] != null
           ? List<Map<String, dynamic>>.from(importData['records'] as List)
           : <Map<String, dynamic>>[];
+      return await importRawRecords(rawRecords);
+    } catch (e) {
+      developer.log('importDataFromJson failed: $e', name: 'Database');
+      return false;
+    }
+  }
 
+  /// Replace all records and merge groups with [rawRecords] (raw JSON-style
+  /// maps as produced by `csv_json.py` / the live receivers). Shared by the
+  /// JSON file import and the CSV-from-drive import so both flow through the
+  /// same isolate prepare + single-transaction insert + FTS rebuild.
+  Future<bool> importRawRecords(List<Map<String, dynamic>> rawRecords) async {
+    try {
       // Prepare insert-ready rows (searchText + derived columns) and the
       // merge-group payload in a single isolate pass so the UI thread stays
       // responsive and we avoid computing twice (once for the rows, once for
@@ -1371,8 +1385,96 @@ END)''';
 
       return true;
     } catch (e) {
-      developer.log('importDataFromJson failed: $e', name: 'Database');
+      developer.log('importRawRecords failed: $e', name: 'Database');
       return false;
+    }
+  }
+
+  /// Read every `.csv` file in `<driveLetter>:\CSVTEST`, convert each row to a
+  /// train record (porting `csv_json.py`'s parsing logic off the UI thread via
+  /// [parseCsvFilesToRecords]), and import the result — replacing all existing
+  /// data. Windows only (the `X:\CSVTEST` path convention is Windows-specific).
+  /// Returns a [CsvImportResult] with counts and a user-facing message.
+  Future<CsvImportResult> importCsvFromDrive(String driveLetter) async {
+    final letter = driveLetter.trim().toUpperCase();
+    if (letter.isEmpty) {
+      return const CsvImportResult(success: false, message: '未选择盘符');
+    }
+    final dirPath = '$letter:\\CSVTEST';
+    final dir = Directory(dirPath);
+    if (!await dir.exists()) {
+      return CsvImportResult(success: false, message: '目录不存在：$dirPath');
+    }
+
+    final csvFiles = <String>[];
+    try {
+      await for (final entity in dir.list(followLinks: false)) {
+        if (entity is File && entity.path.toLowerCase().endsWith('.csv')) {
+          csvFiles.add(entity.path);
+        }
+      }
+    } catch (e) {
+      return CsvImportResult(success: false, message: '读取目录失败：$e');
+    }
+    if (csvFiles.isEmpty) {
+      return CsvImportResult(
+          success: false, message: '未在 $dirPath 找到 CSV 文件');
+    }
+    csvFiles.sort();
+
+    // Loaded on the main isolate: worker isolates cannot touch rootBundle.
+    final locoTypeMap = await _loadLocoTypeMap();
+    final Map<String, dynamic> payload;
+    try {
+      payload = await compute<Map<String, dynamic>, Map<String, dynamic>>(
+        parseCsvFilesToRecords,
+        <String, dynamic>{
+          'files': csvFiles,
+          'locoTypeMap': locoTypeMap,
+        },
+      );
+    } catch (e) {
+      return CsvImportResult(success: false, message: '解析 CSV 失败：$e');
+    }
+    final records = (payload['records'] as List).cast<Map<String, dynamic>>();
+
+    if (records.isEmpty) {
+      return CsvImportResult(
+        success: false,
+        fileCount: csvFiles.length,
+        message: 'CSV 文件中未解析出有效记录',
+      );
+    }
+
+    final ok = await importRawRecords(records);
+    return CsvImportResult(
+      success: ok,
+      fileCount: csvFiles.length,
+      recordCount: records.length,
+      message: ok
+          ? '导入 ${records.length} 条记录（${csvFiles.length} 个文件）'
+          : '导入失败',
+    );
+  }
+
+  /// Load the `loco_type_info.csv` asset into a code→name map. Standalone
+  /// (rather than reusing the `LocoTypeUtil` singleton) so the result can be
+  /// handed to the CSV-parse isolate without an init-order race.
+  Future<Map<String, String>> _loadLocoTypeMap() async {
+    try {
+      final csv = await rootBundle.loadString('assets/loco_type_info.csv');
+      final map = <String, String>{};
+      for (final line in const LineSplitter().convert(csv)) {
+        final trimmed = line.trim();
+        if (trimmed.isEmpty) continue;
+        final parts = trimmed.split(',');
+        if (parts.length >= 2) {
+          map[parts[0].trim()] = parts[1].trim();
+        }
+      }
+      return map;
+    } catch (e) {
+      return {};
     }
   }
 
