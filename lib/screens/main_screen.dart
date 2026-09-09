@@ -310,6 +310,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _changeBluetoothDeviceName(String name) async {
+    await _bleService.setRemoteDeviceName(name);
+  }
+
   Future<void> _showFirmwareUpdateDialog(FirmwareUpdateInfo update) async {
     if (!mounted) return;
     await showDialog<void>(
@@ -848,6 +852,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         onCheckForUpdates: () => _checkForUpdate(showErrors: true),
         onCheckFirmwareUpdate: () => _checkFirmwareUpdate(showErrors: true),
         firmwareVersion: _firmwareVersion,
+        onChangeDeviceName: _changeBluetoothDeviceName,
+        isBluetoothConnected: _isConnected,
       ),
     ];
 

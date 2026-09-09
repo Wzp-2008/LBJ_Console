@@ -21,6 +21,8 @@ class SettingsScreen extends StatefulWidget {
   final VoidCallback? onCheckForUpdates;
   final VoidCallback? onCheckFirmwareUpdate;
   final String? firmwareVersion;
+  final Future<void> Function(String name)? onChangeDeviceName;
+  final bool isBluetoothConnected;
 
   const SettingsScreen({
     super.key,
@@ -28,6 +30,8 @@ class SettingsScreen extends StatefulWidget {
     this.onCheckForUpdates,
     this.onCheckFirmwareUpdate,
     this.firmwareVersion,
+    this.onChangeDeviceName,
+    this.isBluetoothConnected = false,
   });
 
   @override
@@ -49,6 +53,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _recordCount = 0;
   bool _mergeRecordsEnabled = false;
   bool _hideUngroupableRecords = false;
+  bool _changingDeviceName = false;
 
   InputSource _inputSource = InputSource.bluetooth;
 
@@ -144,6 +149,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _saveImmediately();
   }
 
+  Future<void> _changeRemoteDeviceName() async {
+    final callback = widget.onChangeDeviceName;
+    if (callback == null) return;
+    final name = _deviceNameController.text.trim();
+    if (name.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('设备名称不能为空')));
+      return;
+    }
+    setState(() => _changingDeviceName = true);
+    try {
+      await callback(name);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('设备名称已保存，请重启设备后生效')));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('修改设备名称失败：$e')));
+      }
+    } finally {
+      if (mounted) setState(() => _changingDeviceName = false);
+    }
+  }
+
   @override
   void dispose() {
     _saveDebounceTimer?.cancel();
@@ -235,6 +269,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   });
                   _scheduleSave();
                 },
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: widget.isBluetoothConnected && !_changingDeviceName
+                    ? _changeRemoteDeviceName
+                    : null,
+                icon: _changingDeviceName
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.edit, size: 18),
+                label: const Text('修改设备名称'),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                '名称最多 16 个 UTF-8 字节，保存后需重启设备生效',
+                style: AppTheme.caption,
               ),
             ],
 

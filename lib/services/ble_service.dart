@@ -51,6 +51,8 @@ class BLEService {
       StreamController<String>.broadcast();
   final StreamController<Map<String, dynamic>> _otaStateController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<Map<String, dynamic>> _deviceNameResultController =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<String> get statusStream => _statusController.stream;
 
@@ -84,6 +86,7 @@ class BLEService {
   Completer<void>? _otaReadyCompleter;
   bool _otaActive = false;
   Object? _otaError;
+  int _negotiatedMtu = 23;
 
   void initialize() {
     _loadSettings();
@@ -364,7 +367,9 @@ class BLEService {
 
       _characteristic = mainCharacteristic;
       _connectedDevice = device;
-      if (Platform.isAndroid) await device.requestMtu(512);
+      // The Windows implementation returns the negotiated maximum MTU too;
+      // without this call Windows stays at ATT MTU 23.
+      _negotiatedMtu = await device.requestMtu(512);
       await _valueSubscription?.cancel();
       await _otaControlSubscription?.cancel();
       _dataBuffer.clear();
@@ -544,15 +549,20 @@ class BLEService {
         throw ArgumentError.value(sha256, 'sha256', 'SHA-256 格式错误');
       }
       _otaReadyCompleter = Completer<void>();
-      await control.write(
-        utf8.encode(
-          jsonEncode({'cmd': 'start', 'total': total, 'sha256': sha256}),
-        ),
-      );
+      // Windows may stay at ATT MTU 23.  The device accepts the compact
+      // text form, so omit the optional SHA-256 when the JSON/text command
+      // cannot fit in one ATT packet.
+      final startWithHash = 'OTA_START $total $sha256';
+      final maxControlPayload = max(_negotiatedMtu - 3, 20);
+      final startCommand =
+          utf8.encode(startWithHash).length <= maxControlPayload
+          ? startWithHash
+          : 'OTA_START $total';
+      await _writeOtaControl(control, startCommand);
       await _otaReadyCompleter!.future.timeout(const Duration(seconds: 10));
       if (_otaError != null) throw _otaError!;
 
-      final chunkSize = min(max(device.mtuNow - 3, 20), 512);
+      final chunkSize = min(max(_negotiatedMtu - 3, 20), 512);
       var sent = 0;
       await for (final chunk in firmware.openRead()) {
         for (var offset = 0; offset < chunk.length; offset += chunkSize) {
@@ -564,17 +574,20 @@ class BLEService {
           );
           sent += end - offset;
           onProgress?.call(sent / total);
+          // The receiver processes at most one queued packet per 10 ms main
+          // loop.  Pace writes to keep its 128-packet queue from overflowing.
+          await Future.delayed(const Duration(milliseconds: 10));
         }
       }
       if (_otaError != null) throw _otaError!;
       _otaTerminalCompleter = Completer<void>();
-      await control.write(utf8.encode('{"cmd":"finish"}'));
+      await _writeOtaControl(control, 'FINISH');
       await _otaTerminalCompleter!.future.timeout(const Duration(seconds: 30));
       if (_otaError != null) throw _otaError!;
     } catch (_) {
       if (isConnected && identical(device, _connectedDevice)) {
         try {
-          await control.write(utf8.encode('{"cmd":"cancel"}'));
+          await _writeOtaControl(control, 'CANCEL');
         } catch (_) {
           // Preserve the original transfer error if cancellation also fails.
         }
@@ -588,10 +601,59 @@ class BLEService {
     }
   }
 
+  Future<void> _writeOtaControl(
+    BluetoothCharacteristic characteristic,
+    String command,
+  ) async {
+    await characteristic.write(
+      utf8.encode(command),
+      withoutResponse: Platform.isWindows,
+    );
+  }
+
   Future<void> cancelFirmwareOta() async {
     if (_otaActive && _otaControlCharacteristic != null) {
-      await _otaControlCharacteristic!.write(utf8.encode('{"cmd":"cancel"}'));
+      await _writeOtaControl(_otaControlCharacteristic!, 'CANCEL');
     }
+  }
+
+  /// Write a NAME command to the connected receiver's legacy FFE1 channel
+  /// and wait for its persisted-result notification.
+  Future<void> setRemoteDeviceName(String name) async {
+    final characteristic = _characteristic;
+    final device = _connectedDevice;
+    if (!isConnected || characteristic == null || device == null) {
+      throw StateError('蓝牙设备未连接');
+    }
+
+    final normalized = name.trim();
+    final nameBytes = utf8.encode(normalized);
+    if (nameBytes.isEmpty) throw ArgumentError('设备名称不能为空');
+    if (nameBytes.length > 16) {
+      throw ArgumentError('设备名称 UTF-8 编码不能超过 16 字节');
+    }
+    if (normalized.runes.any((rune) => rune < 0x20 || rune == 0x7f)) {
+      throw ArgumentError('设备名称不能包含控制字符');
+    }
+
+    final command = utf8.encode('NAME:$normalized');
+    final maxPayload = max(_negotiatedMtu - 3, 20);
+    if (command.length > maxPayload) {
+      throw StateError('当前蓝牙 MTU 不足以发送该设备名称，请重新连接后再试');
+    }
+
+    final resultFuture = _deviceNameResultController.stream.firstWhere(
+      (result) => result['state'] == 'saved' || result['state'] == 'error',
+    );
+    await characteristic.write(command);
+    final result = await resultFuture.timeout(const Duration(seconds: 10));
+    if (result['state'] != 'saved') {
+      throw StateError(result['message']?.toString() ?? '设备拒绝了名称修改请求');
+    }
+
+    _targetDeviceName = normalized;
+    _lastKnownDeviceDisplayName = normalized;
+    await DatabaseService.instance.setSetting('deviceName', normalized);
   }
 
   void _processDataBuffer() {
@@ -639,6 +701,7 @@ class BLEService {
       final decodedJson = jsonDecode(jsonData);
       if (decodedJson is Map<String, dynamic>) {
         if (_tryHandleFirmwareVersion(decodedJson)) return;
+        if (_tryHandleDeviceNameResult(decodedJson)) return;
         final now = DateTime.now();
         final recordData = Map<String, dynamic>.from(decodedJson);
         recordData['uniqueId'] =
@@ -659,6 +722,12 @@ class BLEService {
     } catch (e) {}
   }
 
+  bool _tryHandleDeviceNameResult(Map<String, dynamic> decoded) {
+    if (decoded['type']?.toString() != 'device_name') return false;
+    _deviceNameResultController.add(decoded);
+    return true;
+  }
+
   void _updateConnectionState(bool connected, String status) {
     if (connected) {
       _deviceStatus = "已连接";
@@ -669,6 +738,7 @@ class BLEService {
       _otaControlCharacteristic = null;
       _otaDataCharacteristic = null;
       _firmwareVersion = null;
+      _negotiatedMtu = 23;
       _lastReceivedTime = null;
       _lastReceivedTimeController.add(null);
     }
@@ -723,5 +793,6 @@ class BLEService {
     _lastReceivedTimeController.close();
     _firmwareVersionController.close();
     _otaStateController.close();
+    _deviceNameResultController.close();
   }
 }
