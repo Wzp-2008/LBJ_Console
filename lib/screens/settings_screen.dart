@@ -19,11 +19,15 @@ import 'package:lbjconsole/services/app_update_service.dart';
 class SettingsScreen extends StatefulWidget {
   final VoidCallback? onSettingsChanged;
   final VoidCallback? onCheckForUpdates;
+  final VoidCallback? onCheckFirmwareUpdate;
+  final String? firmwareVersion;
 
   const SettingsScreen({
     super.key,
     this.onSettingsChanged,
     this.onCheckForUpdates,
+    this.onCheckFirmwareUpdate,
+    this.firmwareVersion,
   });
 
   @override
@@ -1051,6 +1055,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
               icon: const Icon(Icons.system_update),
               label: const Text('检查更新'),
             ),
+            if (widget.firmwareVersion != null) ...[
+              const SizedBox(height: 8),
+              Text('当前固件：${widget.firmwareVersion}', style: AppTheme.caption),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: widget.onCheckFirmwareUpdate,
+                icon: const Icon(Icons.memory),
+                label: const Text('检查固件更新'),
+              ),
+            ],
             const SizedBox(height: 16),
             GestureDetector(
               onTap: () async {

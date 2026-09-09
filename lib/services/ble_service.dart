@@ -24,10 +24,18 @@ class BLEService {
   static const String TAG = "LBJ_BT_FLUTTER";
   static final Guid serviceUuid = Guid("0000ffe0-0000-1000-8000-00805f9b34fb");
   static final Guid charUuid = Guid("0000ffe1-0000-1000-8000-00805f9b34fb");
+  static final Guid otaServiceUuid = Guid(
+    "0000fff0-0000-1000-8000-00805f9b34fb",
+  );
+  static final Guid otaControlUuid = Guid(
+    "0000fff1-0000-1000-8000-00805f9b34fb",
+  );
+  static final Guid otaDataUuid = Guid("0000fff2-0000-1000-8000-00805f9b34fb");
 
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _characteristic;
   StreamSubscription<List<int>>? _valueSubscription;
+  StreamSubscription<List<int>>? _otaControlSubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
 
@@ -39,6 +47,10 @@ class BLEService {
       StreamController<bool>.broadcast();
   final StreamController<DateTime?> _lastReceivedTimeController =
       StreamController<DateTime?>.broadcast();
+  final StreamController<String> _firmwareVersionController =
+      StreamController<String>.broadcast();
+  final StreamController<Map<String, dynamic>> _otaStateController =
+      StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<String> get statusStream => _statusController.stream;
 
@@ -49,9 +61,14 @@ class BLEService {
   Stream<DateTime?> get lastReceivedTimeStream =>
       _lastReceivedTimeController.stream;
 
+  Stream<String> get firmwareVersionStream => _firmwareVersionController.stream;
+
+  Stream<Map<String, dynamic>> get otaStateStream => _otaStateController.stream;
+
   String _deviceStatus = "未连接";
   String? _lastKnownDeviceAddress;
   String? _lastKnownDeviceDisplayName;
+  String? _firmwareVersion;
   String _targetDeviceName = "LBJReceiver";
   DateTime? _lastReceivedTime;
 
@@ -61,6 +78,12 @@ class BLEService {
 
   Timer? _heartbeatTimer;
   final StringBuffer _dataBuffer = StringBuffer();
+  BluetoothCharacteristic? _otaControlCharacteristic;
+  BluetoothCharacteristic? _otaDataCharacteristic;
+  Completer<void>? _otaTerminalCompleter;
+  Completer<void>? _otaReadyCompleter;
+  bool _otaActive = false;
+  Object? _otaError;
 
   void initialize() {
     _loadSettings();
@@ -124,7 +147,8 @@ class BLEService {
       // Second: try match by device name (OS may have maintained the connection but with a different handle)
       if (target == null) {
         target = connected.cast<BluetoothDevice?>().firstWhere(
-          (d) => d!.platformName.toLowerCase() == _targetDeviceName.toLowerCase(),
+          (d) =>
+              d!.platformName.toLowerCase() == _targetDeviceName.toLowerCase(),
           orElse: () => null,
         );
       }
@@ -229,7 +253,9 @@ class BLEService {
 
       // If already connected at OS level, skip connect() and go straight to service discovery
       final systemConnected = FlutterBluePlus.connectedDevices;
-      final alreadyConnected = systemConnected.any((d) => d.remoteId == device.remoteId);
+      final alreadyConnected = systemConnected.any(
+        (d) => d.remoteId == device.remoteId,
+      );
 
       if (!alreadyConnected) {
         await device.connect(timeout: const Duration(seconds: 15));
@@ -293,8 +319,7 @@ class BLEService {
     for (final service in services) {
       for (final c in service.characteristics) {
         try {
-          bool write =
-              c.properties.write || c.properties.writeWithoutResponse;
+          bool write = c.properties.write || c.properties.writeWithoutResponse;
           if (Platform.isWindows) {
             final prop = (c as BluetoothCharacteristicWindows).propertiesWinBle;
             write = prop.write == true || prop.writeWithoutResponse == true;
@@ -314,29 +339,56 @@ class BLEService {
       final services = await _discoverServicesWithRetry(device);
       await _writeTimeSyncToWritableCharacteristics(services);
 
+      BluetoothCharacteristic? mainCharacteristic;
+      BluetoothCharacteristic? otaControl;
+      BluetoothCharacteristic? otaData;
       for (var service in services) {
         if (service.uuid == serviceUuid) {
           for (var char in service.characteristics) {
             if (char.uuid == charUuid) {
-              _characteristic = char;
-              _connectedDevice = device;
-              await device.requestMtu(512);
-              await char.setNotifyValue(true);
-              _valueSubscription = char.lastValueStream.listen(_onDataReceived);
-
-              _updateConnectionState(true, "已连接");
-              _isConnecting = false;
-              return;
+              mainCharacteristic = char;
             }
           }
         }
+        if (service.uuid == otaServiceUuid) {
+          for (var char in service.characteristics) {
+            if (char.uuid == otaControlUuid) otaControl = char;
+            if (char.uuid == otaDataUuid) otaData = char;
+          }
+        }
       }
-      throw Exception('LBJ GATT service not found');
+      if (mainCharacteristic == null) {
+        throw Exception('LBJ GATT service not found');
+      }
+
+      _characteristic = mainCharacteristic;
+      _connectedDevice = device;
+      await device.requestMtu(512);
+      await mainCharacteristic.setNotifyValue(true);
+      _valueSubscription = mainCharacteristic.lastValueStream.listen(
+        _onDataReceived,
+      );
+
+      if (otaControl != null && otaData != null) {
+        _otaControlCharacteristic = otaControl;
+        _otaDataCharacteristic = otaData;
+        await otaControl.setNotifyValue(true);
+        _otaControlSubscription = otaControl.lastValueStream.listen(
+          _onOtaControlReceived,
+        );
+      }
+
+      _updateConnectionState(true, "已连接");
+      _isConnecting = false;
     } catch (e) {
       _isConnecting = false;
       await _valueSubscription?.cancel();
+      await _otaControlSubscription?.cancel();
       _valueSubscription = null;
+      _otaControlSubscription = null;
       _characteristic = null;
+      _otaControlCharacteristic = null;
+      _otaDataCharacteristic = null;
       try {
         await device.disconnect();
       } catch (_) {}
@@ -346,6 +398,16 @@ class BLEService {
 
   void _onDisconnected({bool attemptReconnect = true}) {
     final wasConnected = isConnected;
+    if (_otaActive) {
+      _otaError ??= StateError('蓝牙连接已断开，OTA 已中止');
+      if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
+        _otaReadyCompleter!.completeError(_otaError!);
+      }
+      if (_otaTerminalCompleter != null &&
+          !_otaTerminalCompleter!.isCompleted) {
+        _otaTerminalCompleter!.completeError(_otaError!);
+      }
+    }
     _updateConnectionState(false, "连接已断开");
     _connectionStateSubscription?.cancel();
 
@@ -368,10 +430,14 @@ class BLEService {
 
     await _connectionStateSubscription?.cancel();
     await _valueSubscription?.cancel();
+    await _otaControlSubscription?.cancel();
     _valueSubscription = null;
+    _otaControlSubscription = null;
 
     final device = _connectedDevice;
     _characteristic = null;
+    _otaControlCharacteristic = null;
+    _otaDataCharacteristic = null;
     _connectedDevice = null;
 
     if (device != null) {
@@ -386,9 +452,138 @@ class BLEService {
     if (value.isEmpty) return;
     try {
       final data = utf8.decode(value);
+      if (!_otaActive && data.trimLeft().startsWith('{')) {
+        final decoded = jsonDecode(data);
+        if (_tryHandleFirmwareVersion(decoded)) {
+          return;
+        }
+      }
+      if (_otaActive) return;
       _dataBuffer.write(data);
       _processDataBuffer();
     } catch (e) {}
+  }
+
+  bool _tryHandleFirmwareVersion(Object? decoded) {
+    if (decoded is! Map || decoded['type']?.toString() != 'firmware_version') {
+      return false;
+    }
+    final version = decoded['version']?.toString();
+    if (version != null && version.isNotEmpty) {
+      _firmwareVersion = version;
+      _firmwareVersionController.add(version);
+    }
+    return true;
+  }
+
+  void _onOtaControlReceived(List<int> value) {
+    try {
+      final decoded = jsonDecode(utf8.decode(value));
+      if (decoded is! Map) return;
+      final state = Map<String, dynamic>.from(decoded);
+      _otaStateController.add(state);
+      final name = state['state']?.toString();
+      if (name == 'receiving') {
+        if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
+          _otaReadyCompleter!.complete();
+        }
+        _otaReadyCompleter = null;
+      }
+      if (name == 'error' || name == 'aborted' || name == 'success') {
+        if (name == 'error') {
+          _otaError = Exception(state['code'] ?? 'OTA failed');
+        }
+        if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
+          _otaReadyCompleter!.completeError(_otaError ?? StateError('OTA 已中止'));
+        }
+        if (_otaTerminalCompleter != null &&
+            !_otaTerminalCompleter!.isCompleted) {
+          _otaTerminalCompleter!.complete();
+        }
+        _otaTerminalCompleter = null;
+      }
+    } catch (_) {}
+  }
+
+  Future<void> startFirmwareOta(
+    File firmware, {
+    required String sha256,
+    void Function(Map<String, dynamic> state)? onState,
+    void Function(double progress)? onProgress,
+  }) async {
+    final control = _otaControlCharacteristic;
+    final dataCharacteristic = _otaDataCharacteristic;
+    final device = _connectedDevice;
+    if (!isConnected ||
+        control == null ||
+        dataCharacteristic == null ||
+        device == null) {
+      throw StateError('OTA 服务不可用，请先连接支持 OTA 的接收机');
+    }
+    if (_otaActive) throw StateError('已有 OTA 升级正在进行');
+
+    final subscription = otaStateStream.listen((state) {
+      onState?.call(state);
+      final received = state['received'];
+      final total = state['total'];
+      if (received is num && total is num && total > 0) {
+        onProgress?.call((received / total).clamp(0.0, 1.0));
+      }
+    });
+    _otaActive = true;
+    _otaError = null;
+    try {
+      final total = await firmware.length();
+      if (total <= 0) throw StateError('固件文件为空');
+      if (sha256.length != 64 ||
+          !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(sha256)) {
+        throw ArgumentError.value(sha256, 'sha256', 'SHA-256 格式错误');
+      }
+      _otaReadyCompleter = Completer<void>();
+      await control.write(
+        utf8.encode(
+          jsonEncode({'cmd': 'start', 'total': total, 'sha256': sha256}),
+        ),
+      );
+      await _otaReadyCompleter!.future.timeout(const Duration(seconds: 10));
+
+      final chunkSize = min(max(device.mtuNow - 3, 20), 512);
+      var sent = 0;
+      await for (final chunk in firmware.openRead()) {
+        for (var offset = 0; offset < chunk.length; offset += chunkSize) {
+          final end = min(offset + chunkSize, chunk.length);
+          await dataCharacteristic.write(
+            chunk.sublist(offset, end),
+            withoutResponse: _supportsWriteWithoutResponse(dataCharacteristic),
+          );
+          sent += end - offset;
+          onProgress?.call(sent / total);
+        }
+      }
+      _otaTerminalCompleter = Completer<void>();
+      await control.write(utf8.encode('{"cmd":"finish"}'));
+      await _otaTerminalCompleter!.future.timeout(const Duration(seconds: 30));
+      if (_otaError != null) throw _otaError!;
+    } finally {
+      await subscription.cancel();
+      _otaReadyCompleter = null;
+      _otaTerminalCompleter = null;
+      _otaActive = false;
+    }
+  }
+
+  bool _supportsWriteWithoutResponse(BluetoothCharacteristic characteristic) {
+    if (Platform.isWindows &&
+        characteristic is BluetoothCharacteristicWindows) {
+      return characteristic.propertiesWinBle.writeWithoutResponse == true;
+    }
+    return characteristic.properties.writeWithoutResponse;
+  }
+
+  Future<void> cancelFirmwareOta() async {
+    if (_otaActive && _otaControlCharacteristic != null) {
+      await _otaControlCharacteristic!.write(utf8.encode('{"cmd":"cancel"}'));
+    }
   }
 
   void _processDataBuffer() {
@@ -435,6 +630,7 @@ class BLEService {
     try {
       final decodedJson = jsonDecode(jsonData);
       if (decodedJson is Map<String, dynamic>) {
+        if (_tryHandleFirmwareVersion(decodedJson)) return;
         final now = DateTime.now();
         final recordData = Map<String, dynamic>.from(decodedJson);
         recordData['uniqueId'] =
@@ -462,6 +658,9 @@ class BLEService {
       _deviceStatus = status;
       _connectedDevice = null;
       _characteristic = null;
+      _otaControlCharacteristic = null;
+      _otaDataCharacteristic = null;
+      _firmwareVersion = null;
       _lastReceivedTime = null;
       _lastReceivedTimeController.add(null);
     }
@@ -478,6 +677,8 @@ class BLEService {
   }
 
   bool get isConnected => _characteristic != null;
+
+  String? get firmwareVersion => _firmwareVersion;
 
   String get deviceStatus => _deviceStatus;
 
@@ -512,5 +713,7 @@ class BLEService {
     _dataController.close();
     _connectionController.close();
     _lastReceivedTimeController.close();
+    _firmwareVersionController.close();
+    _otaStateController.close();
   }
 }

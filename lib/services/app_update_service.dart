@@ -15,11 +15,13 @@ class AppUpdateInfo {
     required this.hash,
     required this.fileName,
     required this.fileId,
+    required this.uploadTime,
   });
 
   final String hash;
   final String fileName;
   final int fileId;
+  final String? uploadTime;
 }
 
 class AppUpdateService {
@@ -42,7 +44,7 @@ class AppUpdateService {
       page: 1,
       num: 100,
       sort: 'TIME',
-      reverse: true,
+      reverse: false,
     );
     final extension = Platform.isAndroid ? 'apk' : 'zip';
     final pattern = RegExp(r'^LBJ-Console-([0-9a-f]{8})$');
@@ -57,7 +59,12 @@ class AppUpdateService {
         final hash = match.group(1)!;
         final name = '$baseName.$itemExtension';
         if (hash != appBuildHash) {
-          return AppUpdateInfo(hash: hash, fileName: name, fileId: fileId);
+          return AppUpdateInfo(
+            hash: hash,
+            fileName: name,
+            fileId: fileId,
+            uploadTime: _uploadTime(item),
+          );
         }
         return null;
       }
@@ -201,6 +208,9 @@ class AppUpdateService {
     if (value is num) return value.toInt();
     return int.tryParse(value?.toString() ?? '');
   }
+
+  String? _uploadTime(Map<String, dynamic> item) =>
+      (item['time'] ?? item['uploadTime'] ?? item['createdAt'])?.toString();
 
   static Future<void> cleanupFromArguments(List<String> args) async {
     if (!Platform.isWindows) return;

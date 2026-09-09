@@ -57,6 +57,7 @@ dependencies:
   msix: ^3.16.12
   flutter_background_service: ^5.1.0
   gbk_codec: ^0.4.0
+  crypto: ^3.0.6
   flutter_blue_plus_windows: ^1.26.1
   window_manager: ^0.5.1
   tray_manager: ^0.5.2

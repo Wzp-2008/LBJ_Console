@@ -14,6 +14,7 @@ import 'package:lbjconsole/services/audio_input_service.dart';
 import 'package:lbjconsole/themes/app_theme.dart';
 import 'package:lbjconsole/widgets/audio_waterfall_widget.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
+import 'package:lbjconsole/services/firmware_ota_service.dart';
 
 class _ConnectionStatusWidget extends StatefulWidget {
   final BLEService bleService;
@@ -250,7 +251,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   final GlobalKey<HistoryScreenState> _historyScreenKey =
       GlobalKey<HistoryScreenState>();
   late final AppUpdateService _updateService;
+  late final FirmwareOtaService _firmwareOtaService;
   bool _checkingUpdate = false;
+  bool _checkingFirmwareUpdate = false;
+  StreamSubscription<String>? _firmwareVersionSubscription;
+  String? _firmwareVersion;
 
   @override
   void initState() {
@@ -259,6 +264,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _bleService = BLEService();
     _rtlTcpService = RtlTcpService();
     _updateService = AppUpdateService();
+    _firmwareOtaService = FirmwareOtaService(bleService: _bleService);
     _bleService.initialize();
     _loadInputSettings();
     _initializeServices();
@@ -267,9 +273,119 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _setupLastReceivedTimeListener();
     _setupSettingsListener();
     _loadRecordCount();
+    _firmwareVersionSubscription = _bleService.firmwareVersionStream.listen((
+      version,
+    ) {
+      if (!mounted) return;
+      setState(() => _firmwareVersion = version);
+      _checkFirmwareUpdate();
+    });
+    final knownFirmwareVersion = _bleService.firmwareVersion;
+    if (knownFirmwareVersion != null) {
+      _firmwareVersion = knownFirmwareVersion;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _checkFirmwareUpdate();
+      });
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkForUpdate(showErrors: false, automatic: true);
     });
+  }
+
+  Future<void> _checkFirmwareUpdate({bool showErrors = false}) async {
+    if (_checkingFirmwareUpdate || !_bleService.isConnected) return;
+    _checkingFirmwareUpdate = true;
+    try {
+      final update = await _firmwareOtaService.checkForUpdate();
+      if (!mounted || update == null) return;
+      await _showFirmwareUpdateDialog(update);
+    } catch (e) {
+      if (showErrors && mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('检查固件更新失败：$e')));
+      }
+    } finally {
+      _checkingFirmwareUpdate = false;
+    }
+  }
+
+  Future<void> _showFirmwareUpdateDialog(FirmwareUpdateInfo update) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        var downloading = false;
+        var progress = 0.0;
+        var otaState = '等待开始';
+        return StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: const Text('发现新固件'),
+            content: downloading
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      LinearProgressIndicator(value: progress),
+                      const SizedBox(height: 12),
+                      Text('$otaState ${(progress * 100).toStringAsFixed(0)}%'),
+                    ],
+                  )
+                : Text(
+                    '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
+                    '最新固件：${update.version}\n文件：${update.fileName}'
+                    '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+                  ),
+            actions: [
+              if (!downloading)
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('暂不更新'),
+                ),
+              if (!downloading)
+                FilledButton(
+                  onPressed: () async {
+                    setState(() {
+                      downloading = true;
+                      progress = 0;
+                      otaState = '正在下载/升级';
+                    });
+                    try {
+                      await _firmwareOtaService.installUpdate(
+                        update,
+                        onProgress: (value) {
+                          if (context.mounted) setState(() => progress = value);
+                        },
+                        onState: (state) {
+                          if (context.mounted) {
+                            setState(
+                              () => otaState =
+                                  state['state']?.toString() ?? otaState,
+                            );
+                          }
+                        },
+                      );
+                      if (context.mounted) {
+                        Navigator.pop(dialogContext);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('固件升级成功，设备即将重启')),
+                        );
+                      }
+                    } catch (e) {
+                      if (context.mounted) {
+                        setState(() => downloading = false);
+                        ScaffoldMessenger.of(
+                          context,
+                        ).showSnackBar(SnackBar(content: Text('固件升级失败：$e')));
+                      }
+                    }
+                  },
+                  child: const Text('升级固件'),
+                ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _checkForUpdate({
@@ -317,7 +433,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                     ],
                   )
                 : Text(
-                    '当前版本：$appBuildHash\n最新版本：${update.hash}\n文件：${update.fileName}',
+                    '当前版本：$appBuildHash\n最新版本：${update.hash}\n文件：${update.fileName}'
+                    '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
                   ),
             actions: [
               if (!downloading)
@@ -516,6 +633,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _lastReceivedTimeSubscription?.cancel();
     _rtlTcpLastReceivedTimeSubscription?.cancel();
     _audioLastReceivedTimeSubscription?.cancel();
+    _firmwareVersionSubscription?.cancel();
     _settingsSubscription?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -728,6 +846,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       SettingsScreen(
         onSettingsChanged: () {},
         onCheckForUpdates: () => _checkForUpdate(showErrors: true),
+        onCheckFirmwareUpdate: () => _checkFirmwareUpdate(showErrors: true),
+        firmwareVersion: _firmwareVersion,
       ),
     ];
 
