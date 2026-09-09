@@ -34,7 +34,7 @@ class MainActivity: FlutterActivity() {
                     }
                     val uri = FileProvider.getUriForFile(
                         this,
-                        "${BuildConfig.APPLICATION_ID}.fileprovider",
+                        "${applicationContext.packageName}.fileprovider",
                         apk,
                     )
                     val intent = Intent(Intent.ACTION_VIEW).apply {
