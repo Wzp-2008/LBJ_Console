@@ -45,14 +45,17 @@ class AppUpdateService {
       reverse: true,
     );
     final extension = Platform.isAndroid ? 'apk' : 'zip';
-    final pattern = RegExp(r'^LBJ-Console-([0-9a-f]{8})\.' + extension + r'$');
+    final pattern = RegExp(r'^LBJ-Console-([0-9a-f]{8})$');
 
     for (final item in page.files) {
-      final name = _fileName(item);
-      final match = pattern.firstMatch(name);
+      final baseName = _fileName(item);
+      final itemExtension = _extension(item);
+      if (itemExtension != extension) continue;
+      final match = pattern.firstMatch(baseName);
       final fileId = _fileId(item);
       if (match != null && fileId != null) {
         final hash = match.group(1)!;
+        final name = '$baseName.$itemExtension';
         if (hash != appBuildHash) {
           return AppUpdateInfo(hash: hash, fileName: name, fileId: fileId);
         }
@@ -186,6 +189,12 @@ class AppUpdateService {
 
   String _fileName(Map<String, dynamic> item) =>
       (item['name'] ?? item['filename'] ?? item['fileName'] ?? '').toString();
+
+  String _extension(Map<String, dynamic> item) =>
+      (item['ext'] ?? item['extension'] ?? '')
+          .toString()
+          .toLowerCase()
+          .replaceFirst('.', '');
 
   int? _fileId(Map<String, dynamic> item) {
     final value = item['id'] ?? item['fileId'];
