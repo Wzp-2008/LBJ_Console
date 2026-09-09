@@ -317,7 +317,9 @@ class BLEService {
     final payload = utf8.encode('TIME:$formatted');
 
     for (final service in services) {
+      if (service.uuid != serviceUuid) continue;
       for (final c in service.characteristics) {
+        if (c.uuid != charUuid) continue;
         try {
           bool write = c.properties.write || c.properties.writeWithoutResponse;
           if (Platform.isWindows) {
@@ -337,7 +339,6 @@ class BLEService {
   ) async {
     try {
       final services = await _discoverServicesWithRetry(device);
-      await _writeTimeSyncToWritableCharacteristics(services);
 
       BluetoothCharacteristic? mainCharacteristic;
       BluetoothCharacteristic? otaControl;
@@ -363,23 +364,33 @@ class BLEService {
 
       _characteristic = mainCharacteristic;
       _connectedDevice = device;
-      await device.requestMtu(512);
-      await mainCharacteristic.setNotifyValue(true);
+      if (Platform.isAndroid) await device.requestMtu(512);
+      await _valueSubscription?.cancel();
+      await _otaControlSubscription?.cancel();
+      _dataBuffer.clear();
       _valueSubscription = mainCharacteristic.lastValueStream.listen(
         _onDataReceived,
       );
+      await mainCharacteristic.setNotifyValue(true);
 
       if (otaControl != null && otaData != null) {
         _otaControlCharacteristic = otaControl;
         _otaDataCharacteristic = otaData;
-        await otaControl.setNotifyValue(true);
         _otaControlSubscription = otaControl.lastValueStream.listen(
           _onOtaControlReceived,
         );
+        await otaControl.setNotifyValue(true);
       }
 
       _updateConnectionState(true, "已连接");
       _isConnecting = false;
+      // Read before TIME overwrites the characteristic's cached version value.
+      try {
+        await mainCharacteristic.read();
+      } catch (_) {
+        // Older firmware may only support version notifications.
+      }
+      await _writeTimeSyncToWritableCharacteristics(services);
     } catch (e) {
       _isConnecting = false;
       await _valueSubscription?.cancel();
@@ -401,11 +412,11 @@ class BLEService {
     if (_otaActive) {
       _otaError ??= StateError('蓝牙连接已断开，OTA 已中止');
       if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
-        _otaReadyCompleter!.completeError(_otaError!);
+        _otaReadyCompleter!.complete();
       }
       if (_otaTerminalCompleter != null &&
           !_otaTerminalCompleter!.isCompleted) {
-        _otaTerminalCompleter!.completeError(_otaError!);
+        _otaTerminalCompleter!.complete();
       }
     }
     _updateConnectionState(false, "连接已断开");
@@ -452,12 +463,6 @@ class BLEService {
     if (value.isEmpty) return;
     try {
       final data = utf8.decode(value);
-      if (!_otaActive && data.trimLeft().startsWith('{')) {
-        final decoded = jsonDecode(data);
-        if (_tryHandleFirmwareVersion(decoded)) {
-          return;
-        }
-      }
       if (_otaActive) return;
       _dataBuffer.write(data);
       _processDataBuffer();
@@ -487,20 +492,19 @@ class BLEService {
         if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
           _otaReadyCompleter!.complete();
         }
-        _otaReadyCompleter = null;
       }
       if (name == 'error' || name == 'aborted' || name == 'success') {
-        if (name == 'error') {
+        if (name == 'error' || name == 'aborted') {
           _otaError = Exception(state['code'] ?? 'OTA failed');
         }
         if (_otaReadyCompleter != null && !_otaReadyCompleter!.isCompleted) {
-          _otaReadyCompleter!.completeError(_otaError ?? StateError('OTA 已中止'));
+          _otaError ??= StateError('设备尚未开始接收就结束了 OTA');
+          _otaReadyCompleter!.complete();
         }
         if (_otaTerminalCompleter != null &&
             !_otaTerminalCompleter!.isCompleted) {
           _otaTerminalCompleter!.complete();
         }
-        _otaTerminalCompleter = null;
       }
     } catch (_) {}
   }
@@ -546,38 +550,42 @@ class BLEService {
         ),
       );
       await _otaReadyCompleter!.future.timeout(const Duration(seconds: 10));
+      if (_otaError != null) throw _otaError!;
 
       final chunkSize = min(max(device.mtuNow - 3, 20), 512);
       var sent = 0;
       await for (final chunk in firmware.openRead()) {
         for (var offset = 0; offset < chunk.length; offset += chunkSize) {
+          if (_otaError != null) throw _otaError!;
           final end = min(offset + chunkSize, chunk.length);
           await dataCharacteristic.write(
             chunk.sublist(offset, end),
-            withoutResponse: _supportsWriteWithoutResponse(dataCharacteristic),
+            withoutResponse: false,
           );
           sent += end - offset;
           onProgress?.call(sent / total);
         }
       }
+      if (_otaError != null) throw _otaError!;
       _otaTerminalCompleter = Completer<void>();
       await control.write(utf8.encode('{"cmd":"finish"}'));
       await _otaTerminalCompleter!.future.timeout(const Duration(seconds: 30));
       if (_otaError != null) throw _otaError!;
+    } catch (_) {
+      if (isConnected && identical(device, _connectedDevice)) {
+        try {
+          await control.write(utf8.encode('{"cmd":"cancel"}'));
+        } catch (_) {
+          // Preserve the original transfer error if cancellation also fails.
+        }
+      }
+      rethrow;
     } finally {
       await subscription.cancel();
       _otaReadyCompleter = null;
       _otaTerminalCompleter = null;
       _otaActive = false;
     }
-  }
-
-  bool _supportsWriteWithoutResponse(BluetoothCharacteristic characteristic) {
-    if (Platform.isWindows &&
-        characteristic is BluetoothCharacteristicWindows) {
-      return characteristic.propertiesWinBle.writeWithoutResponse == true;
-    }
-    return characteristic.properties.writeWithoutResponse;
   }
 
   Future<void> cancelFirmwareOta() async {
