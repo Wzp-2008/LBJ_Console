@@ -14,11 +14,17 @@ import 'package:url_launcher_platform_interface/url_launcher_platform_interface.
 import 'package:file_picker/file_picker.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:lbjconsole/services/app_update_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   final VoidCallback? onSettingsChanged;
+  final VoidCallback? onCheckForUpdates;
 
-  const SettingsScreen({super.key, this.onSettingsChanged});
+  const SettingsScreen({
+    super.key,
+    this.onSettingsChanged,
+    this.onCheckForUpdates,
+  });
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
@@ -79,7 +85,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           (e) => e.name == sourceStr,
           orElse: () => InputSource.bluetooth,
         );
-        
+
         _settingsLoaded = true;
       });
     }
@@ -147,9 +153,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
@@ -163,7 +167,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
             const SizedBox(height: 16),
-
 
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -216,7 +219,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   focusedBorder: OutlineInputBorder(
                     borderSide: BorderSide(
-                        color: Theme.of(context).colorScheme.primary),
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
                     borderRadius: BorderRadius.circular(12.0),
                   ),
                 ),
@@ -248,7 +252,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   focusedBorder: OutlineInputBorder(
                     borderSide: BorderSide(
-                        color: Theme.of(context).colorScheme.primary),
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
                     borderRadius: BorderRadius.circular(12.0),
                   ),
                 ),
@@ -279,7 +284,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   focusedBorder: OutlineInputBorder(
                     borderSide: BorderSide(
-                        color: Theme.of(context).colorScheme.primary),
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
                     borderRadius: BorderRadius.circular(12.0),
                   ),
                 ),
@@ -306,8 +312,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     }
                     service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
                   },
-                  icon: Icon(RtlTcpService().isEnabled ? Icons.circle : Icons.refresh, color: RtlTcpService().isConnected ? Colors.green : RtlTcpService().isEnabled ? Colors.orange : Colors.white),
-                  label: Text(RtlTcpService().isConnected ? "已连接" : RtlTcpService().isEnabled ? "正在连接..." : "连接 RTL-TCP"),
+                  icon: Icon(
+                    RtlTcpService().isEnabled ? Icons.circle : Icons.refresh,
+                    color: RtlTcpService().isConnected
+                        ? Colors.green
+                        : RtlTcpService().isEnabled
+                        ? Colors.orange
+                        : Colors.white,
+                  ),
+                  label: Text(
+                    RtlTcpService().isConnected
+                        ? "已连接"
+                        : RtlTcpService().isEnabled
+                        ? "正在连接..."
+                        : "连接 RTL-TCP",
+                  ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: AppTheme.secondaryBlack,
                     foregroundColor: Colors.white,
@@ -328,17 +347,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       return;
                     }
                     final result = await UrlLauncherPlatform.instance.launchUrl(
-                        "iqsrc://-a $_rtlTcpHost -p $_rtlTcpPort -f 821237500 -s 240000 -T 0 -g 600",
-                        const LaunchOptions()
+                      "iqsrc://-a $_rtlTcpHost -p $_rtlTcpPort -f 821237500 -s 240000 -T 0 -g 600",
+                      const LaunchOptions(),
                     );
                     if (result) {
                       service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
                       return;
                     }
                     if (mounted) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('启动失败，请重试')),
-                      );
+                      ScaffoldMessenger.of(
+                        context,
+                      ).showSnackBar(const SnackBar(content: Text('启动失败，请重试')));
                     }
                   },
                   icon: const Icon(Icons.auto_mode),
@@ -352,7 +371,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ),
                 ),
-              )
+              ),
             ],
 
             if (_inputSource == InputSource.audioInput) ...[
@@ -409,9 +428,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
@@ -419,50 +436,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Row(
               children: [
-                Icon(Icons.settings,
-                    color: Theme.of(context).colorScheme.primary),
+                Icon(
+                  Icons.settings,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 const SizedBox(width: 12),
                 const Text('应用设置', style: AppTheme.titleMedium),
               ],
             ),
             const SizedBox(height: 16),
-            Platform.isWindows ? const SizedBox() :
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('后台保活服务', style: AppTheme.bodyLarge),
-                  ],
-                ),
-                Switch(
-                  value: _backgroundServiceEnabled,
-                  onChanged: (value) async {
-                    setState(() {
-                      _backgroundServiceEnabled = value;
-                    });
-                    await _saveSettings();
+            Platform.isWindows
+                ? const SizedBox()
+                : Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [Text('后台保活服务', style: AppTheme.bodyLarge)],
+                      ),
+                      Switch(
+                        value: _backgroundServiceEnabled,
+                        onChanged: (value) async {
+                          setState(() {
+                            _backgroundServiceEnabled = value;
+                          });
+                          await _saveSettings();
 
-                    if (value) {
-                      await BackgroundService.startService();
-                    } else {
-                      await BackgroundService.stopService();
-                    }
-                  },
-                  activeThumbColor: Theme.of(context).colorScheme.primary,
-                ),
-              ],
-            ),
+                          if (value) {
+                            await BackgroundService.startService();
+                          } else {
+                            await BackgroundService.stopService();
+                          }
+                        },
+                        activeThumbColor: Theme.of(context).colorScheme.primary,
+                      ),
+                    ],
+                  ),
             SizedBox(height: Platform.isWindows ? 0 : 16),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('通知服务', style: AppTheme.bodyLarge),
-                  ],
+                  children: [Text('通知服务', style: AppTheme.bodyLarge)],
                 ),
                 Switch(
                   value: _notificationsEnabled,
@@ -473,14 +489,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     // Sync the user-intent flag so the toggle actually gates
                     // notifications, then request the runtime permission when
                     // turning on (Android 13+).
-                    await NotificationService.instance.enableNotifications(value);
+                    await NotificationService.instance.enableNotifications(
+                      value,
+                    );
                     if (value) {
-                      final granted =
-                          await NotificationService.instance.requestPermission();
+                      final granted = await NotificationService.instance
+                          .requestPermission();
                       if (!granted && mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
-                              content: Text('通知权限未授予，请在系统设置中开启通知权限')),
+                            content: Text('通知权限未授予，请在系统设置中开启通知权限'),
+                          ),
                         );
                       }
                     }
@@ -500,9 +519,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
@@ -510,8 +527,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Row(
               children: [
-                Icon(Icons.merge_type,
-                    color: Theme.of(context).colorScheme.primary),
+                Icon(
+                  Icons.merge_type,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 const SizedBox(width: 12),
                 const Text('记录合并', style: AppTheme.titleMedium),
               ],
@@ -522,9 +541,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               children: [
                 const Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('启用记录合并', style: AppTheme.bodyLarge),
-                  ],
+                  children: [Text('启用记录合并', style: AppTheme.bodyLarge)],
                 ),
                 Switch(
                   value: _mergeRecordsEnabled,
@@ -549,8 +566,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text('隐藏不可分组记录', style: AppTheme.bodyLarge),
-                        Text('无车次和机车号的记录',
-                            style: TextStyle(color: Colors.grey, fontSize: 12)),
+                        Text(
+                          '无车次和机车号的记录',
+                          style: TextStyle(color: Colors.grey, fontSize: 12),
+                        ),
                       ],
                     ),
                     Switch(
@@ -577,9 +596,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
@@ -587,8 +604,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           children: [
             Row(
               children: [
-                Icon(Icons.storage,
-                    color: Theme.of(context).colorScheme.primary),
+                Icon(
+                  Icons.storage,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
                 const SizedBox(width: 12),
                 const Text('数据管理', style: AppTheme.titleMedium),
               ],
@@ -681,18 +700,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       color: isDestructive ? Colors.red : Colors.white,
                     ),
                   ),
-                  Text(
-                    subtitle,
-                    style: AppTheme.caption,
-                  ),
+                  Text(subtitle, style: AppTheme.caption),
                 ],
               ),
             ),
-            const Icon(
-              Icons.chevron_right,
-              color: Colors.white54,
-              size: 20,
-            ),
+            const Icon(Icons.chevron_right, color: Colors.white54, size: 20),
           ],
         ),
       ),
@@ -743,33 +755,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
         if (exportedPath != null) {
           final file = File(exportedPath);
-          await SharePlus.instance.share(ShareParams(
-            subject: "LBJ Console Data",
-            files: [XFile(file.path)],
-          ));
+          await SharePlus.instance.share(
+            ShareParams(subject: "LBJ Console Data", files: [XFile(file.path)]),
+          );
         } else {
           scaffoldMessenger.showSnackBar(
-            const SnackBar(
-              content: Text('分享失败：无法生成数据文件'),
-            ),
+            const SnackBar(content: Text('分享失败：无法生成数据文件')),
           );
         }
       } catch (e) {
         if (mounted) {
           Navigator.pop(context);
         }
-        scaffoldMessenger.showSnackBar(
-          SnackBar(
-            content: Text('分享错误：$e'),
-          ),
-        );
+        scaffoldMessenger.showSnackBar(SnackBar(content: Text('分享错误：$e')));
       }
     } catch (e) {
-      scaffoldMessenger.showSnackBar(
-        SnackBar(
-          content: Text('分享错误：$e'),
-        ),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text('分享错误：$e')));
     }
   }
 
@@ -804,7 +805,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (resultFile == null) return;
     final selectedFile = resultFile.files.single.path;
     if (selectedFile == null) return;
-    if (mounted){
+    if (mounted) {
       showDialog(
         context: context,
         barrierDismissible: false,
@@ -827,31 +828,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
 
       if (success) {
-        scaffoldMessenger.showSnackBar(
-          const SnackBar(
-            content: Text('数据导入成功'),
-          ),
-        );
+        scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据导入成功')));
 
         await _loadSettings();
         await _loadRecordCount();
         setState(() {});
       } else {
-        scaffoldMessenger.showSnackBar(
-          const SnackBar(
-            content: Text('数据导入失败'),
-          ),
-        );
+        scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据导入失败')));
       }
     } catch (e) {
       if (mounted) {
         Navigator.pop(context);
       }
-      scaffoldMessenger.showSnackBar(
-        SnackBar(
-          content: Text('导入错误：$e'),
-        ),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text('导入错误：$e')));
     }
   }
 
@@ -908,9 +897,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) {
         Navigator.pop(context);
       }
-      scaffoldMessenger.showSnackBar(
-        SnackBar(content: Text(result.message)),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text(result.message)));
       if (result.success) {
         await _loadSettings();
         await _loadRecordCount();
@@ -920,9 +907,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) {
         Navigator.pop(context);
       }
-      scaffoldMessenger.showSnackBar(
-        SnackBar(content: Text('导入错误：$e')),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text('导入错误：$e')));
     }
   }
 
@@ -948,20 +933,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       await _databaseService.rebuildMergeCache();
       if (mounted) Navigator.pop(context);
-      scaffoldMessenger.showSnackBar(
-        const SnackBar(content: Text('合并缓存已重建')),
-      );
+      scaffoldMessenger.showSnackBar(const SnackBar(content: Text('合并缓存已重建')));
       // Trigger the history list to reload with the fresh summaries.
       widget.onSettingsChanged?.call();
     } catch (e) {
       if (mounted) Navigator.pop(context);
-      scaffoldMessenger.showSnackBar(
-        SnackBar(content: Text('重建错误：$e')),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text('重建错误：$e')));
     }
   }
 
-  Future<void> _clearAllData() async {final scaffoldMessenger = ScaffoldMessenger.of(context);
+  Future<void> _clearAllData() async {
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     final result = await showDialog<bool>(
       context: context,
@@ -1015,11 +997,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         Navigator.pop(context);
       }
 
-      scaffoldMessenger.showSnackBar(
-        const SnackBar(
-          content: Text('数据已清空'),
-        ),
-      );
+      scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据已清空')));
 
       await _loadSettings();
       await _loadRecordCount();
@@ -1028,11 +1006,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) {
         Navigator.pop(context);
       }
-      scaffoldMessenger.showSnackBar(
-        SnackBar(
-          content: Text('清空错误：$e'),
-        ),
-      );
+      scaffoldMessenger.showSnackBar(SnackBar(content: Text('清空错误：$e')));
     }
   }
 
@@ -1040,9 +1014,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16.0),
-      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
@@ -1064,10 +1036,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 if (snapshot.hasData) {
                   return Text(snapshot.data!, style: AppTheme.bodyMedium);
                 } else {
-                  return const Text('v0.1.3-flutter',
-                      style: AppTheme.bodyMedium);
+                  return const Text(
+                    'v0.1.3-flutter',
+                    style: AppTheme.bodyMedium,
+                  );
                 }
               },
+            ),
+            const SizedBox(height: 8),
+            Text('构建 hash：$appBuildHash', style: AppTheme.caption),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: widget.onCheckForUpdates,
+              icon: const Icon(Icons.system_update),
+              label: const Text('检查更新'),
             ),
             const SizedBox(height: 16),
             GestureDetector(
@@ -1171,13 +1153,15 @@ class _DrivePickerDialogState extends State<_DrivePickerDialog> {
                   if (_drives.isEmpty)
                     const Text('未发现含 CSVTEST 文件夹的盘符，可手动输入盘符：')
                   else
-                    ..._drives.map((d) => ListTile(
-                          dense: true,
-                          leading: const Icon(Icons.usb),
-                          title: Text('$d 盘'),
-                          subtitle: Text('$d:\\CSVTEST'),
-                          onTap: () => Navigator.pop(context, d),
-                        )),
+                    ..._drives.map(
+                      (d) => ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.usb),
+                        title: Text('$d 盘'),
+                        subtitle: Text('$d:\\CSVTEST'),
+                        onTap: () => Navigator.pop(context, d),
+                      ),
+                    ),
                   const Divider(),
                   const Text('手动输入盘符：'),
                   TextField(

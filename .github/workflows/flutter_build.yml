@@ -39,32 +39,18 @@ jobs:
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > keystore.jks
 
       - name: Build APK
-        run: flutter build apk --release --split-per-abi
+        run: dart run tool/release_build.dart android
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
 
-      - name: Rename split APKs with tag
-        run: |
-          TAG_NAME=${GITHUB_REF#refs/tags/}
-          # --split-per-abi emits one APK per ABI under flutter-apk/ as
-          # app-<abi>-release.apk (arm64-v8a, armeabi-v7a, x86_64) and no
-          # universal APK. The glob still excludes any app-release.apk by
-          # design (no -<abi>- segment). Copy each under a tagged name.
-          for apk in build/app/outputs/flutter-apk/app-*-release.apk; do
-            name=$(basename "$apk")
-            abi=${name#app-}
-            abi=${abi%-release.apk}
-            cp "$apk" "LBJ_Console_${TAG_NAME}_android_${abi}_release.apk"
-          done
-
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            LBJ_Console_${{ github.ref_name }}_android_*_release.apk
+            LBJ-Console-*.apk
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
@@ -88,23 +74,13 @@ jobs:
         run: flutter pub get
 
       - name: Build Windows
-        run: flutter build windows --release
-
-      # Flutter emits a folder (exe + DLLs + data/); zip its contents so the
-      # archive extracts to a runnable directory. windows-latest ships the VS
-      # build tools Flutter's Windows backend needs, so no extra setup.
-      - name: Package Windows release
-        shell: pwsh
-        run: |
-          $tag = $Env:GITHUB_REF_NAME
-          Compress-Archive -Path build/windows/x64/runner/Release/* `
-            -DestinationPath "LBJ_Console_${tag}_windows_release.zip" -Force
+        run: dart run tool/release_build.dart windows
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            LBJ_Console_${{ github.ref_name }}_windows_release.zip
+            LBJ-Console-*.zip
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
