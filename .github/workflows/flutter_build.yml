@@ -24,6 +24,19 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Cache Flutter build and Dart tool state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+            build
+            android/.dart_tool
+            android/.gradle
+          key: flutter-android-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            flutter-android-${{ runner.os }}-
+
       - name: Cache Gradle
         uses: actions/cache@v4
         with:
@@ -72,6 +85,17 @@ jobs:
 
       - name: Get dependencies
         run: flutter pub get
+
+      - name: Cache Flutter build and Dart tool state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LOCALAPPDATA }}\Pub\Cache
+            .dart_tool
+            build
+          key: flutter-windows-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'windows/**/*.cmake', 'windows/**/*.vcxproj*') }}
+          restore-keys: |
+            flutter-windows-${{ runner.os }}-
 
       - name: Build Windows
         run: dart run tool/release_build.dart windows
