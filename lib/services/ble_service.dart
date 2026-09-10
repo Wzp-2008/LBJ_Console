@@ -235,8 +235,19 @@ class BLEService {
 
   bool _isCurrentConnectionAttempt(int generation, BluetoothDevice device) =>
       generation == _connectionGeneration &&
-      (identical(_connectingDevice, device) ||
-          identical(_connectedDevice, device));
+      (_sameDevice(_connectingDevice, device) ||
+          _sameDevice(_connectedDevice, device));
+
+  // A scan result and the device instance returned by connectedDevices can
+  // represent the same peripheral with different Dart object identities.
+  // Connection-attempt ownership must therefore be based on remoteId, not
+  // identical(...).  This matters especially for a manually selected scan
+  // result, where the plugin may recreate the BluetoothDevice wrapper during
+  // connect/discovery.
+  bool _sameDevice(BluetoothDevice? left, BluetoothDevice right) {
+    if (left == null) return false;
+    return left.remoteId.str.toUpperCase() == right.remoteId.str.toUpperCase();
+  }
 
   void _checkConnectionAttempt(int generation, BluetoothDevice device) {
     if (!_isCurrentConnectionAttempt(generation, device)) {
@@ -258,8 +269,19 @@ class BLEService {
 
     try {
       await _connectionStateSubscription?.cancel();
+      var firstAndroidConnectionState = Platform.isAndroid;
       _connectionStateSubscription = device.connectionState.listen((state) {
+        if (firstAndroidConnectionState) {
+          firstAndroidConnectionState = false;
+          // Android immediately replays the state that existed when the
+          // listener was attached. A fresh attempt normally starts with this
+          // value; it is not a real disconnect and must not invalidate the
+          // attempt. If the replay is `connected`, keep processing later
+          // disconnects normally.
+          if (state == BluetoothConnectionState.disconnected) return;
+        }
         if (state == BluetoothConnectionState.disconnected &&
+            generation == _connectionGeneration &&
             _isCurrentConnectionAttempt(generation, device)) {
           _onDisconnected(connectionGeneration: generation);
         }
