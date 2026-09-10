@@ -4,7 +4,9 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import 'ble_service.dart';
+import 'ble_diagnostics.dart';
 import 'file_share_api.dart';
+import 'recovery_ota.dart';
 
 class FirmwareUpdateInfo {
   const FirmwareUpdateInfo({
@@ -31,8 +33,19 @@ class FirmwareOtaService {
 
   Future<FirmwareUpdateInfo?> checkForUpdate() async {
     final current = _bleService.firmwareVersion;
-    if (current == null || current.isEmpty) return null;
+    if (!_bleService.isConnected) throw StateError('请先连接蓝牙设备');
+    return _findFirmware(current: current);
+  }
 
+  /// Returns the newest firmware entry without requiring a BLE Main
+  /// connection. This is used when the receiver is already in Updater SPP
+  /// mode and therefore cannot report its current firmware version.
+  Future<FirmwareUpdateInfo?> findLatestFirmware() {
+    return _findFirmware();
+  }
+
+  Future<FirmwareUpdateInfo?> _findFirmware({String? current}) async {
+    BleDiagnostics.log('Check firmware folder=$_folderId current=$current');
     final page = await _api.listFiles(
       folder: _folderId,
       page: 1,
@@ -56,7 +69,7 @@ class FirmwareOtaService {
       if (match == null || fileId == null) continue;
 
       final version = match.group(1)!.toUpperCase();
-      if (version.toUpperCase() == current.toUpperCase()) return null;
+      if (version.toUpperCase() == current?.toUpperCase()) return null;
       return FirmwareUpdateInfo(
         version: version,
         fileId: fileId,
@@ -72,6 +85,10 @@ class FirmwareOtaService {
     void Function(double progress)? onProgress,
     void Function(Map<String, dynamic> state)? onState,
   }) async {
+    onState?.call({'state': 'downloading'});
+    BleDiagnostics.log(
+      'Download firmware id=${update.fileId} name=${update.fileName}',
+    );
     final url = await _api.getDownloadUrl(fileId: update.fileId);
     final directory = Directory(
       p.join(Directory.systemTemp.path, 'LBJConsole', 'firmware_update'),
@@ -80,8 +97,7 @@ class FirmwareOtaService {
     final firmware = File(p.join(directory.path, update.fileName));
     await _download(url, firmware, onProgress);
 
-    final bytes = await firmware.readAsBytes();
-    final digest = sha256.convert(bytes).toString();
+    final digest = (await sha256.bind(firmware.openRead()).first).toString();
     await _bleService.startFirmwareOta(
       firmware,
       sha256: digest,
@@ -90,15 +106,57 @@ class FirmwareOtaService {
     );
   }
 
+  Future<void> installSppUpdate(
+    FirmwareUpdateInfo update, {
+    required SppConnector connectSpp,
+    void Function(double progress)? onProgress,
+    void Function(Map<String, dynamic> state)? onState,
+  }) async {
+    onState?.call({'state': 'downloading'});
+    BleDiagnostics.log(
+      'Download rescue firmware id=${update.fileId} name=${update.fileName}',
+    );
+    final url = await _api.getDownloadUrl(fileId: update.fileId);
+    final directory = Directory(
+      p.join(Directory.systemTemp.path, 'LBJConsole', 'firmware_update'),
+    );
+    await directory.create(recursive: true);
+    final firmware = File(p.join(directory.path, update.fileName));
+    await _download(url, firmware, onProgress);
+
+    final digest = (await sha256.bind(firmware.openRead()).first).toString();
+    final total = await firmware.length();
+
+    Future<void> transferFromStart() => SppRecoveryOta(
+      connectSpp: connectSpp,
+      onState: onState,
+      onProgress: onProgress,
+      log: BleDiagnostics.log,
+    ).run(firmware.openRead(), total, digest);
+
+    try {
+      await transferFromStart();
+    } on SppAckTimeoutException {
+      // The failed session has already been closed by SppRecoveryOta. A
+      // retry must create a new SPP session and send OTA_START again; the
+      // timed-out block is never retransmitted in the old session.
+      BleDiagnostics.log('SPP ACK timeout; restarting rescue OTA from START');
+      await transferFromStart();
+    }
+  }
+
   Future<void> _download(
     Uri url,
     File destination,
     void Function(double progress)? onProgress,
   ) async {
-    final client = HttpClient();
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
     try {
       final request = await client.getUrl(url);
-      final response = await request.close();
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw FileShareApiException(
           '固件下载失败（HTTP ${response.statusCode}）',
@@ -109,7 +167,9 @@ class FirmwareOtaService {
       var received = 0;
       final sink = destination.openWrite();
       try {
-        await for (final chunk in response) {
+        await for (final chunk in response.timeout(
+          const Duration(seconds: 30),
+        )) {
           sink.add(chunk);
           received += chunk.length;
           if (total > 0) onProgress?.call(received / total);
