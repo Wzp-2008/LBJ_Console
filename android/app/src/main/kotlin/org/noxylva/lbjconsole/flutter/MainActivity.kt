@@ -14,6 +14,7 @@ class MainActivity: FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         RtlTcpChannelHandler.registerWith(flutterEngine)
         AudioInputHandler.registerWith(flutterEngine, applicationContext)
+        ClassicSppChannelHandler.registerWith(flutterEngine, applicationContext)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, updateChannel)
             .setMethodCallHandler { call, result ->

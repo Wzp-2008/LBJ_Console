@@ -59,8 +59,14 @@ dependencies:
   gbk_codec: ^0.4.0
   crypto: ^3.0.6
   flutter_blue_plus_windows: ^1.26.1
+  flutter_classic_bluetooth: ^1.3.0
   window_manager: ^0.5.1
   tray_manager: ^0.5.2
+
+dependency_overrides:
+  # UTF-8 and fragmented IPC fixes, reproducible on CI.
+  win_ble:
+    path: third_party/win_ble
 
 dev_dependencies:
   flutter_test:

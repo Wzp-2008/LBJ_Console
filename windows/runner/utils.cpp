@@ -8,12 +8,14 @@
 #include <iostream>
 
 void CreateAndAttachConsole() {
-  if (::AllocConsole()) {
+  if (::GetConsoleWindow() != nullptr || ::AllocConsole()) {
+    ::SetConsoleCP(CP_UTF8);
+    ::SetConsoleOutputCP(CP_UTF8);
     FILE *unused;
-    if (freopen_s(&unused, "CONOUT$", "w", stdout)) {
+    if (freopen_s(&unused, "CONOUT$", "w", stdout) == 0) {
       _dup2(_fileno(stdout), 1);
     }
-    if (freopen_s(&unused, "CONOUT$", "w", stderr)) {
+    if (freopen_s(&unused, "CONOUT$", "w", stderr) == 0) {
       _dup2(_fileno(stdout), 2);
     }
     std::ios::sync_with_stdio();
