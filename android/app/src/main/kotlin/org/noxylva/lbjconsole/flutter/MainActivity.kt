@@ -33,10 +33,19 @@ class MainActivity: FlutterActivity() {
                         result.error("NOT_FOUND", "APK does not exist", null)
                         return@setMethodCallHandler
                     }
+                    // The Dart temp directory can resolve through a different
+                    // canonical path on some Android builds.  Copy the APK to
+                    // the app cache, which is explicitly exposed by our
+                    // FileProvider, before creating the content URI.
+                    val installApk = File(
+                        cacheDir,
+                        "lbj-update-${System.currentTimeMillis()}.apk",
+                    )
+                    apk.copyTo(installApk, overwrite = true)
                     val uri = FileProvider.getUriForFile(
                         this,
                         "${applicationContext.packageName}.fileprovider",
-                        apk,
+                        installApk,
                     )
                     val intent = Intent(Intent.ACTION_VIEW).apply {
                         setDataAndType(uri, "application/vnd.android.package-archive")
@@ -44,6 +53,7 @@ class MainActivity: FlutterActivity() {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
                     startActivity(intent)
+                    installApk.deleteOnExit()
                     result.success(null)
                 } catch (error: Exception) {
                     result.error("INSTALLER_ERROR", error.message, null)
