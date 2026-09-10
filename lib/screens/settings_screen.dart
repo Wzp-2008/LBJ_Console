@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
+import 'package:lbjconsole/services/ble_service.dart';
+import 'package:lbjconsole/services/ble_diagnostics.dart';
 
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/background_service.dart';
@@ -20,18 +23,22 @@ class SettingsScreen extends StatefulWidget {
   final VoidCallback? onSettingsChanged;
   final VoidCallback? onCheckForUpdates;
   final VoidCallback? onCheckFirmwareUpdate;
+  final Future<void> Function()? onWirelessBrickRecovery;
   final String? firmwareVersion;
   final Future<void> Function(String name)? onChangeDeviceName;
   final bool isBluetoothConnected;
+  final bool canChangeDeviceName;
 
   const SettingsScreen({
     super.key,
     this.onSettingsChanged,
     this.onCheckForUpdates,
     this.onCheckFirmwareUpdate,
+    this.onWirelessBrickRecovery,
     this.firmwareVersion,
     this.onChangeDeviceName,
     this.isBluetoothConnected = false,
+    this.canChangeDeviceName = false,
   });
 
   @override
@@ -40,14 +47,12 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late DatabaseService _databaseService;
-  late TextEditingController _deviceNameController;
   late TextEditingController _rtlTcpHostController;
   late TextEditingController _rtlTcpPortController;
 
   bool _settingsLoaded = false;
   Timer? _saveDebounceTimer;
 
-  String _deviceName = '';
   bool _backgroundServiceEnabled = false;
   bool _notificationsEnabled = true;
   int _recordCount = 0;
@@ -64,7 +69,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void initState() {
     super.initState();
     _databaseService = DatabaseService.instance;
-    _deviceNameController = TextEditingController();
     _rtlTcpHostController = TextEditingController();
     _rtlTcpPortController = TextEditingController();
     _loadSettings();
@@ -75,8 +79,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final settingsMap = await _databaseService.getAllSettings() ?? {};
     if (mounted) {
       setState(() {
-        _deviceName = settingsMap['deviceName'] ?? 'LBJReceiver';
-        _deviceNameController.text = _deviceName;
         _backgroundServiceEnabled =
             (settingsMap['backgroundServiceEnabled'] ?? 0) == 1;
         _notificationsEnabled = (settingsMap['notificationEnabled'] ?? 1) == 1;
@@ -100,11 +102,58 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _openBrickRecoveryMode() async {
+    final mode = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('救砖模式'),
+        content: const Text(
+          '无线模式适用于已经进入 Updater SPP 模式的预警器。\n'
+          '程序会列出已配对和未配对的蓝牙设备，请手动选择目标设备。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.pop(dialogContext, 'wired'),
+            icon: const Icon(Icons.usb),
+            label: const Text('有线救砖'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(dialogContext, 'wireless'),
+            icon: const Icon(Icons.bluetooth),
+            label: const Text('无线救砖'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted) return;
+    if (mode == 'wired') {
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('有线救砖'),
+          content: const Text('功能未实现'),
+          actions: [
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('知道了'),
+            ),
+          ],
+        ),
+      );
+    } else if (mode == 'wireless') {
+      await widget.onWirelessBrickRecovery?.call();
+    }
+  }
+
   Future<void> _saveSettings() async {
     if (!_settingsLoaded) return;
 
     await _databaseService.updateSettings({
-      'deviceName': _deviceName,
       'backgroundServiceEnabled': _backgroundServiceEnabled ? 1 : 0,
       'notificationEnabled': _notificationsEnabled ? 1 : 0,
       'mergeRecordsEnabled': _mergeRecordsEnabled ? 1 : 0,
@@ -152,28 +201,94 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _changeRemoteDeviceName() async {
     final callback = widget.onChangeDeviceName;
     if (callback == null) return;
-    final name = _deviceNameController.text.trim();
-    if (name.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('设备名称不能为空')));
-      return;
-    }
+    final controller = TextEditingController(
+      text: BLEService().connectedDeviceName,
+    );
+    var saving = false;
+    String? error;
     setState(() => _changingDeviceName = true);
     try {
-      await callback(name);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('设备名称已保存，请重启设备后生效')));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('修改设备名称失败：$e')));
-      }
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => StatefulBuilder(
+          builder: (context, update) => PopScope(
+            canPop: !saving,
+            child: AlertDialog(
+              title: const Text('修改设备广播名称'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('设备地址：${BLEService().connectedDeviceAddress ?? "未知"}'),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: controller,
+                    autofocus: true,
+                    enabled: !saving,
+                    decoration: InputDecoration(
+                      labelText: '新名称',
+                      errorText: error,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    '最多 16 个 UTF-8 字节（中文通常占 3 字节）。\n保存后需重启设备生效；重连仍使用设备地址。',
+                  ),
+                  if (saving) const LinearProgressIndicator(),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: saving ? null : () => Navigator.pop(dialogContext),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: saving
+                      ? null
+                      : () async {
+                          final name = controller.text.trim();
+                          if (name.isEmpty ||
+                              utf8.encode(name).length > 16 ||
+                              name.runes.any((r) => r < 32 || r == 127)) {
+                            update(() => error = '名称不能为空、含控制字符或超过 16 字节');
+                            return;
+                          }
+                          update(() {
+                            saving = true;
+                            error = null;
+                          });
+                          try {
+                            await callback(name);
+                            if (!context.mounted) return;
+                            update(() => saving = false);
+                            Navigator.pop(dialogContext);
+                            if (mounted) {
+                              ScaffoldMessenger.of(this.context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('设备名称已保存，请重启设备后生效'),
+                                ),
+                              );
+                            }
+                          } catch (e) {
+                            if (context.mounted)
+                              update(() {
+                                saving = false;
+                                error = e.toString();
+                              });
+                          }
+                        },
+                  child: const Text('保存到设备'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
     } finally {
+      // Dialog route transition may still be using its text field.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      controller.dispose();
       if (mounted) setState(() => _changingDeviceName = false);
     }
   }
@@ -181,7 +296,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void dispose() {
     _saveDebounceTimer?.cancel();
-    _deviceNameController.dispose();
     _rtlTcpHostController.dispose();
     _rtlTcpPortController.dispose();
     super.dispose();
@@ -240,39 +354,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
             if (_inputSource == InputSource.bluetooth) ...[
               const SizedBox(height: 16),
-              TextField(
-                controller: _deviceNameController,
-                decoration: InputDecoration(
-                  labelText: '蓝牙设备名称',
-                  hintText: '输入设备名称',
-                  labelStyle: const TextStyle(color: Colors.white70),
-                  hintStyle: const TextStyle(color: Colors.white54),
-                  border: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                ),
-                style: const TextStyle(color: Colors.white),
-                onChanged: (value) {
-                  setState(() {
-                    _deviceName = value;
-                  });
-                  _scheduleSave();
-                },
+              Text(
+                '已记住的设备地址：${BLEService().connectedDeviceAddress ?? "尚未选择"}',
+                style: AppTheme.bodyMedium,
+              ),
+              const Text(
+                '首次请在蓝牙设备列表中手动选择。连接成功后按地址自动重连，扫描不筛选名称。',
+                style: AppTheme.caption,
               ),
               const SizedBox(height: 8),
               OutlinedButton.icon(
-                onPressed: widget.isBluetoothConnected && !_changingDeviceName
+                onPressed:
+                    widget.isBluetoothConnected &&
+                        widget.canChangeDeviceName &&
+                        !_changingDeviceName &&
+                        !BLEService().isOtaActive
                     ? _changeRemoteDeviceName
                     : null,
                 icon: _changingDeviceName
@@ -1042,7 +1138,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       await _databaseService.deleteAllRecords();
       await _databaseService.updateSettings({
-        'deviceName': 'LBJReceiver',
         'backgroundServiceEnabled': 0,
         'notificationEnabled': 1,
         'mergeRecordsEnabled': 0,
@@ -1108,9 +1203,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
               icon: const Icon(Icons.system_update),
               label: const Text('检查更新'),
             ),
-            if (widget.firmwareVersion != null) ...[
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: widget.onWirelessBrickRecovery == null
+                  ? null
+                  : _openBrickRecoveryMode,
+              icon: const Icon(Icons.build_circle_outlined),
+              label: const Text('救砖模式'),
+            ),
+            SelectableText(
+              '蓝牙诊断日志：${BleDiagnostics.logPath}',
+              style: AppTheme.caption,
+            ),
+            if (widget.isBluetoothConnected) ...[
               const SizedBox(height: 8),
-              Text('当前固件：${widget.firmwareVersion}', style: AppTheme.caption),
+              Text(
+                '当前固件：${widget.firmwareVersion ?? '未知（可尝试恢复升级）'}',
+                style: AppTheme.caption,
+              ),
               const SizedBox(height: 8),
               OutlinedButton.icon(
                 onPressed: widget.onCheckFirmwareUpdate,

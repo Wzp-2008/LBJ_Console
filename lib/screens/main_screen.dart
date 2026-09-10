@@ -1,3 +1,5 @@
+import 'package:lbjconsole/services/ble_diagnostics.dart';
+import 'package:lbjconsole/services/ble_protocol.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
@@ -15,6 +17,7 @@ import 'package:lbjconsole/themes/app_theme.dart';
 import 'package:lbjconsole/widgets/audio_waterfall_widget.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
 import 'package:lbjconsole/services/firmware_ota_service.dart';
+import 'package:lbjconsole/services/classic_spp_service.dart';
 
 class _ConnectionStatusWidget extends StatefulWidget {
   final BLEService bleService;
@@ -254,6 +257,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   late final FirmwareOtaService _firmwareOtaService;
   bool _checkingUpdate = false;
   bool _checkingFirmwareUpdate = false;
+  bool _brickRecoveryActive = false;
   StreamSubscription<String>? _firmwareVersionSubscription;
   String? _firmwareVersion;
 
@@ -293,13 +297,24 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _checkFirmwareUpdate({bool showErrors = false}) async {
-    if (_checkingFirmwareUpdate || !_bleService.isConnected) return;
+    if (_checkingFirmwareUpdate ||
+        !_bleService.isConnected ||
+        _bleService.isOtaActive)
+      return;
     _checkingFirmwareUpdate = true;
     try {
       final update = await _firmwareOtaService.checkForUpdate();
-      if (!mounted || update == null) return;
+      if (!mounted) return;
+      if (update == null) {
+        if (showErrors)
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('当前固件已是最新版本，或分享站暂无匹配固件')),
+          );
+        return;
+      }
       await _showFirmwareUpdateDialog(update);
-    } catch (e) {
+    } catch (e, stack) {
+      BleDiagnostics.log('Firmware check failed', e, stack);
       if (showErrors && mounted) {
         ScaffoldMessenger.of(
           context,
@@ -316,76 +331,251 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   Future<void> _showFirmwareUpdateDialog(FirmwareUpdateInfo update) async {
     if (!mounted) return;
+    var downloading = false;
+    var progress = 0.0;
+    var otaState = '等待开始';
     await showDialog<void>(
       context: context,
+      barrierDismissible: false,
       builder: (dialogContext) {
-        var downloading = false;
-        var progress = 0.0;
-        var otaState = '等待开始';
         return StatefulBuilder(
-          builder: (context, setState) => AlertDialog(
-            title: const Text('发现新固件'),
-            content: downloading
-                ? Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      LinearProgressIndicator(value: progress),
-                      const SizedBox(height: 12),
-                      Text('$otaState ${(progress * 100).toStringAsFixed(0)}%'),
-                    ],
-                  )
-                : Text(
-                    '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
-                    '最新固件：${update.version}\n文件：${update.fileName}'
-                    '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+          builder: (context, setState) => PopScope(
+            canPop: !downloading,
+            child: AlertDialog(
+              title: const Text('发现新固件'),
+              content: downloading
+                  ? Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        LinearProgressIndicator(value: progress),
+                        const SizedBox(height: 12),
+                        Text(
+                          '$otaState ${(progress * 100).toStringAsFixed(0)}%',
+                        ),
+                      ],
+                    )
+                  : Text(
+                      '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
+                      '最新固件：${update.version}\n文件：${update.fileName}'
+                      '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+                    ),
+              actions: [
+                if (!downloading)
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('暂不更新'),
                   ),
-            actions: [
-              if (!downloading)
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('暂不更新'),
-                ),
-              if (!downloading)
-                FilledButton(
-                  onPressed: () async {
-                    setState(() {
-                      downloading = true;
-                      progress = 0;
-                      otaState = '正在下载/升级';
-                    });
-                    try {
-                      await _firmwareOtaService.installUpdate(
-                        update,
-                        onProgress: (value) {
-                          if (context.mounted) setState(() => progress = value);
-                        },
-                        onState: (state) {
-                          if (context.mounted) {
-                            setState(
-                              () => otaState =
-                                  state['state']?.toString() ?? otaState,
-                            );
-                          }
-                        },
-                      );
-                      if (context.mounted) {
-                        Navigator.pop(dialogContext);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('固件升级成功，设备即将重启')),
+                if (!downloading)
+                  FilledButton(
+                    onPressed: () async {
+                      setState(() {
+                        downloading = true;
+                        progress = 0;
+                        otaState = '正在下载/升级';
+                      });
+                      try {
+                        await _firmwareOtaService.installUpdate(
+                          update,
+                          onProgress: (value) {
+                            if (context.mounted)
+                              setState(() => progress = value);
+                          },
+                          onState: (state) {
+                            if (context.mounted) {
+                              setState(() {
+                                final phase =
+                                    state['state']?.toString() ?? otaState;
+                                otaState = otaStateLabel(phase);
+                                if (phase == 'starting' ||
+                                    phase == 'reconnecting') {
+                                  progress = 0;
+                                }
+                              });
+                            }
+                          },
                         );
+                        if (context.mounted) {
+                          setState(() => downloading = false);
+                          Navigator.pop(dialogContext);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('固件升级成功，设备即将重启')),
+                          );
+                        }
+                      } catch (e, stack) {
+                        BleDiagnostics.log("Firmware install failed", e, stack);
+                        if (context.mounted) {
+                          setState(() => downloading = false);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                '固件升级失败：$e\n日志：${BleDiagnostics.logPath}',
+                              ),
+                            ),
+                          );
+                        }
                       }
-                    } catch (e) {
-                      if (context.mounted) {
-                        setState(() => downloading = false);
-                        ScaffoldMessenger.of(
-                          context,
-                        ).showSnackBar(SnackBar(content: Text('固件升级失败：$e')));
+                    },
+                    child: const Text('升级固件'),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _startWirelessBrickRecovery() async {
+    if (_brickRecoveryActive) return;
+    if (_bleService.isOtaActive) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已有固件升级正在进行')));
+      return;
+    }
+
+    _brickRecoveryActive = true;
+    try {
+      final device = await _findRescueSppDevice();
+      if (!mounted || device == null) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已选择 ${device.displayName}，正在查询最新固件')),
+      );
+      final update = await _firmwareOtaService.findLatestFirmware();
+      if (!mounted) return;
+      if (update == null) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('分享站暂无匹配的最新固件')));
+        return;
+      }
+      await _showRescueFirmwareDialog(update, device);
+    } catch (error, stack) {
+      BleDiagnostics.log('Wireless brick recovery failed', error, stack);
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('无线救砖失败：$error')));
+      }
+    } finally {
+      _brickRecoveryActive = false;
+    }
+  }
+
+  Future<ClassicBluetoothDevice?> _findRescueSppDevice() {
+    if (!mounted) return Future.value();
+    return showDialog<ClassicBluetoothDevice>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => const _RescueDevicePickerDialog(),
+    );
+  }
+
+  Future<void> _showRescueFirmwareDialog(
+    FirmwareUpdateInfo update,
+    ClassicBluetoothDevice device,
+  ) async {
+    var installing = false;
+    var progress = 0.0;
+    var otaState = '等待开始';
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setState) => PopScope(
+            canPop: !installing,
+            child: AlertDialog(
+              title: const Text('无线救砖升级'),
+              content: installing
+                  ? Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        LinearProgressIndicator(value: progress),
+                        const SizedBox(height: 12),
+                        Text(
+                          '$otaState ${(progress * 100).toStringAsFixed(0)}%',
+                        ),
+                      ],
+                    )
+                  : Text(
+                      '设备：${device.displayName}\n'
+                      '运行模式：Updater SPP\n'
+                      '最新固件：${update.version}\n'
+                      '文件：${update.fileName}'
+                      '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}\n\n'
+                      '升级过程中请勿关闭程序或断开蓝牙。',
+                    ),
+              actions: [
+                if (!installing)
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('取消'),
+                  ),
+                if (!installing)
+                  FilledButton(
+                    onPressed: () async {
+                      setState(() {
+                        installing = true;
+                        progress = 0;
+                        otaState = '准备升级';
+                      });
+                      try {
+                        await _firmwareOtaService.installSppUpdate(
+                          update,
+                          connectSpp: () =>
+                              ClassicSppService.connectOtaTransport(
+                                device.address,
+                              ),
+                          onProgress: (value) {
+                            if (context.mounted) {
+                              setState(() => progress = value);
+                            }
+                          },
+                          onState: (state) {
+                            if (context.mounted) {
+                              setState(() {
+                                final phase =
+                                    state['state']?.toString() ?? otaState;
+                                otaState = otaStateLabel(phase);
+                                if (phase == 'reconnecting') progress = 0;
+                              });
+                            }
+                          },
+                        );
+                        if (dialogContext.mounted) {
+                          Navigator.pop(dialogContext);
+                        }
+                        if (mounted) {
+                          ScaffoldMessenger.of(this.context).showSnackBar(
+                            const SnackBar(content: Text('无线救砖升级成功，设备即将重启')),
+                          );
+                        }
+                      } catch (error, stack) {
+                        BleDiagnostics.log(
+                          'Wireless brick recovery install failed',
+                          error,
+                          stack,
+                        );
+                        if (dialogContext.mounted) {
+                          Navigator.pop(dialogContext);
+                        }
+                        if (mounted) {
+                          ScaffoldMessenger.of(this.context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                '无线救砖升级失败：$error\n日志：${BleDiagnostics.logPath}',
+                              ),
+                            ),
+                          );
+                        }
                       }
-                    }
-                  },
-                  child: const Text('升级固件'),
-                ),
-            ],
+                    },
+                    child: const Text('开始刷写'),
+                  ),
+              ],
+            ),
           ),
         );
       },
@@ -595,6 +785,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _isConnected = connected;
+          if (!connected) _firmwareVersion = null;
         });
       }
     });
@@ -851,9 +1042,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         onSettingsChanged: () {},
         onCheckForUpdates: () => _checkForUpdate(showErrors: true),
         onCheckFirmwareUpdate: () => _checkFirmwareUpdate(showErrors: true),
+        onWirelessBrickRecovery: _startWirelessBrickRecovery,
         firmwareVersion: _firmwareVersion,
         onChangeDeviceName: _changeBluetoothDeviceName,
         isBluetoothConnected: _isConnected,
+        canChangeDeviceName: _bleService.canChangeDeviceName,
       ),
     ];
 
@@ -881,6 +1074,211 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             label: '列车记录',
           ),
           NavigationDestination(icon: Icon(Icons.settings), label: '设置'),
+        ],
+      ),
+    );
+  }
+}
+
+class _RescueDevicePickerDialog extends StatefulWidget {
+  const _RescueDevicePickerDialog();
+
+  @override
+  State<_RescueDevicePickerDialog> createState() =>
+      _RescueDevicePickerDialogState();
+}
+
+class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
+  List<ClassicBluetoothDevice> _devices = const [];
+  String? _selectedAddress;
+  String _status = '正在搜索经典蓝牙设备…';
+  String? _errorMessage;
+  bool _loading = true;
+  bool _connecting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDevices();
+  }
+
+  Future<void> _loadDevices() async {
+    if (_loading && _devices.isNotEmpty) return;
+    setState(() {
+      _loading = true;
+      _errorMessage = null;
+      _status = '正在搜索经典蓝牙设备…';
+    });
+    try {
+      final devices = await ClassicSppService.discoverDevices(
+        timeout: const Duration(seconds: 10),
+      );
+      if (!mounted) return;
+      setState(() {
+        _devices = devices;
+        _loading = false;
+        _selectedAddress =
+            devices.any((device) => device.address == _selectedAddress)
+            ? _selectedAddress
+            : null;
+        _status = devices.isEmpty ? '未发现蓝牙设备' : '请选择要救砖的设备';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _errorMessage = '设备搜索失败：$error';
+        _status = '设备搜索失败';
+      });
+    }
+  }
+
+  ClassicBluetoothDevice? get _selectedDevice {
+    final address = _selectedAddress;
+    if (address == null) return null;
+    for (final device in _devices) {
+      if (device.address == address) return device;
+    }
+    return null;
+  }
+
+  Future<void> _pairSelected() async {
+    final device = _selectedDevice;
+    if (device == null || _connecting) return;
+
+    setState(() {
+      _connecting = true;
+      _errorMessage = null;
+      _status = device.isPaired
+          ? '已选择 ${device.displayName}，准备连接…'
+          : '请在系统蓝牙窗口中完成 ${device.displayName} 的配对…';
+    });
+
+    try {
+      if (!device.isPaired) {
+        final paired = await ClassicSppService.pair(
+          device.address,
+        ).timeout(const Duration(seconds: 60));
+        if (!paired) throw StateError('设备配对未完成');
+      }
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        device.isPaired
+            ? device
+            : ClassicBluetoothDevice(device: device.device, isPaired: true),
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _connecting = false;
+          _errorMessage = '配对或连接失败：$error';
+          _status = '请选择其他设备，或重新配对后再试';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _connecting = false);
+    }
+  }
+
+  Widget _buildDeviceGroup(String title, bool paired) {
+    final devices = _devices.where((device) => device.isPaired == paired);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 8, bottom: 4),
+          child: Text(
+            title,
+            style: const TextStyle(fontWeight: FontWeight.bold),
+          ),
+        ),
+        ...devices.map(
+          (device) => RadioListTile<String>(
+            value: device.address,
+            title: Text(device.displayName),
+            subtitle: Text(
+              '${device.address}\n'
+              '${device.hasSppService ? '已发现 SPP 服务' : '未发现 SPP 服务（仍可尝试）'}',
+            ),
+            secondary: Icon(
+              device.hasSppService
+                  ? Icons.bluetooth_connected
+                  : Icons.bluetooth,
+            ),
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            enabled: !_connecting,
+          ),
+        ),
+        if (!devices.any((_) => true))
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 4),
+            child: Text('暂无设备', style: TextStyle(color: Colors.white54)),
+          ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final selected = _selectedDevice;
+    return PopScope(
+      canPop: !_connecting,
+      child: AlertDialog(
+        title: const Text('选择无线救砖设备'),
+        content: SizedBox(
+          width: 520,
+          height: 430,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (_loading) const LinearProgressIndicator(),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Text(_errorMessage ?? _status),
+              ),
+              if (_loading)
+                const Expanded(
+                  child: Center(child: CircularProgressIndicator()),
+                )
+              else
+                Expanded(
+                  child: Scrollbar(
+                    child: RadioGroup<String>(
+                      groupValue: _selectedAddress,
+                      onChanged: (address) {
+                        if (!_connecting && address != null) {
+                          setState(() => _selectedAddress = address);
+                        }
+                      },
+                      child: ListView(
+                        children: [
+                          _buildDeviceGroup('已配对设备', true),
+                          _buildDeviceGroup('未配对设备', false),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: _connecting ? null : () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: _loading || _connecting ? null : _loadDevices,
+            child: const Text('重新搜索'),
+          ),
+          FilledButton(
+            onPressed: selected == null || _loading || _connecting
+                ? null
+                : _pairSelected,
+            child: Text(selected?.isPaired == true ? '选择此设备' : '配对并选择'),
+          ),
         ],
       ),
     );
@@ -957,18 +1355,31 @@ class _PixelPerfectBluetoothDialogState
         _devices.clear();
       });
     }
-    await widget.bleService.startScan(
-      timeout: const Duration(seconds: 8),
-      onScanResults: (devices) {
-        if (mounted) setState(() => _devices = devices);
-      },
-    );
+    try {
+      await widget.bleService.startScan(
+        timeout: const Duration(seconds: 8),
+        onScanResults: (devices) {
+          if (mounted) setState(() => _devices = devices);
+        },
+      );
+      await Future<void>.delayed(const Duration(seconds: 8));
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('扫描失败：$e')));
+    }
     if (mounted) setState(() => _scanState = _ScanState.finished);
   }
 
   Future<void> _connectToDevice(BluetoothDevice device) async {
+    final messenger = ScaffoldMessenger.of(context);
     Navigator.pop(context);
-    await widget.bleService.connectManually(device);
+    try {
+      await widget.bleService.connectManually(device);
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('连接失败：$e')));
+    }
   }
 
   Future<void> _disconnect() async {
@@ -1063,8 +1474,7 @@ class _PixelPerfectBluetoothDialogState
           ),
         ),
         const SizedBox(height: 16),
-        if (_scanState == _ScanState.finished && _devices.isNotEmpty)
-          _buildDeviceListView(),
+        if (_devices.isNotEmpty) _buildDeviceListView(),
       ],
     );
   }
