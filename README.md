@@ -15,7 +15,16 @@ dart run tool/release_build.dart windows
 Debug 构建仍使用 Flutter 默认命名。发布到文件分享站时，将 Android APK
 和 Windows ZIP 放入文件夹 `3469`，应用会从该文件夹检查更新。
 
-应用程序支持通过 BLE 从 [SX1276_Receive_LBJ](https://github.com/undef-i/SX1276_Receive_LBJ) 接收预警消息，或直接连接 RTL-TCP 服务器从 RTL-SDR 接收预警消息。在可视化方面，软件能够在地图上标注预警消息的 GPS 位置，并支持绘制指定列车的运行轨迹。此外，程序内置了机车数据文件，可根据数据内容匹配并显示机车配属、机车类型以及车次类型。
+## Android 集成测试
+
+Android UI 自动化测试可使用以下脚本启动。脚本会在 APK 安装和重新安装期间，
+通过 root `adbd` 自动授予蓝牙、定位和通知权限，并处理残留的 MIUI 权限弹窗：
+
+```powershell
+.\tool\run_android_integration_test.ps1 -Serial <设备序列号>
+```
+
+应用程序支持通过 BLE 从 [SX1276_Receive_LBJ](https://github.com/undef-i/SX1276_Receive_LBJ) 接收预警消息。在可视化方面，软件能够在地图上标注预警消息的 GPS 位置，并支持绘制指定列车的运行轨迹。此外，程序内置了机车数据文件，可根据数据内容匹配并显示机车配属、机车类型以及车次类型。
 
 [android](https://github.com/undef-i/LBJ_Console/tree/android) 分支包含项目早期基于 Android 平台的实现代码，已实现基本功能，现已停止开发。
 
@@ -27,7 +36,7 @@ LBJ Console 依赖以下数据文件，位于 `assets` 目录，用于支持机�
 
 - `loco_info.csv`：包含机车配属信息，格式为 `机车型号,机车编号起始值,机车编号结束值,所属铁路局及机务段,备注`。
 - `loco_type_info.csv`：包含机车类型编码信息，格式为 `机车类型编码前缀,机车类型`。
-- `train_info.csv`：包含车次类型信息，格式为 `正则表达式,车次类型`。
+- `train_number_info.csv`：包含车次类型信息，格式为 `正则表达式,车次类型`。
 
 数据来源于网络，可能存在错误或不完整，欢迎通过提交 Pull Request 共同完善数据准确性。
 
@@ -81,9 +90,7 @@ LBJ Console 依赖以下数据文件，位于 `assets` 目录，用于支持机�
 
 # 致谢
 
-本项目的 RTL-TCP 解析功能以 [RailwayPagerDemod](https://github.com/Arch-Jason/RailwayPagerDemod) 为基础，并移植了 [SX1276_Receive_LBJ](https://github.com/FLN1021/SX1276_Receive_LBJ) 的部分解析逻辑。
-
-感谢以上项目作者的贡献。
+感谢 [SX1276_Receive_LBJ](https://github.com/FLN1021/SX1276_Receive_LBJ) 项目作者的贡献。
 
 
 # 许可证

@@ -1,6 +1,6 @@
 # Recovery Classic SPP OTA
 
-协议参考：2026-09-10 的 APPBLE.md 第六节。
+协议参考：设备端 Updater SPP 协议（见本文下方的帧格式、ACK 与握手约定）。
 
 - 固件取分享站 3470，`TIME / reverse=false`，UI 展示上传时间。
 - Main 阶段仍连接 BLE，订阅 FFF1 并发送带完整 SHA-256 的 `OTA_START`。
