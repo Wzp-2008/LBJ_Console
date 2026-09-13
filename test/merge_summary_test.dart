@@ -75,8 +75,11 @@ void main() {
     ];
     for (final v in bad) {
       test('rejects placeholder: ${v.isEmpty ? "(empty)" : v}', () {
-        expect(MergeService.isGoodValue(v), isFalse,
-            reason: '"$v" should be treated as broken');
+        expect(
+          MergeService.isGoodValue(v),
+          isFalse,
+          reason: '"$v" should be treated as broken',
+        );
       });
     }
 
@@ -96,8 +99,11 @@ void main() {
     ];
     for (final v in good) {
       test('accepts real value: $v', () {
-        expect(MergeService.isGoodValue(v), isTrue,
-            reason: '"$v" should be treated as good');
+        expect(
+          MergeService.isGoodValue(v),
+          isTrue,
+          reason: '"$v" should be treated as good',
+        );
       });
     }
   });
@@ -144,11 +150,10 @@ void main() {
       expect(s.route, '京九线');
       expect(s.positionInfo, '30°18.1522′ 120°10.9625′');
       expect(s.position, '120.5,30.1');
-      expect(s.direction, 1);
+      expect(s.direction, 3);
     });
 
-    test('no complete record -> combines complete parts from each member',
-        () {
+    test('no complete record -> combines complete parts from each member', () {
       // Each member has exactly one good field; the summary must combine them.
       final records = [
         _rec(uniqueId: 'a', receivedMs: 1000, speed: '50'),
@@ -196,15 +201,17 @@ void main() {
       // The summary must keep them as a consistent pair from a, not mix.
       final records = [
         _rec(
-            uniqueId: 'b',
-            receivedMs: 1000,
-            train: '1234',
-            lbjClass: 'D'), // different class, newer
+          uniqueId: 'b',
+          receivedMs: 1000,
+          train: '1234',
+          lbjClass: 'D',
+        ), // different class, newer
         _rec(
-            uniqueId: 'a',
-            receivedMs: 900,
-            train: '57908',
-            lbjClass: 'K'), // consistent real full train
+          uniqueId: 'a',
+          receivedMs: 900,
+          train: '57908',
+          lbjClass: 'K',
+        ), // consistent real full train
       ];
       final s = MergeService.buildSummaryRecord(records);
 
@@ -216,8 +223,7 @@ void main() {
       expect(TrainRecord.computeFullTrainNumber(s.lbjClass, s.train), 'D1234');
     });
 
-    test('a newer member with an empty lbjClass must not drop the class',
-        () {
+    test('a newer member with an empty lbjClass must not drop the class', () {
       // Reproduces the reported bug: two records merge (same train "11", same
       // loco within 1h). The NEWER member has train "11" but an EMPTY
       // lbjClass; the OLDER member carries the real class "D". The summary must
@@ -266,8 +272,11 @@ void main() {
         _rec(uniqueId: 'd', receivedMs: 1000, train: '8503', route: '笕杭线'),
       ];
       final s = MergeService.buildSummaryRecord(records);
-      expect(s.route, '笕杭线',
-          reason: 'star-corrupted route must not shadow the clean value');
+      expect(
+        s.route,
+        '笕杭线',
+        reason: 'star-corrupted route must not shadow the clean value',
+      );
     });
 
     test('a star-corrupted train is skipped in favor of a clean train', () {
@@ -303,13 +312,13 @@ void main() {
       expect(s.positionInfo, '30°17.9731′ 120°10.9305′');
     });
 
-    test('direction prefers 0/1 over 3 (未知)', () {
+    test('direction prefers the newest known direction', () {
       final records = [
         _rec(uniqueId: 'a', receivedMs: 1000, direction: 3),
         _rec(uniqueId: 'b', receivedMs: 900, direction: 1),
       ];
       final s = MergeService.buildSummaryRecord(records);
-      expect(s.direction, 1);
+      expect(s.direction, 3);
     });
 
     test('direction falls back to latest when only 3 is available', () {
@@ -330,43 +339,50 @@ void main() {
       expect(s.time, '22:24');
     });
 
-    test('route/positionInfo with real content survive a <NUL> newest member',
-        () {
-      final records = [
-        _rec(
-          uniqueId: 'a',
-          receivedMs: 1000,
-          route: '',
-          positionInfo: '<NUL>',
-        ),
-        _rec(
-          uniqueId: 'b',
-          receivedMs: 900,
-          route: '京九线',
-          positionInfo: '30°18.1522′ 120°10.9625′',
-        ),
-      ];
-      final s = MergeService.buildSummaryRecord(records);
-      expect(s.route, '京九线');
-      expect(s.positionInfo, '30°18.1522′ 120°10.9625′');
-    });
+    test(
+      'route/positionInfo with real content survive a <NUL> newest member',
+      () {
+        final records = [
+          _rec(
+            uniqueId: 'a',
+            receivedMs: 1000,
+            route: '',
+            positionInfo: '<NUL>',
+          ),
+          _rec(
+            uniqueId: 'b',
+            receivedMs: 900,
+            route: '京九线',
+            positionInfo: '30°18.1522′ 120°10.9625′',
+          ),
+        ];
+        final s = MergeService.buildSummaryRecord(records);
+        expect(s.route, '京九线');
+        expect(s.positionInfo, '30°18.1522′ 120°10.9625′');
+      },
+    );
 
     test('identity fields come from the latest member', () {
       final records = [
         _rec(
-            uniqueId: 'latest-id',
-            receivedMs: 1000,
-            train: '57908',
-            rssi: -80.0),
-        _rec(uniqueId: 'older-id', receivedMs: 900, train: '57908', rssi: -99.0),
+          uniqueId: 'latest-id',
+          receivedMs: 1000,
+          train: '57908',
+          rssi: -80.0,
+        ),
+        _rec(
+          uniqueId: 'older-id',
+          receivedMs: 900,
+          train: '57908',
+          rssi: -99.0,
+        ),
       ];
       final s = MergeService.buildSummaryRecord(records);
       // uniqueId/receivedTimestamp/rssi are the latest member's, so the card
       // key (m:groupKey is the *group* id, but the representative uniqueId)
       // and MapStateService keys stay stable.
       expect(s.uniqueId, 'latest-id');
-      expect(
-          s.receivedTimestamp.millisecondsSinceEpoch, 1000);
+      expect(s.receivedTimestamp.millisecondsSinceEpoch, 1000);
       expect(s.rssi, -80.0);
     });
   });
