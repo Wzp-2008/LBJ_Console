@@ -225,10 +225,9 @@ packages:
   flutter_classic_bluetooth:
     dependency: "direct main"
     description:
-      name: flutter_classic_bluetooth
-      sha256: "3a1882ff7b855fee3673149619a445abf76d12d13398a2fffbd7711f308ac801"
-      url: "https://pub.flutter-io.cn"
-    source: hosted
+      path: "third_party/flutter_classic_bluetooth"
+      relative: true
+    source: path
     version: "1.3.0"
   flutter_driver:
     dependency: transitive

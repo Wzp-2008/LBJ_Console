@@ -20,6 +20,7 @@ import 'package:lbjconsole/services/wired_recovery_service.dart';
 import 'package:lbjconsole/screens/wired_recovery_dialogs.dart';
 import 'package:lbjconsole/services/windows_tray_service.dart';
 import 'package:lbjconsole/models/train_record.dart';
+import 'package:lbjconsole/models/firmware_board.dart';
 
 class _ConnectionStatusWidget extends StatelessWidget {
   final DateTime? lastReceivedTime;
@@ -179,6 +180,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   bool _wiredRecoveryActive = false;
   StreamSubscription<String>? _firmwareVersionSubscription;
   String? _firmwareVersion;
+  FirmwareBoard? _sessionFirmwareBoard;
 
   @override
   void initState() {
@@ -194,23 +196,33 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _setupConnectionListener();
     _setupLastReceivedTimeListener();
     _loadRecordCount();
-    _firmwareVersionSubscription = _bleService.firmwareVersionStream.listen((
-      version,
-    ) {
-      if (!mounted) return;
-      setState(() => _firmwareVersion = version);
-      _checkFirmwareUpdate();
-    });
+    _firmwareVersionSubscription = _bleService.firmwareVersionStream.listen(
+      (version) => unawaited(_handleFirmwareVersion(version)),
+    );
     final knownFirmwareVersion = _bleService.firmwareVersion;
     if (knownFirmwareVersion != null) {
       _firmwareVersion = knownFirmwareVersion;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _checkFirmwareUpdate();
+        unawaited(_handleFirmwareVersion(knownFirmwareVersion));
       });
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkForUpdate(showErrors: false, automatic: true);
     });
+  }
+
+  Future<void> _handleFirmwareVersion(String version) async {
+    if (!mounted) return;
+    final reportedBoard = _bleService.firmwareBoard;
+    setState(() {
+      _firmwareVersion = version;
+      if (reportedBoard != null) _sessionFirmwareBoard = reportedBoard;
+    });
+    final address = _bleService.connectedDeviceAddress;
+    if (reportedBoard != null && address != null && address.isNotEmpty) {
+      await DatabaseService.instance.setDeviceBoard(address, reportedBoard);
+    }
+    await _checkFirmwareUpdate();
   }
 
   Future<void> _checkFirmwareUpdate({bool showErrors = false}) async {
@@ -221,7 +233,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
     _checkingFirmwareUpdate = true;
     try {
-      final update = await _firmwareOtaService.checkForUpdate();
+      final board = await _resolveConnectedFirmwareBoard();
+      if (board == null) return;
+      final update = await _firmwareOtaService.checkForUpdate(board);
       if (!mounted) return;
       if (update == null) {
         if (showErrors) {
@@ -242,6 +256,48 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     } finally {
       _checkingFirmwareUpdate = false;
     }
+  }
+
+  Future<FirmwareBoard?> _resolveConnectedFirmwareBoard() async {
+    final known = _bleService.firmwareBoard ?? _sessionFirmwareBoard;
+    if (known != null) return known;
+    final selected = await _showFirmwareBoardPicker();
+    if (selected == null || !mounted) return null;
+    setState(() => _sessionFirmwareBoard = selected);
+    final address = _bleService.connectedDeviceAddress;
+    if (address != null && address.isNotEmpty) {
+      await DatabaseService.instance.setDeviceBoard(address, selected);
+    }
+    return selected;
+  }
+
+  Future<FirmwareBoard?> _showFirmwareBoardPicker({bool forRescue = false}) {
+    if (!mounted) return Future.value();
+    return showDialog<FirmwareBoard>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('选择板型'),
+        content: Text(
+          '${forRescue ? '救砖模式无法通过 BLE 获取板型' : '设备未上报可识别的板型'}，'
+          '请根据实际硬件选择。\n\n'
+          '$firmwareBoardWarning',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          OutlinedButton(
+            onPressed: () => Navigator.pop(dialogContext, FirmwareBoard.lore32),
+            child: const Text('lore32'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, FirmwareBoard.wzp),
+            child: const Text('wzp'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _changeBluetoothDeviceName(String name) async {
@@ -357,8 +413,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       title: '发现新固件',
       detail:
           '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
+          '板型：${update.board.displayName}\n'
           '最新固件：${update.version}\n文件：${update.fileName}'
-          '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+          '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}\n\n'
+          '$firmwareBoardWarning',
       actionLabel: '升级固件',
       cancelLabel: '暂不更新',
       onInstall: ({onProgress, onState}) => _firmwareOtaService.installUpdate(
@@ -385,10 +443,17 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       final device = await _findRescueSppDevice();
       if (!mounted || device == null) return;
 
+      final board = await _resolveRescueFirmwareBoard(device.address);
+      if (!mounted || board == null) return;
+
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已选择 ${device.displayName}，正在查询最新固件')),
+        SnackBar(
+          content: Text(
+            '已选择 ${device.displayName}（${board.displayName}），正在查询最新固件',
+          ),
+        ),
       );
-      final update = await _firmwareOtaService.findLatestFirmware();
+      final update = await _firmwareOtaService.findLatestFirmware(board);
       if (!mounted) return;
       if (update == null) {
         ScaffoldMessenger.of(
@@ -407,6 +472,48 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     } finally {
       _brickRecoveryActive = false;
     }
+  }
+
+  Future<FirmwareBoard?> _resolveRescueFirmwareBoard(String address) async {
+    final history = await DatabaseService.instance.getDeviceBoard(address);
+    if (!mounted) return null;
+    FirmwareBoard? selected;
+    if (history != null) {
+      final action = await showDialog<_BoardHistoryAction>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('确认救砖板型'),
+          content: Text(
+            '根据历史蓝牙连接情况，自动选择板型 '
+            '${history.displayName}，若不是该板型请手动选择。\n\n'
+            '$firmwareBoardWarning',
+          ),
+          actions: [
+            OutlinedButton(
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                _BoardHistoryAction.chooseManually,
+              ),
+              child: const Text('手动选择'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _BoardHistoryAction.confirm),
+              child: const Text('确定'),
+            ),
+          ],
+        ),
+      );
+      if (action == null) return null;
+      if (action == _BoardHistoryAction.confirm) return history;
+      selected = await _showFirmwareBoardPicker(forRescue: true);
+    } else {
+      selected = await _showFirmwareBoardPicker(forRescue: true);
+    }
+    if (selected != null) {
+      await DatabaseService.instance.setDeviceBoard(address, selected);
+    }
+    return selected;
   }
 
   Future<void> _startWiredBrickRecovery() async {
@@ -429,7 +536,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     return showDialog<ClassicBluetoothDevice>(
       context: context,
       barrierDismissible: false,
-      builder: (dialogContext) => const _RescueDevicePickerDialog(),
+      builder: (dialogContext) => const RescueDevicePickerDialog(),
     );
   }
 
@@ -442,10 +549,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       detail:
           '设备：${device.displayName}\n'
           '运行模式：Updater SPP\n'
+          '板型：${update.board.displayName}\n'
           '最新固件：${update.version}\n'
           '文件：${update.fileName}'
           '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}\n\n'
-          '升级过程中请勿关闭程序或断开蓝牙。',
+          '升级过程中请勿关闭程序或断开蓝牙。\n\n'
+          '$firmwareBoardWarning',
       actionLabel: '开始刷写',
       cancelLabel: '取消',
       onInstall: ({onProgress, onState}) =>
@@ -553,7 +662,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _isConnected = connected;
-          if (!connected) _firmwareVersion = null;
+          if (!connected) {
+            _firmwareVersion = null;
+            _sessionFirmwareBoard = null;
+          }
         });
       }
     });
@@ -617,7 +729,10 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       context: context,
       barrierDismissible: true,
       builder: (context) =>
-          _PixelPerfectBluetoothDialog(bleService: _bleService),
+          _PixelPerfectBluetoothDialog(
+            bleService: _bleService,
+            sessionFirmwareBoard: _sessionFirmwareBoard,
+          ),
     ).then((_) {
       _bleService.setAutoConnectBlocked(false);
       if (!_bleService.isManualDisconnect) {
@@ -812,15 +927,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 }
 
-class _RescueDevicePickerDialog extends StatefulWidget {
-  const _RescueDevicePickerDialog();
+enum _BoardHistoryAction { chooseManually, confirm }
+
+class RescueDevicePickerDialog extends StatefulWidget {
+  const RescueDevicePickerDialog({super.key, this.discovery});
+
+  final ClassicSppDiscoverySession? discovery;
 
   @override
-  State<_RescueDevicePickerDialog> createState() =>
+  State<RescueDevicePickerDialog> createState() =>
       _RescueDevicePickerDialogState();
 }
 
-class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
+class _RescueDevicePickerDialogState extends State<RescueDevicePickerDialog> {
   late final ClassicSppDiscoverySession _discovery;
   final _deviceScrollController = ScrollController();
   StreamSubscription<List<ClassicBluetoothDevice>>? _discoverySubscription;
@@ -832,12 +951,21 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
   bool _loading = false;
   bool _canRescan = false;
   bool _connecting = false;
+  bool _showAllDevices = false;
   int _scanGeneration = 0;
+
+  List<ClassicBluetoothDevice> get _visiblePairedDevices => _showAllDevices
+      ? _pairedDevices
+      : _pairedDevices.where((device) => device.isRecoveryDevice).toList();
+
+  List<ClassicBluetoothDevice> get _visibleUnpairedDevices => _showAllDevices
+      ? _unpairedDevices
+      : _unpairedDevices.where((device) => device.isRecoveryDevice).toList();
 
   @override
   void initState() {
     super.initState();
-    _discovery = ClassicSppDiscoverySession();
+    _discovery = widget.discovery ?? ClassicSppDiscoverySession();
     _discoverySubscription = _discovery.updates.listen(_applyDevices);
     unawaited(_startScan());
   }
@@ -858,15 +986,38 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
       _pairedDevices = paired;
       _unpairedDevices = unpaired;
       if (_selectedAddress != null &&
-          !devices.any((device) => device.address == _selectedAddress)) {
+          !devices.any(
+            (device) =>
+                device.address == _selectedAddress &&
+                (_showAllDevices || device.isRecoveryDevice),
+          )) {
         _selectedAddress = null;
       }
-      if (_loading && _errorMessage == null) {
-        _status = unpaired.isEmpty
-            ? '正在搜索未配对设备…'
-            : '正在搜索未配对设备，已发现 ${unpaired.length} 台';
-      }
+      _refreshDiscoveryStatus(scanning: _loading);
     });
+  }
+
+  void _refreshDiscoveryStatus({required bool scanning}) {
+    if (_errorMessage != null) return;
+    final allCount = _pairedDevices.length + _unpairedDevices.length;
+    final visibleCount =
+        _visiblePairedDevices.length + _visibleUnpairedDevices.length;
+    if (scanning) {
+      final recoveryCount = [..._pairedDevices, ..._unpairedDevices]
+          .where((device) => device.isRecoveryDevice)
+          .length;
+      _status = _showAllDevices
+          ? '正在搜索蓝牙设备，已发现 $allCount 台'
+          : '正在搜索救砖设备，已发现 $recoveryCount 台匹配设备（全部设备 $allCount 台）';
+      return;
+    }
+    _status = visibleCount == 0
+        ? (_showAllDevices
+              ? '未发现蓝牙设备'
+              : allCount == 0
+              ? '未发现 CoD 0x801FFC 救砖设备'
+              : '已发现 $allCount 台蓝牙设备，但没有匹配 CoD 0x801FFC 救砖设备')
+        : '请选择要救砖的设备';
   }
 
   Future<void> _startScan() async {
@@ -889,9 +1040,7 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
       setState(() {
         _loading = false;
         _canRescan = true;
-        _status = _pairedDevices.isEmpty && _unpairedDevices.isEmpty
-            ? '未发现蓝牙设备'
-            : '请选择要救砖的设备';
+        _refreshDiscoveryStatus(scanning: false);
       });
     } catch (error) {
       if (!mounted || generation != _scanGeneration) return;
@@ -983,19 +1132,29 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
             style: const TextStyle(fontWeight: FontWeight.bold),
           ),
         ),
-        ...devices.map(
-          (device) => RadioListTile<String>(
+        ...devices.map((device) {
+          final cod = device.classOfDevice;
+          final codDescription = device.isRecoveryDevice
+              ? '救砖设备 · CoD 0x801FFC'
+              : cod == null
+              ? 'CoD 未知'
+              : 'CoD ${formatClassOfDevice(cod)}';
+          return RadioListTile<String>(
             value: device.address,
             selected: _selectedAddress == device.address,
             title: Text(device.displayName),
             subtitle: Text(
               '${device.address}\n'
+              '$codDescription\n'
               '${device.hasSppService ? '已发现 SPP 服务' : '未发现 SPP 服务（仍可尝试）'}',
             ),
             secondary: Icon(
-              device.hasSppService
+              device.isRecoveryDevice
+                  ? Icons.build_circle_outlined
+                  : device.hasSppService
                   ? Icons.bluetooth_connected
                   : Icons.bluetooth,
+              color: device.isRecoveryDevice ? Colors.green : null,
             ),
             dense: true,
             contentPadding: EdgeInsets.zero,
@@ -1003,8 +1162,8 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
             selectedTileColor: Colors.transparent,
             hoverColor: Colors.transparent,
             enabled: !_connecting,
-          ),
-        ),
+          );
+        }),
         if (devices.isEmpty)
           Padding(
             padding: EdgeInsets.symmetric(vertical: 4),
@@ -1020,10 +1179,12 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
   @override
   Widget build(BuildContext context) {
     final selected = _selectedDevice;
+    final visiblePaired = _visiblePairedDevices;
+    final visibleUnpaired = _visibleUnpairedDevices;
     return PopScope(
       canPop: !_connecting,
       child: AlertDialog(
-        title: const Text('选择无线救砖设备'),
+        title: const Text('选择无线救砖设备（SPP）'),
         content: SizedBox(
           width: 520,
           height: 430,
@@ -1035,6 +1196,24 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 child: Text(_errorMessage ?? _status),
               ),
+              if (!_showAllDevices)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton.icon(
+                    onPressed: _connecting
+                        ? null
+                        : () {
+                            setState(() {
+                              _showAllDevices = true;
+                              _status = _loading
+                                  ? '正在搜索全部蓝牙设备…'
+                                  : '已显示全部设备，请手动确认';
+                            });
+                          },
+                    icon: const Icon(Icons.visibility),
+                    label: const Text('显示全部设备'),
+                  ),
+                ),
               Expanded(
                 child: Scrollbar(
                   controller: _deviceScrollController,
@@ -1051,12 +1230,12 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
                       children: [
                         _buildDeviceGroup(
                           '已配对设备',
-                          _pairedDevices,
+                          visiblePaired,
                           searching: false,
                         ),
                         _buildDeviceGroup(
                           '未配对设备',
-                          _unpairedDevices,
+                          visibleUnpaired,
                           searching: _loading,
                         ),
                       ],
@@ -1094,7 +1273,12 @@ enum _ScanState { initial, scanning, finished }
 
 class _PixelPerfectBluetoothDialog extends StatefulWidget {
   final BLEService bleService;
-  const _PixelPerfectBluetoothDialog({required this.bleService});
+  final FirmwareBoard? sessionFirmwareBoard;
+
+  const _PixelPerfectBluetoothDialog({
+    required this.bleService,
+    this.sessionFirmwareBoard,
+  });
   @override
   State<_PixelPerfectBluetoothDialog> createState() =>
       _PixelPerfectBluetoothDialogState();
@@ -1105,6 +1289,7 @@ class _PixelPerfectBluetoothDialogState
   List<BluetoothDevice> _devices = [];
   _ScanState _scanState = _ScanState.initial;
   StreamSubscription? _connectionSubscription;
+  StreamSubscription<String>? _firmwareVersionSubscription;
 
   @override
   void initState() {
@@ -1112,6 +1297,10 @@ class _PixelPerfectBluetoothDialogState
     _connectionSubscription = widget.bleService.connectionStream.listen((_) {
       if (mounted) setState(() {});
     });
+    _firmwareVersionSubscription = widget.bleService.firmwareVersionStream
+        .listen((_) {
+          if (mounted) setState(() {});
+        });
 
     if (!widget.bleService.isConnected) {
       _startScan();
@@ -1121,6 +1310,7 @@ class _PixelPerfectBluetoothDialogState
   @override
   void dispose() {
     _connectionSubscription?.cancel();
+    _firmwareVersionSubscription?.cancel();
     super.dispose();
   }
 
@@ -1168,7 +1358,7 @@ class _PixelPerfectBluetoothDialogState
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('蓝牙设备'),
+      title: const Text('BLE 设备'),
       content: SizedBox(
         width: double.maxFinite,
         child: SingleChildScrollView(
@@ -1187,6 +1377,8 @@ class _PixelPerfectBluetoothDialogState
   }
 
   Widget _buildConnectedView(BuildContext context, BluetoothDevice? device) {
+    final board =
+        widget.bleService.firmwareBoard ?? widget.sessionFirmwareBoard;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -1209,6 +1401,8 @@ class _PixelPerfectBluetoothDialogState
             style: Theme.of(context).textTheme.bodySmall,
             textAlign: TextAlign.center,
           ),
+        const SizedBox(height: 4),
+        Text('设备类型：${board?.displayName ?? '未知'}'),
         const SizedBox(height: 16),
         ElevatedButton.icon(
           onPressed: _disconnect,
@@ -1239,7 +1433,9 @@ class _PixelPerfectBluetoothDialogState
                   ),
                 )
               : const Icon(Icons.search),
-          label: Text(_scanState == _ScanState.scanning ? '扫描中...' : '扫描设备'),
+          label: Text(
+            _scanState == _ScanState.scanning ? '扫描 BLE 中...' : '扫描 BLE 设备',
+          ),
           style: ElevatedButton.styleFrom(
             minimumSize: const Size(double.infinity, 40),
           ),

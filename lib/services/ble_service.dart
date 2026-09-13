@@ -9,6 +9,7 @@ import 'classic_spp_service.dart';
 import 'recovery_ota.dart';
 
 import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
+import 'package:lbjconsole/models/firmware_board.dart';
 import 'package:lbjconsole/models/train_record.dart';
 import 'package:lbjconsole/services/database_service.dart';
 
@@ -63,6 +64,7 @@ class BLEService {
   String? _lastKnownDeviceAddress;
   String? _lastKnownDeviceDisplayName;
   String? _firmwareVersion;
+  FirmwareBoard? _firmwareBoard;
   bool _initialized = false;
   DateTime? _lastReceivedTime;
 
@@ -166,13 +168,30 @@ class BLEService {
     Duration? timeout,
     Function(List<BluetoothDevice>)? onScanResults,
   }) async {
+    BleDiagnostics.log('BLE scan start timeout=${timeout ?? 'default'}');
     if (FlutterBluePlus.isScanningNow) {
       await FlutterBluePlus.stopScan();
     }
 
     _scanResultsSubscription?.cancel();
+    final reportedAddresses = <String>{};
     _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
       final allFoundDevices = results.map((r) => r.device).toList();
+
+      final newlyReported = <String>[];
+      for (final device in allFoundDevices) {
+        final address = device.remoteId.str;
+        if (reportedAddresses.add(address)) {
+          newlyReported.add(
+            '$address(${device.platformName.trim().isEmpty ? 'unknown' : device.platformName.trim()})',
+          );
+        }
+      }
+      if (newlyReported.isNotEmpty) {
+        BleDiagnostics.log(
+          'BLE scan result total=${allFoundDevices.length} new=${newlyReported.join(', ')}',
+        );
+      }
 
       onScanResults?.call(allFoundDevices);
 
@@ -198,6 +217,9 @@ class BLEService {
 
     try {
       await FlutterBluePlus.startScan(timeout: timeout);
+      BleDiagnostics.log(
+        'BLE scan command accepted resultsSeen=${reportedAddresses.length}',
+      );
     } catch (e, stack) {
       BleDiagnostics.log("Scan failed", e, stack);
       rethrow;
@@ -212,6 +234,7 @@ class BLEService {
   Future<void> stopScan() async {
     await FlutterBluePlus.stopScan();
     _scanResultsSubscription?.cancel();
+    BleDiagnostics.log('BLE scan stop requested');
   }
 
   bool _isCurrentConnectionAttempt(int generation, BluetoothDevice device) =>
@@ -572,6 +595,10 @@ class BLEService {
     final version = decoded['version']?.toString();
     if (version != null && version.isNotEmpty) {
       _firmwareVersion = version;
+      _firmwareBoard = FirmwareBoard.fromWireValue(decoded['board']);
+      if (decoded.containsKey('board') && _firmwareBoard == null) {
+        BleDiagnostics.log('Unknown firmware board value=${decoded['board']}');
+      }
       _firmwareVersionController.add(version);
     }
     return true;
@@ -762,6 +789,7 @@ class BLEService {
       _characteristic = null;
       _otaControlCharacteristic = null;
       _firmwareVersion = null;
+      _firmwareBoard = null;
       _negotiatedMtu = 23;
       _lastReceivedTime = null;
       _lastReceivedTimeController.add(null);
@@ -787,6 +815,8 @@ class BLEService {
   bool get canChangeDeviceName => _characteristic != null && isConnected;
 
   String? get firmwareVersion => _firmwareVersion;
+
+  FirmwareBoard? get firmwareBoard => _firmwareBoard;
 
   String get deviceStatus => _deviceStatus;
 

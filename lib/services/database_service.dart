@@ -9,6 +9,7 @@ import 'dart:convert';
 import 'dart:developer' as developer;
 
 import 'package:lbjconsole/models/train_record.dart';
+import 'package:lbjconsole/models/firmware_board.dart';
 import 'package:lbjconsole/services/csv_import_service.dart';
 import 'package:lbjconsole/services/display_group_cache.dart';
 import 'package:lbjconsole/services/sqflite_initializer.dart';
@@ -25,11 +26,12 @@ class DatabaseService {
   DatabaseService._internal();
 
   static const String _databaseName = 'train_database';
-  static const _databaseVersion = 19;
+  static const _databaseVersion = 20;
 
   static const String trainRecordsTable = 'train_records';
   static const String trainRecordsFtsTable = 'train_records_fts';
   static const String appSettingsTable = 'app_settings';
+  static const String deviceBoardHistoryTable = 'device_board_history';
   static const int _maxFuzzyCharGapLength = 10;
   static const int _exportBatchSize = 500;
 
@@ -167,6 +169,9 @@ class DatabaseService {
       await db.execute('DROP INDEX IF EXISTS idx_records_received');
       await db.execute('DROP INDEX IF EXISTS idx_mdg_latest');
     }
+    if (oldVersion < 20) {
+      await _createDeviceBoardHistoryTable(db);
+    }
   }
 
   Future<void> _createSettingsTable(DatabaseExecutor db) async {
@@ -178,6 +183,15 @@ class DatabaseService {
         notificationEnabled INTEGER NOT NULL DEFAULT 0,
         mergeRecordsEnabled INTEGER NOT NULL DEFAULT 0,
         hideUngroupableRecords INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+  }
+
+  Future<void> _createDeviceBoardHistoryTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $deviceBoardHistoryTable (
+        deviceAddress TEXT PRIMARY KEY,
+        board TEXT NOT NULL
       )
     ''');
   }
@@ -518,6 +532,7 @@ END)''';
 
     await _createSettingsTable(db);
     await db.insert(appSettingsTable, _defaultSettings());
+    await _createDeviceBoardHistoryTable(db);
 
     await db.execute(
       'CREATE INDEX IF NOT EXISTS idx_records_timestamp ON $trainRecordsTable(timestamp)',
@@ -959,6 +974,40 @@ END)''';
 
   Future<int> setSetting(String key, dynamic value) async {
     return updateSettings({key: value});
+  }
+
+  Future<FirmwareBoard?> getDeviceBoard(String address) {
+    final normalized = normalizeBluetoothAddress(address);
+    return _runInDbQueue(() async {
+      final db = await database;
+      final rows = await db.query(
+        deviceBoardHistoryTable,
+        columns: const ['board'],
+        where: 'deviceAddress = ?',
+        whereArgs: [normalized],
+        limit: 1,
+      );
+      if (rows.isEmpty) return null;
+      return FirmwareBoard.fromWireValue(rows.first['board']);
+    });
+  }
+
+  Future<void> setDeviceBoard(String address, FirmwareBoard board) {
+    final normalized = normalizeBluetoothAddress(address);
+    return _runInDbQueue(() async {
+      final db = await database;
+      await db.insert(deviceBoardHistoryTable, {
+        'deviceAddress': normalized,
+        'board': board.wireName,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    });
+  }
+
+  Future<void> clearDeviceBoardHistory() {
+    return _runInDbQueue(() async {
+      final db = await database;
+      await db.delete(deviceBoardHistoryTable);
+    });
   }
 
   Future<void> deleteRecords(List<String> uniqueIds) async {

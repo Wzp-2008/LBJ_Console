@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
+import 'package:lbjconsole/models/firmware_board.dart';
 
 import 'ble_service.dart';
 import 'ble_diagnostics.dart';
@@ -15,12 +16,14 @@ class FirmwareUpdateInfo {
     required this.fileId,
     required this.fileName,
     required this.uploadTime,
+    required this.board,
   });
 
   final String version;
   final int fileId;
   final String fileName;
   final String? uploadTime;
+  final FirmwareBoard board;
 }
 
 class FirmwareOtaService {
@@ -28,27 +31,31 @@ class FirmwareOtaService {
     : _api = api ?? FileShareApi(),
       _bleService = bleService ?? BLEService();
 
-  static const int _folderId = 3470;
   final FileShareApi _api;
   final BLEService _bleService;
 
-  Future<FirmwareUpdateInfo?> checkForUpdate() async {
+  Future<FirmwareUpdateInfo?> checkForUpdate(FirmwareBoard board) async {
     final current = _bleService.firmwareVersion;
     if (!_bleService.isConnected) throw StateError('请先连接蓝牙设备');
-    return _findFirmware(current: current);
+    return _findFirmware(board, current: current);
   }
 
   /// Returns the newest firmware entry without requiring a BLE Main
   /// connection. This is used when the receiver is already in Updater SPP
   /// mode and therefore cannot report its current firmware version.
-  Future<FirmwareUpdateInfo?> findLatestFirmware() {
-    return _findFirmware();
+  Future<FirmwareUpdateInfo?> findLatestFirmware(FirmwareBoard board) {
+    return _findFirmware(board);
   }
 
-  Future<FirmwareUpdateInfo?> _findFirmware({String? current}) async {
-    BleDiagnostics.log('Check firmware folder=$_folderId current=$current');
+  Future<FirmwareUpdateInfo?> _findFirmware(
+    FirmwareBoard board, {
+    String? current,
+  }) async {
+    BleDiagnostics.log(
+      'Check firmware board=${board.wireName} folder=${board.folderId} current=$current',
+    );
     final page = await _api.listFiles(
-      folder: _folderId,
+      folder: board.folderId,
       page: 1,
       num: 100,
       sort: 'TIME',
@@ -71,6 +78,7 @@ class FirmwareOtaService {
         fileId: fileId,
         fileName: '$baseName.$extension',
         uploadTime: fileShareUploadTime(item),
+        board: board,
       );
     }
     return null;

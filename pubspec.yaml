@@ -56,6 +56,9 @@ dependencies:
   tray_manager: ^0.5.2
 
 dependency_overrides:
+  # CoD exposure for reproducible Android/Windows rescue-device filtering.
+  flutter_classic_bluetooth:
+    path: third_party/flutter_classic_bluetooth
   # UTF-8 and fragmented IPC fixes, reproducible on CI.
   win_ble:
     path: third_party/win_ble

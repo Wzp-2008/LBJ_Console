@@ -2,7 +2,9 @@
 
 协议参考：设备端 Updater SPP 协议（见本文下方的帧格式、ACK 与握手约定）。
 
-- 固件取分享站 3470，`TIME / reverse=false`，UI 展示上传时间。
+- 固件按板型取分享站目录：`lore32` 使用 `3471`，`wzp` 使用
+  `3472`，`TIME / reverse=false`，UI 展示板型和上传时间。Main BLE
+  从 `firmware_version.board` 获取板型；旧固件未上报时由用户确认。
 - Main 阶段仍连接 BLE，订阅 FFF1 并发送带完整 SHA-256 的 `OTA_START`。
 - Main 返回 `receiving` 后会重启；这次 BLE 断开是正常的模式切换。
 - Updater 不提供 BLE/GATT。APP 改用相同蓝牙地址连接标准 Classic SPP
@@ -24,6 +26,12 @@
 Android 由 `ClassicSppChannelHandler.kt` 管理 RFCOMM socket。Windows 由
 `flutter_classic_bluetooth` 直接通过 Flutter 插件调用系统 RFCOMM 实现。Windows
 若返回 access denied，应先在系统蓝牙设置中配对。
+
+进入 Updater SPP 的设备在可发现前设置 24 位 CoD `0x801FFC`：
+Service Information `0x400`、Major Uncategorized `0x1F`、Minor 厂商标识
+`0x3F`。救砖扫描默认只显示该 CoD；旧固件或系统未返回 CoD 时，
+用户可点击“显示全部设备”恢复手动选择。CoD 只用于缩小候选范围，
+最终仍必须通过 `LBJ Train Warning Ready` SPP 握手。
 
 普通 BLE 扫描仍不按名称或 Service 筛选。首次使用手动选择，完成 GATT 服务
 发现后才保存 `specifiedDeviceAddress`；后续普通连接按地址自动重连。设备改名

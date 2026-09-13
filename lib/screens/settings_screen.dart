@@ -799,6 +799,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       await BackgroundService.stopService();
       await _databaseService.deleteAllRecords();
+      await _databaseService.clearDeviceBoardHistory();
       await MapStateService.instance.clearAllMapStates();
       await NotificationService.instance.enableNotifications(true);
       await _databaseService.updateSettings(_collectSettings(reset: true));

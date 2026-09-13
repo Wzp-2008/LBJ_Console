@@ -8,6 +8,7 @@ import 'package:flutter_classic_bluetooth/flutter_classic_bluetooth.dart';
 import 'ble_diagnostics.dart';
 import 'ble_protocol.dart';
 import 'recovery_ota.dart';
+import 'package:lbjconsole/models/firmware_board.dart';
 
 abstract interface class ClassicSppConnection {
   Stream<List<int>> get data;
@@ -26,6 +27,8 @@ class ClassicBluetoothDevice {
   String get address => device.address;
   String get displayName => device.displayName;
   List<String> get serviceUuids => device.uuids;
+  int? get classOfDevice => device.classOfDevice;
+  bool get isRecoveryDevice => isRecoveryClassOfDevice(classOfDevice);
   bool get hasSppService => serviceUuids.any(
     (uuid) =>
         ClassicSppService.normalizeUuid(uuid) ==
@@ -129,7 +132,8 @@ class ClassicSppDiscoverySession {
     if (!_scanning) return;
     BleDiagnostics.log(
       'Classic discovery result address=${device.address} '
-      'name=${device.displayName} bond=${device.bondState.name}',
+      'name=${device.displayName} bond=${device.bondState.name} '
+      'classOfDevice=${device.classOfDevice == null ? 'unknown' : formatClassOfDevice(device.classOfDevice!)}',
     );
     final previous = _devices[device.address];
     _devices[device.address] = previous == null

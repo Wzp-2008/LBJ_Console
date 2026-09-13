@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lbjconsole/services/wired_recovery_service.dart';
+import 'package:path/path.dart' as p;
 
 void main() {
   test('exposes the supported recovery baud rates', () {
@@ -282,7 +283,7 @@ Future<File> _writeBundleZip(
     ..addFile(
       ArchiveFile.bytes('partitions.bin', binary ?? _partitionBinary()),
     );
-  final file = File('${root.path}\firmware.zip');
+  final file = File(p.join(root.path, 'firmware.zip'));
   await file.writeAsBytes(ZipEncoder().encodeBytes(archive));
   return file;
 }
