@@ -3,10 +3,11 @@ name: Flutter Build
 on:
   push:
     branches:
-      - '**'
+      - flutter
     tags:
       - 'v*'
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
