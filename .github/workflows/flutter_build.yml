@@ -1,54 +1,32 @@
 name: Flutter Build
 
 on:
-  push:
-    branches:
-      - flutter
-    tags:
-      - 'v*'
-  pull_request:
-  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - Flutter Test
+    types:
+      - completed
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.41.6'
-          channel: 'stable'
-          cache: true
-
-      - name: Get dependencies
-        run: flutter pub get
-
-      - name: Analyze
-        run: flutter analyze
-
-      - name: Run tests
-        run: flutter test
-
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.6'
-          channel: 'stable'
+          channel: stable
           cache: true
 
       - name: Get dependencies
@@ -88,31 +66,34 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
-
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             LBJ-Console-*.apk
-          name: ${{ github.ref_name }}
+          name: ${{ github.event.workflow_run.head_branch }}
           draft: false
           prerelease: false
 
   build-windows:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.6'
-          channel: 'stable'
+          channel: stable
           cache: true
 
       - name: Get dependencies
@@ -137,6 +118,6 @@ jobs:
         with:
           files: |
             LBJ-Console-*.zip
-          name: ${{ github.ref_name }}
+          name: ${{ github.event.workflow_run.head_branch }}
           draft: false
           prerelease: false
