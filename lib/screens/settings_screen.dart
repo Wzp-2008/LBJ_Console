@@ -21,6 +21,7 @@ class SettingsScreen extends StatefulWidget {
   final VoidCallback? onSettingsChanged;
   final VoidCallback? onCheckForUpdates;
   final VoidCallback? onCheckFirmwareUpdate;
+  final Future<void> Function()? onWiredBrickRecovery;
   final Future<void> Function()? onWirelessBrickRecovery;
   final String? firmwareVersion;
   final Future<void> Function(String name)? onChangeDeviceName;
@@ -32,6 +33,7 @@ class SettingsScreen extends StatefulWidget {
     this.onSettingsChanged,
     this.onCheckForUpdates,
     this.onCheckFirmwareUpdate,
+    this.onWiredBrickRecovery,
     this.onWirelessBrickRecovery,
     this.firmwareVersion,
     this.onChangeDeviceName,
@@ -98,6 +100,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   };
 
   Future<void> _openBrickRecoveryMode() async {
+    if (Platform.isAndroid) {
+      await widget.onWirelessBrickRecovery?.call();
+      return;
+    }
     final mode = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -111,11 +117,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
             onPressed: () => Navigator.pop(dialogContext),
             child: const Text('取消'),
           ),
-          OutlinedButton.icon(
-            onPressed: () => Navigator.pop(dialogContext, 'wired'),
-            icon: const Icon(Icons.usb),
-            label: const Text('有线救砖'),
-          ),
+          if (Platform.isWindows && widget.onWiredBrickRecovery != null)
+            OutlinedButton.icon(
+              onPressed: () => Navigator.pop(dialogContext, 'wired'),
+              icon: const Icon(Icons.usb),
+              label: const Text('有线救砖'),
+            ),
           FilledButton.icon(
             onPressed: () => Navigator.pop(dialogContext, 'wireless'),
             icon: const Icon(Icons.bluetooth),
@@ -127,19 +134,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     if (!mounted) return;
     if (mode == 'wired') {
-      await showDialog<void>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('有线救砖'),
-          content: const Text('功能未实现'),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('知道了'),
-            ),
-          ],
-        ),
-      );
+      await widget.onWiredBrickRecovery?.call();
     } else if (mode == 'wireless') {
       await widget.onWirelessBrickRecovery?.call();
     }
@@ -861,7 +856,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 8),
           OutlinedButton.icon(
-            onPressed: widget.onWirelessBrickRecovery == null
+            onPressed:
+                widget.onWirelessBrickRecovery == null &&
+                    widget.onWiredBrickRecovery == null
                 ? null
                 : _openBrickRecoveryMode,
             icon: const Icon(Icons.build_circle_outlined),

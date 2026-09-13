@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -11,6 +12,7 @@ class WindowsTrayService with WindowListener, TrayListener {
   static final WindowsTrayService instance = WindowsTrayService._();
 
   bool _initialized = false;
+  bool _criticalOperationActive = false;
 
   static bool get isSupported => Platform.isWindows;
 
@@ -27,7 +29,11 @@ class WindowsTrayService with WindowListener, TrayListener {
         'assets',
         'tray_icon.ico',
       );
-      final developmentIcon = p.join(Directory.current.path, 'assets', 'tray_icon.ico');
+      final developmentIcon = p.join(
+        Directory.current.path,
+        'assets',
+        'tray_icon.ico',
+      );
       final iconPath = await File(packagedIcon).exists()
           ? packagedIcon
           : developmentIcon;
@@ -37,15 +43,7 @@ class WindowsTrayService with WindowListener, TrayListener {
 
       await trayManager.setIcon(iconPath);
       await trayManager.setToolTip('LBJ Console');
-      await trayManager.setContextMenu(
-        Menu(
-          items: [
-            MenuItem(key: 'show', label: '显示主窗口'),
-            MenuItem.separator(),
-            MenuItem(key: 'exit', label: '退出'),
-          ],
-        ),
-      );
+      await _updateContextMenu();
       await windowManager.setPreventClose(true);
       windowManager.addListener(this);
       trayManager.addListener(this);
@@ -58,12 +56,36 @@ class WindowsTrayService with WindowListener, TrayListener {
     }
   }
 
+  /// Prevents the app from being hidden or terminated while an operation is
+  /// in the middle of writing device flash.
+  Future<void> setCriticalOperationActive(bool active) async {
+    _criticalOperationActive = active;
+    if (_initialized) await _updateContextMenu();
+  }
+
+  Future<void> _updateContextMenu() {
+    return trayManager.setContextMenu(
+      Menu(
+        items: [
+          MenuItem(key: 'show', label: '显示主窗口'),
+          MenuItem.separator(),
+          MenuItem(
+            key: 'exit',
+            label: _criticalOperationActive ? '刷写进行中，暂不可退出' : '退出',
+            disabled: _criticalOperationActive,
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> showMainWindow() async {
     await windowManager.show();
     await windowManager.focus();
   }
 
   Future<void> exitApp() async {
+    if (_criticalOperationActive) return;
     // Remove the tray icon first so the user gets immediate feedback, then
     // terminate the process. The native message loop
     // (windows/runner/main.cpp) runs with SetQuitOnClose(false) for tray
@@ -78,6 +100,10 @@ class WindowsTrayService with WindowListener, TrayListener {
 
   @override
   void onWindowClose() {
+    if (_criticalOperationActive) {
+      unawaited(showMainWindow());
+      return;
+    }
     windowManager.hide();
   }
 
@@ -97,7 +123,7 @@ class WindowsTrayService with WindowListener, TrayListener {
       case 'show':
         showMainWindow();
       case 'exit':
-        exitApp();
+        if (!_criticalOperationActive) unawaited(exitApp());
     }
   }
 }

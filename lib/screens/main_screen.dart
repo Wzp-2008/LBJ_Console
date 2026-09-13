@@ -3,6 +3,7 @@ import 'package:lbjconsole/services/ble_protocol.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
+import 'dart:io';
 import 'dart:developer' as developer;
 import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
 import 'package:lbjconsole/screens/history_screen.dart';
@@ -15,6 +16,9 @@ import 'package:lbjconsole/themes/app_theme.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
 import 'package:lbjconsole/services/firmware_ota_service.dart';
 import 'package:lbjconsole/services/classic_spp_service.dart';
+import 'package:lbjconsole/services/wired_recovery_service.dart';
+import 'package:lbjconsole/screens/wired_recovery_dialogs.dart';
+import 'package:lbjconsole/services/windows_tray_service.dart';
 import 'package:lbjconsole/models/train_record.dart';
 
 class _ConnectionStatusWidget extends StatelessWidget {
@@ -168,9 +172,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       GlobalKey<HistoryScreenState>();
   late final AppUpdateService _updateService;
   late final FirmwareOtaService _firmwareOtaService;
+  late final WiredRecoveryService _wiredRecoveryService;
   bool _checkingUpdate = false;
   bool _checkingFirmwareUpdate = false;
   bool _brickRecoveryActive = false;
+  bool _wiredRecoveryActive = false;
   StreamSubscription<String>? _firmwareVersionSubscription;
   String? _firmwareVersion;
 
@@ -181,6 +187,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _bleService = BLEService();
     _updateService = AppUpdateService();
     _firmwareOtaService = FirmwareOtaService(bleService: _bleService);
+    _wiredRecoveryService = WiredRecoveryService();
     _bleService.initialize();
     _initializeServices();
     _checkAndStartBackgroundService();
@@ -399,6 +406,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       }
     } finally {
       _brickRecoveryActive = false;
+    }
+  }
+
+  Future<void> _startWiredBrickRecovery() async {
+    if (!Platform.isWindows || _wiredRecoveryActive) return;
+    _wiredRecoveryActive = true;
+    try {
+      await showWiredRecoveryWorkflow(
+        context,
+        service: _wiredRecoveryService,
+        onCriticalOperation: (active) =>
+            WindowsTrayService.instance.setCriticalOperationActive(active),
+      );
+    } finally {
+      _wiredRecoveryActive = false;
     }
   }
 
@@ -737,6 +759,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         onSettingsChanged: () {},
         onCheckForUpdates: () => _checkForUpdate(showErrors: true),
         onCheckFirmwareUpdate: () => _checkFirmwareUpdate(showErrors: true),
+        onWiredBrickRecovery: _startWiredBrickRecovery,
         onWirelessBrickRecovery: _startWirelessBrickRecovery,
         firmwareVersion: _firmwareVersion,
         onChangeDeviceName: _changeBluetoothDeviceName,

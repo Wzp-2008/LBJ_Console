@@ -24,6 +24,13 @@ Android UI 自动化测试可使用以下脚本启动。脚本会在 APK 安装�
 .\tool\run_android_integration_test.ps1 -Serial <设备序列号>
 ```
 
+## Windows 有线救砖
+
+Windows 发布包内置 `espflash 4.5.0`，有线救砖只接受本地 ZIP 固件包，不会联网下载。
+ZIP 根目录必须严格包含 `bootloader.bin`、`updater.bin`、`firmware.bin`、
+`partitions.csv` 和 `partitions.bin` 五个文件。刷写时会按分区表写入 updater/firmware，
+并固定将 bootloader 写到 `0x1000`、分区表写到 `0x10000`；NVS 和 otadata 会保留。
+
 应用程序支持通过 BLE 从 [SX1276_Receive_LBJ](https://github.com/undef-i/SX1276_Receive_LBJ) 接收预警消息。在可视化方面，软件能够在地图上标注预警消息的 GPS 位置，并支持绘制指定列车的运行轨迹。此外，程序内置了机车数据文件，可根据数据内容匹配并显示机车配属、机车类型以及车次类型。
 
 [android](https://github.com/undef-i/LBJ_Console/tree/android) 分支包含项目早期基于 Android 平台的实现代码，已实现基本功能，现已停止开发。

@@ -78,6 +78,14 @@ endif()
 set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
 set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
+# espflash is a Windows-only bundled tool.  It is deliberately installed
+# outside flutter_assets so Android and other Flutter targets never package the
+# executable.
+set(ESPFLASH_BUNDLED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/espflash/windows-x64")
+if(NOT EXISTS "${ESPFLASH_BUNDLED_DIR}/espflash.exe")
+  message(FATAL_ERROR "Bundled espflash.exe is missing from ${ESPFLASH_BUNDLED_DIR}")
+endif()
+
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
 
@@ -111,4 +119,11 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 # Install the AOT library on non-Debug builds only.
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
+  COMPONENT Runtime)
+
+install(FILES
+  "${ESPFLASH_BUNDLED_DIR}/espflash.exe"
+  "${ESPFLASH_BUNDLED_DIR}/LICENSE-MIT"
+  "${ESPFLASH_BUNDLED_DIR}/LICENSE-APACHE"
+  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}/tools/espflash"
   COMPONENT Runtime)
