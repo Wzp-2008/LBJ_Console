@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -33,21 +34,84 @@ Future<void> disposeTestDatabase() async {
   DatabaseService.resetForTesting();
 }
 
-/// Locates the sample data file `LBJ_Console_output.json` (32 696 records).
-/// `flutter test` runs with the working directory at the project root, where
-/// the file lives; the upward walk is a fallback.
+/// Locates the optional large sample data file `LBJ_Console_output.json`.
+///
+/// The real sample is intentionally ignored by git because it is large and
+/// may contain private captures. CI therefore uses a deterministic generated
+/// fixture with the same top-level JSON shape when the local sample is absent.
+/// The fallback is large enough to exercise pagination and contains both
+/// groupable and ungroupable records for the data-layer tests.
 String sampleJsonPath() {
+  final forceFallback = Platform.environment['LBJ_TEST_SYNTHETIC_SAMPLE'] == '1';
   final direct = p.join(Directory.current.path, 'LBJ_Console_output.json');
-  if (File(direct).existsSync()) return direct;
+  if (!forceFallback && File(direct).existsSync()) return direct;
   var dir = Directory.current;
-  for (var i = 0; i < 6; i++) {
-    final candidate = p.join(dir.path, 'LBJ_Console_output.json');
-    if (File(candidate).existsSync()) return candidate;
-    final parent = dir.parent;
-    if (parent.path == dir.path) break;
-    dir = parent;
+  if (!forceFallback) {
+    for (var i = 0; i < 6; i++) {
+      final candidate = p.join(dir.path, 'LBJ_Console_output.json');
+      if (File(candidate).existsSync()) return candidate;
+      final parent = dir.parent;
+      if (parent.path == dir.path) break;
+      dir = parent;
+    }
   }
-  return direct;
+
+  final fallback = p.join(
+    Directory.systemTemp.path,
+    'lbj_console_test_sample_$pid.json',
+  );
+  final fallbackFile = File(fallback);
+  if (!fallbackFile.existsSync()) {
+    final baseMs = DateTime.utc(2024, 1, 1).millisecondsSinceEpoch;
+    final records = <Map<String, dynamic>>[];
+
+    // Keep more than one page of displayable records so pagination tests
+    // exercise their cursor termination path.
+    for (var i = 0; i < 400; i++) {
+      final receivedMs = baseMs - i * 60000;
+      records.add({
+        'uniqueId': 'ci_$i',
+        'timestamp': receivedMs,
+        'receivedTimestamp': receivedMs,
+        'train': 'T${i % 100}',
+        'direction': i.isEven ? 1 : 3,
+        'speed': '${40 + i % 80}',
+        'position': '${100 + i % 300}',
+        'time': '12:00',
+        'loco': '4101${i.toString().padLeft(4, '0')}',
+        'locoType': '测试车型',
+        'lbjClass': 'K',
+        'route': '测试线路',
+        'positionInfo': '30.0 120.0',
+        'rssi': -70.0,
+      });
+    }
+
+    // These records deliberately have no train or loco key and must be
+    // removed when hideUngroupableRecords is enabled.
+    for (var i = 0; i < 20; i++) {
+      final receivedMs = baseMs - (500 + i) * 60000;
+      records.add({
+        'uniqueId': 'ci_ungroupable_$i',
+        'timestamp': receivedMs,
+        'receivedTimestamp': receivedMs,
+        'train': '',
+        'direction': 1,
+        'speed': '',
+        'position': '',
+        'time': '12:00',
+        'loco': '',
+        'locoType': '',
+        'lbjClass': '',
+        'route': '测试线路',
+        'positionInfo': '',
+        'rssi': -80.0,
+      });
+    }
+
+    fallbackFile.writeAsStringSync(jsonEncode({'records': records}));
+  }
+  return fallback;
 }
 
 /// Builds a [TrainRecord] for tests with sensible defaults; only the fields
