@@ -8,6 +8,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lbjconsole/screens/settings_screen.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
@@ -112,6 +113,19 @@ void main() {
       // ignore: avoid_print
       print('checkForUpdate() → $info');
       expect(info, isNull);
+    });
+
+    test('PowerShell 更新脚本已作为 Windows 资源打包', () async {
+      if (!Platform.isWindows) {
+        markTestSkipped('仅 Windows 端适用');
+        return;
+      }
+
+      final script = await rootBundle.loadString('assets/windows_updater.ps1');
+      expect(script, contains('Expand-Archive'));
+      expect(script, contains('ParentProcessId'));
+      expect(script, contains('lbj_updater.exe'));
+      expect(script, contains('robocopy.exe'));
     });
   });
 

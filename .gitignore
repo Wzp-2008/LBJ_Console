@@ -15,6 +15,7 @@ captures
 local.properties
 *.ps1
 !tool/run_android_integration_test.ps1
+!assets/windows_updater.ps1
 .*.bat
 *.jks
 *.keystore

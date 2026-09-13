@@ -92,60 +92,33 @@ class AppUpdateService {
 
     final executable = File(Platform.resolvedExecutable);
     final installDirectory = executable.parent;
-    final updater = await _findWindowsUpdater(installDirectory, directory);
+    final updaterScript = File(p.join(directory.path, 'update.ps1'));
+    final script = await rootBundle.loadString('assets/windows_updater.ps1');
+    await updaterScript.writeAsString(script, flush: true);
 
-    await Process.start(updater.path, [
+    await Process.start('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-WindowStyle',
+      'Hidden',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      updaterScript.path,
+      '-InstallDirectory',
       installDirectory.path,
+      '-ZipPath',
       downloaded.path,
+      '-UpdateDirectory',
       directory.path,
+      '-Executable',
+      executable.path,
+      '-ParentProcessId',
+      pid.toString(),
     ], mode: ProcessStartMode.detached);
     _api.close();
     exit(0);
   }
-
-  Future<File> _findWindowsUpdater(
-    Directory installDirectory,
-    Directory updateDirectory,
-  ) async {
-    final installedUpdater = File(
-      p.join(installDirectory.path, 'lbj_updater.exe'),
-    );
-    if (await installedUpdater.exists()) return installedUpdater;
-
-    // The first release containing the updater must also be able to update
-    // installations created by older releases which do not have it yet.
-    final bootstrapDirectory = Directory(
-      p.join(updateDirectory.path, 'bootstrap'),
-    );
-    await bootstrapDirectory.create(recursive: true);
-    final zipPath = p.join(updateDirectory.path, 'update.zip');
-    if (!await File(zipPath).exists()) {
-      throw const FileShareApiException('更新目录中缺少 update.zip');
-    }
-    final command =
-        "Expand-Archive -LiteralPath '${_powerShellQuote(zipPath)}' "
-        "-DestinationPath '${_powerShellQuote(bootstrapDirectory.path)}' -Force";
-    final result = await Process.run('powershell.exe', [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-Command',
-      command,
-    ]);
-    if (result.exitCode != 0) {
-      throw FileShareApiException('无法准备 Windows 更新器：${result.stderr}');
-    }
-    final extractedUpdater = File(
-      p.join(bootstrapDirectory.path, 'lbj_updater.exe'),
-    );
-    if (!await extractedUpdater.exists()) {
-      throw const FileShareApiException('更新包中缺少 Windows 更新器');
-    }
-    return extractedUpdater;
-  }
-
-  String _powerShellQuote(String value) => value.replaceAll("'", "''");
 
   Future<Directory> _createUpdateDirectory(String hash) async {
     final root = Directory(p.join(Directory.systemTemp.path, 'LBJConsole'));

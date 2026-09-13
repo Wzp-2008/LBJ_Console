@@ -25,7 +25,7 @@
 | `TrainRecord.rssi`（字段/JSON/DB 列/`merge_service.dart:97`） | 用户明确决定：**不展示，但要保存**。不要加 UI，也不要删 |
 | `assets/*.csv`、`assets/tray_icon.ico` | 四个资产全部在用（`loco_info_util.dart:16`、`train_type_util.dart:13`、`loco_type_util.dart:21` + `database_service.dart:1492`、`windows_tray_service.dart:28,30`） |
 | `DatabaseService.getAllRecords()`、`deleteRecord()` | 生产代码零调用，但**测试在用**（`test/windows_platform_test.dart:57`、`test/crud_test.dart:62`）→ 归类为"测试专用 API"，保留 |
-| `windows/runner/lbj_updater.cpp` 及 CMake 里的 `lbj_updater` target | Windows 更新器，`windows/CMakeLists.txt:81` 已接线，是活的 |
+| `windows/runner/lbj_updater.cpp` 及 CMake 里的 `lbj_updater` target | 已删除；Windows 更新改由 `assets/windows_updater.ps1` 负责，旧版本残留的 `lbj_updater.exe` 会在升级时清理 |
 | `linux/` | 用户明确要求保留 |
 | `LBJ_Console_output.json`（15.8 MB）、`keystore.jks` | 前者是 3 个测试的活夹具（gitignore 正确），后者由 CI 从 secret 生成（设计如此） |
 
