@@ -11,102 +11,27 @@ import 'package:lbjconsole/services/ble_service.dart';
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/notification_service.dart';
 import 'package:lbjconsole/services/background_service.dart';
-import 'package:lbjconsole/services/rtl_tcp_service.dart';
-import 'package:lbjconsole/services/audio_input_service.dart';
 import 'package:lbjconsole/themes/app_theme.dart';
-import 'package:lbjconsole/widgets/audio_waterfall_widget.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
 import 'package:lbjconsole/services/firmware_ota_service.dart';
 import 'package:lbjconsole/services/classic_spp_service.dart';
+import 'package:lbjconsole/models/train_record.dart';
 
-class _ConnectionStatusWidget extends StatefulWidget {
-  final BLEService bleService;
-  final RtlTcpService rtlTcpService;
+class _ConnectionStatusWidget extends StatelessWidget {
   final DateTime? lastReceivedTime;
-  final DateTime? rtlTcpLastReceivedTime;
-  final DateTime? audioLastReceivedTime;
-  final InputSource inputSource;
-  final bool rtlTcpConnected;
+  final bool isConnected;
+  final String deviceStatus;
 
   const _ConnectionStatusWidget({
-    required this.bleService,
-    required this.rtlTcpService,
     required this.lastReceivedTime,
-    required this.rtlTcpLastReceivedTime,
-    required this.audioLastReceivedTime,
-    required this.inputSource,
-    required this.rtlTcpConnected,
+    required this.isConnected,
+    required this.deviceStatus,
   });
 
   @override
-  State<_ConnectionStatusWidget> createState() =>
-      _ConnectionStatusWidgetState();
-}
-
-class _ConnectionStatusWidgetState extends State<_ConnectionStatusWidget> {
-  StreamSubscription? _connectionSubscription;
-  String _deviceStatus = "未连接";
-  bool _isConnected = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _connectionSubscription = widget.bleService.connectionStream.listen((
-      connected,
-    ) {
-      if (mounted) {
-        setState(() {
-          _isConnected = connected;
-          _deviceStatus = connected ? "已连接" : "未连接";
-        });
-      }
-    });
-    _isConnected = widget.bleService.isConnected;
-    _deviceStatus = widget.bleService.deviceStatus;
-  }
-
-  @override
-  void didUpdateWidget(covariant _ConnectionStatusWidget oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.inputSource != widget.inputSource ||
-        oldWidget.rtlTcpConnected != widget.rtlTcpConnected) {
-      setState(() {});
-    }
-  }
-
-  @override
-  void dispose() {
-    _connectionSubscription?.cancel();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    bool isConnected;
-    Color statusColor;
-    String statusText;
-    DateTime? displayTime;
-
-    switch (widget.inputSource) {
-      case InputSource.rtlTcp:
-        isConnected = widget.rtlTcpConnected;
-        statusColor = isConnected ? Colors.green : Colors.red;
-        statusText = isConnected ? '已连接' : '未连接';
-        displayTime = widget.rtlTcpLastReceivedTime;
-        break;
-      case InputSource.audioInput:
-        isConnected = AudioInputService().isListening;
-        statusColor = isConnected ? Colors.green : Colors.red;
-        statusText = isConnected ? '监听中' : '已停止';
-        displayTime = widget.audioLastReceivedTime;
-        break;
-      case InputSource.bluetooth:
-        isConnected = _isConnected;
-        statusColor = isConnected ? Colors.green : Colors.red;
-        statusText = _deviceStatus;
-        displayTime = widget.lastReceivedTime;
-        break;
-    }
+    final statusColor = isConnected ? Colors.green : Colors.red;
+    final displayTime = lastReceivedTime;
 
     return Row(
       children: [
@@ -116,7 +41,7 @@ class _ConnectionStatusWidgetState extends State<_ConnectionStatusWidget> {
           children: [
             if (displayTime == null || !isConnected) ...[
               Text(
-                statusText,
+                deviceStatus,
                 style: const TextStyle(color: Colors.white70, fontSize: 12),
               ),
             ],
@@ -227,29 +152,17 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   int _currentIndex = 0;
 
   late final BLEService _bleService;
-  late final RtlTcpService _rtlTcpService;
   final NotificationService _notificationService = NotificationService.instance;
-  final DatabaseService _databaseService = DatabaseService.instance;
 
   StreamSubscription? _connectionSubscription;
-  StreamSubscription? _rtlTcpConnectionSubscription;
-  StreamSubscription? _audioConnectionSubscription;
   StreamSubscription? _dataSubscription;
-  StreamSubscription? _rtlTcpDataSubscription;
-  StreamSubscription? _audioDataSubscription;
   StreamSubscription? _lastReceivedTimeSubscription;
-  StreamSubscription? _rtlTcpLastReceivedTimeSubscription;
-  StreamSubscription? _audioLastReceivedTimeSubscription;
-  StreamSubscription? _settingsSubscription;
+  Timer? _recordCountRefreshTimer;
   DateTime? _lastReceivedTime;
-  DateTime? _rtlTcpLastReceivedTime;
-  DateTime? _audioLastReceivedTime;
   bool _isHistoryEditMode = false;
 
-  InputSource _inputSource = InputSource.bluetooth;
   int _recordCount = 0;
 
-  bool _rtlTcpConnected = false;
   bool _isConnected = false;
   final GlobalKey<HistoryScreenState> _historyScreenKey =
       GlobalKey<HistoryScreenState>();
@@ -266,16 +179,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _bleService = BLEService();
-    _rtlTcpService = RtlTcpService();
     _updateService = AppUpdateService();
     _firmwareOtaService = FirmwareOtaService(bleService: _bleService);
     _bleService.initialize();
-    _loadInputSettings();
     _initializeServices();
     _checkAndStartBackgroundService();
     _setupConnectionListener();
     _setupLastReceivedTimeListener();
-    _setupSettingsListener();
     _loadRecordCount();
     _firmwareVersionSubscription = _bleService.firmwareVersionStream.listen((
       version,
@@ -299,17 +209,19 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _checkFirmwareUpdate({bool showErrors = false}) async {
     if (_checkingFirmwareUpdate ||
         !_bleService.isConnected ||
-        _bleService.isOtaActive)
+        _bleService.isOtaActive) {
       return;
+    }
     _checkingFirmwareUpdate = true;
     try {
       final update = await _firmwareOtaService.checkForUpdate();
       if (!mounted) return;
       if (update == null) {
-        if (showErrors)
+        if (showErrors) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('当前固件已是最新版本，或分享站暂无匹配固件')),
           );
+        }
         return;
       }
       await _showFirmwareUpdateDialog(update);
@@ -329,99 +241,126 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     await _bleService.setRemoteDeviceName(name);
   }
 
-  Future<void> _showFirmwareUpdateDialog(FirmwareUpdateInfo update) async {
+  Future<void> _showOtaProgressDialog({
+    required String title,
+    required String detail,
+    required String actionLabel,
+    required String cancelLabel,
+    required Future<void> Function({
+      void Function(double progress)? onProgress,
+      void Function(Map<String, dynamic> state)? onState,
+    })
+    onInstall,
+    required String successMessage,
+    required String failureMessage,
+    bool barrierDismissible = false,
+    bool closeOnError = false,
+  }) async {
     if (!mounted) return;
-    var downloading = false;
+    var installing = false;
     var progress = 0.0;
     var otaState = '等待开始';
     await showDialog<void>(
       context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setState) => PopScope(
-            canPop: !downloading,
-            child: AlertDialog(
-              title: const Text('发现新固件'),
-              content: downloading
-                  ? Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        LinearProgressIndicator(value: progress),
-                        const SizedBox(height: 12),
-                        Text(
-                          '$otaState ${(progress * 100).toStringAsFixed(0)}%',
-                        ),
-                      ],
-                    )
-                  : Text(
-                      '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
-                      '最新固件：${update.version}\n文件：${update.fileName}'
-                      '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
-                    ),
-              actions: [
-                if (!downloading)
-                  TextButton(
-                    onPressed: () => Navigator.pop(dialogContext),
-                    child: const Text('暂不更新'),
-                  ),
-                if (!downloading)
-                  FilledButton(
-                    onPressed: () async {
-                      setState(() {
-                        downloading = true;
-                        progress = 0;
-                        otaState = '正在下载/升级';
-                      });
-                      try {
-                        await _firmwareOtaService.installUpdate(
-                          update,
-                          onProgress: (value) {
-                            if (context.mounted)
-                              setState(() => progress = value);
-                          },
-                          onState: (state) {
-                            if (context.mounted) {
-                              setState(() {
-                                final phase =
-                                    state['state']?.toString() ?? otaState;
-                                otaState = otaStateLabel(phase);
-                                if (phase == 'starting' ||
-                                    phase == 'reconnecting') {
-                                  progress = 0;
-                                }
-                              });
-                            }
-                          },
-                        );
-                        if (context.mounted) {
-                          setState(() => downloading = false);
-                          Navigator.pop(dialogContext);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('固件升级成功，设备即将重启')),
-                          );
-                        }
-                      } catch (e, stack) {
-                        BleDiagnostics.log("Firmware install failed", e, stack);
-                        if (context.mounted) {
-                          setState(() => downloading = false);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                '固件升级失败：$e\n日志：${BleDiagnostics.logPath}',
-                              ),
-                            ),
-                          );
-                        }
+      barrierDismissible: barrierDismissible,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setState) => PopScope(
+          canPop: !installing,
+          child: AlertDialog(
+            title: Text(title),
+            content: installing
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      LinearProgressIndicator(value: progress),
+                      const SizedBox(height: 12),
+                      Text('$otaState ${(progress * 100).toStringAsFixed(0)}%'),
+                    ],
+                  )
+                : Text(detail),
+            actions: [
+              if (!installing)
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: Text(cancelLabel),
+                ),
+              if (!installing)
+                FilledButton(
+                  onPressed: () async {
+                    setState(() {
+                      installing = true;
+                      progress = 0;
+                      otaState = '准备升级';
+                    });
+                    try {
+                      await onInstall(
+                        onProgress: (value) {
+                          if (context.mounted) setState(() => progress = value);
+                        },
+                        onState: (state) {
+                          if (context.mounted) {
+                            setState(() {
+                              final phase =
+                                  state['state']?.toString() ?? otaState;
+                              otaState = otaStateLabel(phase);
+                              if (phase == 'starting' ||
+                                  phase == 'reconnecting') {
+                                progress = 0;
+                              }
+                            });
+                          }
+                        },
+                      );
+                      if (dialogContext.mounted) Navigator.pop(dialogContext);
+                      if (mounted) {
+                        ScaffoldMessenger.of(
+                          this.context,
+                        ).showSnackBar(SnackBar(content: Text(successMessage)));
                       }
-                    },
-                    child: const Text('升级固件'),
-                  ),
-              ],
-            ),
+                    } catch (error, stack) {
+                      BleDiagnostics.log('$title failed', error, stack);
+                      if (closeOnError && dialogContext.mounted) {
+                        Navigator.pop(dialogContext);
+                      }
+                      if (!closeOnError && context.mounted) {
+                        setState(() => installing = false);
+                      }
+                      if (mounted) {
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              '$failureMessage：$error\n日志：${BleDiagnostics.logPath}',
+                            ),
+                          ),
+                        );
+                      }
+                    }
+                  },
+                  child: Text(actionLabel),
+                ),
+            ],
           ),
-        );
-      },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showFirmwareUpdateDialog(FirmwareUpdateInfo update) {
+    return _showOtaProgressDialog(
+      title: '发现新固件',
+      detail:
+          '当前固件：${_bleService.firmwareVersion ?? '未知'}\n'
+          '最新固件：${update.version}\n文件：${update.fileName}'
+          '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+      actionLabel: '升级固件',
+      cancelLabel: '暂不更新',
+      onInstall: ({onProgress, onState}) => _firmwareOtaService.installUpdate(
+        update,
+        onProgress: onProgress,
+        onState: onState,
+      ),
+      successMessage: '固件升级成功，设备即将重启',
+      failureMessage: '固件升级失败',
     );
   }
 
@@ -475,110 +414,29 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _showRescueFirmwareDialog(
     FirmwareUpdateInfo update,
     ClassicBluetoothDevice device,
-  ) async {
-    var installing = false;
-    var progress = 0.0;
-    var otaState = '等待开始';
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setState) => PopScope(
-            canPop: !installing,
-            child: AlertDialog(
-              title: const Text('无线救砖升级'),
-              content: installing
-                  ? Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        LinearProgressIndicator(value: progress),
-                        const SizedBox(height: 12),
-                        Text(
-                          '$otaState ${(progress * 100).toStringAsFixed(0)}%',
-                        ),
-                      ],
-                    )
-                  : Text(
-                      '设备：${device.displayName}\n'
-                      '运行模式：Updater SPP\n'
-                      '最新固件：${update.version}\n'
-                      '文件：${update.fileName}'
-                      '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}\n\n'
-                      '升级过程中请勿关闭程序或断开蓝牙。',
-                    ),
-              actions: [
-                if (!installing)
-                  TextButton(
-                    onPressed: () => Navigator.pop(dialogContext),
-                    child: const Text('取消'),
-                  ),
-                if (!installing)
-                  FilledButton(
-                    onPressed: () async {
-                      setState(() {
-                        installing = true;
-                        progress = 0;
-                        otaState = '准备升级';
-                      });
-                      try {
-                        await _firmwareOtaService.installSppUpdate(
-                          update,
-                          connectSpp: () =>
-                              ClassicSppService.connectOtaTransport(
-                                device.address,
-                              ),
-                          onProgress: (value) {
-                            if (context.mounted) {
-                              setState(() => progress = value);
-                            }
-                          },
-                          onState: (state) {
-                            if (context.mounted) {
-                              setState(() {
-                                final phase =
-                                    state['state']?.toString() ?? otaState;
-                                otaState = otaStateLabel(phase);
-                                if (phase == 'reconnecting') progress = 0;
-                              });
-                            }
-                          },
-                        );
-                        if (dialogContext.mounted) {
-                          Navigator.pop(dialogContext);
-                        }
-                        if (mounted) {
-                          ScaffoldMessenger.of(this.context).showSnackBar(
-                            const SnackBar(content: Text('无线救砖升级成功，设备即将重启')),
-                          );
-                        }
-                      } catch (error, stack) {
-                        BleDiagnostics.log(
-                          'Wireless brick recovery install failed',
-                          error,
-                          stack,
-                        );
-                        if (dialogContext.mounted) {
-                          Navigator.pop(dialogContext);
-                        }
-                        if (mounted) {
-                          ScaffoldMessenger.of(this.context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                '无线救砖升级失败：$error\n日志：${BleDiagnostics.logPath}',
-                              ),
-                            ),
-                          );
-                        }
-                      }
-                    },
-                    child: const Text('开始刷写'),
-                  ),
-              ],
-            ),
+  ) {
+    return _showOtaProgressDialog(
+      title: '无线救砖升级',
+      detail:
+          '设备：${device.displayName}\n'
+          '运行模式：Updater SPP\n'
+          '最新固件：${update.version}\n'
+          '文件：${update.fileName}'
+          '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}\n\n'
+          '升级过程中请勿关闭程序或断开蓝牙。',
+      actionLabel: '开始刷写',
+      cancelLabel: '取消',
+      onInstall: ({onProgress, onState}) =>
+          _firmwareOtaService.installSppUpdate(
+            update,
+            connectSpp: () =>
+                ClassicSppService.connectOtaTransport(device.address),
+            onProgress: onProgress,
+            onState: onState,
           ),
-        );
-      },
+      successMessage: '无线救砖升级成功，设备即将重启',
+      failureMessage: '无线救砖升级失败',
+      closeOnError: true,
     );
   }
 
@@ -590,7 +448,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _checkingUpdate = true;
     try {
       final update = await _updateService.checkForUpdate();
-      if (!mounted || update == null) return;
+      if (!mounted) return;
+      if (update == null) {
+        if (showErrors) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('当前已是最新版本')));
+        }
+        return;
+      }
       await _showUpdateDialog(update, automatic: automatic);
     } catch (e) {
       if (showErrors && mounted) {
@@ -606,65 +472,20 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Future<void> _showUpdateDialog(
     AppUpdateInfo update, {
     required bool automatic,
-  }) async {
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
+  }) {
+    if (!mounted) return Future.value();
+    return _showOtaProgressDialog(
+      title: '发现新版本',
+      detail:
+          '当前版本：$appBuildHash\n最新版本：${update.hash}\n文件：${update.fileName}'
+          '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
+      actionLabel: '立即更新',
+      cancelLabel: '暂不更新',
+      onInstall: ({onProgress, onState}) =>
+          _updateService.installUpdate(update, onProgress: onProgress),
+      successMessage: '安装器已打开，请完成安装',
+      failureMessage: '更新失败',
       barrierDismissible: !automatic,
-      builder: (dialogContext) {
-        var downloading = false;
-        var progress = 0.0;
-        return StatefulBuilder(
-          builder: (context, setState) => AlertDialog(
-            title: const Text('发现新版本'),
-            content: downloading
-                ? Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      LinearProgressIndicator(value: progress),
-                      const SizedBox(height: 12),
-                      Text('正在下载 ${(progress * 100).toStringAsFixed(0)}%'),
-                    ],
-                  )
-                : Text(
-                    '当前版本：$appBuildHash\n最新版本：${update.hash}\n文件：${update.fileName}'
-                    '${update.uploadTime == null ? '' : '\n上传时间：${update.uploadTime}'}',
-                  ),
-            actions: [
-              if (!downloading)
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
-                  child: const Text('暂不更新'),
-                ),
-              if (!downloading)
-                FilledButton(
-                  onPressed: () async {
-                    setState(() {
-                      downloading = true;
-                      progress = 0;
-                    });
-                    try {
-                      await _updateService.installUpdate(
-                        update,
-                        onProgress: (value) {
-                          if (context.mounted) setState(() => progress = value);
-                        },
-                      );
-                    } catch (e) {
-                      if (context.mounted) {
-                        setState(() => downloading = false);
-                        ScaffoldMessenger.of(
-                          context,
-                        ).showSnackBar(SnackBar(content: Text('更新失败：$e')));
-                      }
-                    }
-                  },
-                  child: const Text('立即更新'),
-                ),
-            ],
-          ),
-        );
-      },
     );
   }
 
@@ -675,30 +496,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
   }
 
-  void _loadInputSettings() async {
-    final settings = await _databaseService.getAllSettings();
-    final sourceStr = settings?['inputSource'] as String? ?? 'bluetooth';
-
-    if (mounted) {
-      final newSource = InputSource.values.firstWhere(
-        (e) => e.name == sourceStr,
-        orElse: () => InputSource.bluetooth,
-      );
-
-      setState(() {
-        _inputSource = newSource;
-        _rtlTcpConnected = _rtlTcpService.isConnected;
-      });
-
-      if (_inputSource == InputSource.rtlTcp && !_rtlTcpConnected) {
-        final host = settings?['rtlTcpHost']?.toString() ?? '127.0.0.1';
-        final port = settings?['rtlTcpPort']?.toString() ?? '14423';
-        _connectToRtlTcp(host, port);
-      } else if (_inputSource == InputSource.audioInput) {
-        await AudioInputService().startListening();
-        setState(() {});
-      }
-    }
+  void _scheduleRecordCountRefresh() {
+    if (_recordCountRefreshTimer != null) return;
+    _recordCountRefreshTimer = Timer(const Duration(milliseconds: 300), () {
+      _recordCountRefreshTimer = null;
+      _loadRecordCount();
+    });
   }
 
   Future<void> _checkAndStartBackgroundService() async {
@@ -721,63 +524,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         });
       }
     });
-
-    _rtlTcpLastReceivedTimeSubscription = _rtlTcpService.lastReceivedTimeStream
-        .listen((time) {
-          if (mounted) {
-            setState(() {
-              _rtlTcpLastReceivedTime = time;
-            });
-          }
-        });
-
-    _audioLastReceivedTimeSubscription = AudioInputService()
-        .lastReceivedTimeStream
-        .listen((time) {
-          if (mounted) {
-            setState(() {
-              _audioLastReceivedTime = time;
-            });
-          }
-        });
-  }
-
-  void _setupSettingsListener() {
-    _settingsSubscription = DatabaseService.instance.onSettingsChanged((
-      settings,
-    ) {
-      if (mounted) {
-        final sourceStr = settings['inputSource'] as String? ?? 'bluetooth';
-        final newInputSource = InputSource.values.firstWhere(
-          (e) => e.name == sourceStr,
-          orElse: () => InputSource.bluetooth,
-        );
-
-        setState(() {
-          _inputSource = newInputSource;
-        });
-
-        switch (newInputSource) {
-          case InputSource.rtlTcp:
-            setState(() {
-              _rtlTcpConnected = _rtlTcpService.isConnected;
-            });
-            break;
-          case InputSource.audioInput:
-            setState(() {});
-            break;
-          case InputSource.bluetooth:
-            _rtlTcpService.disconnect();
-            setState(() {
-              _rtlTcpConnected = false;
-              _rtlTcpLastReceivedTime = null;
-            });
-            break;
-        }
-
-        _historyScreenKey.currentState?.reloadRecords();
-      }
-    });
   }
 
   void _setupConnectionListener() {
@@ -789,47 +535,16 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         });
       }
     });
-
-    _rtlTcpConnectionSubscription = _rtlTcpService.connectionStream.listen((
-      connected,
-    ) {
-      if (mounted) {
-        setState(() {
-          _rtlTcpConnected = connected;
-        });
-      }
-    });
-
-    _audioConnectionSubscription = AudioInputService().connectionStream.listen((
-      listening,
-    ) {
-      if (mounted) {
-        setState(() {});
-      }
-    });
-  }
-
-  Future<void> _connectToRtlTcp(String host, String port) async {
-    try {
-      await _rtlTcpService.connect(host: host, port: port);
-    } catch (e) {
-      developer.log('rtl_tcp: connect_fail: $e');
-    }
+    _isConnected = _bleService.isConnected;
   }
 
   @override
   void dispose() {
     _connectionSubscription?.cancel();
-    _rtlTcpConnectionSubscription?.cancel();
-    _audioConnectionSubscription?.cancel();
     _dataSubscription?.cancel();
-    _rtlTcpDataSubscription?.cancel();
-    _audioDataSubscription?.cancel();
     _lastReceivedTimeSubscription?.cancel();
-    _rtlTcpLastReceivedTimeSubscription?.cancel();
-    _audioLastReceivedTimeSubscription?.cancel();
     _firmwareVersionSubscription?.cancel();
-    _settingsSubscription?.cancel();
+    _recordCountRefreshTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -842,7 +557,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _initializeServices() async {
-    await _notificationService.initialize();
+    try {
+      await _notificationService.initialize();
+    } catch (e, stack) {
+      developer.log('通知服务初始化失败：$e', name: 'MainScreen', stackTrace: stack);
+    }
 
     // Sync the user's notification preference (settings toggle) into the
     // service so the toggle actually gates notifications across restarts, and
@@ -850,35 +569,24 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     // notifications enabled (idempotent — the system only prompts once).
     final settings = await DatabaseService.instance.getAllSettings() ?? {};
     final notificationsOn = (settings['notificationEnabled'] ?? 1) == 1;
-    _notificationService.enableNotifications(notificationsOn);
+    await _notificationService.enableNotifications(notificationsOn);
     if (notificationsOn) {
-      await _notificationService.requestPermission();
+      try {
+        await _notificationService.requestPermission();
+      } catch (e, stack) {
+        developer.log('通知权限请求失败：$e', name: 'MainScreen', stackTrace: stack);
+      }
     }
 
     _dataSubscription = _bleService.dataStream.listen((record) {
-      if (_inputSource == InputSource.bluetooth) {
-        _processRecord(record);
-      }
-    });
-
-    _rtlTcpDataSubscription = _rtlTcpService.dataStream.listen((record) {
-      if (_inputSource == InputSource.rtlTcp) {
-        _processRecord(record);
-      }
-    });
-
-    _audioDataSubscription = AudioInputService().dataStream.listen((record) {
-      if (_inputSource == InputSource.audioInput) {
-        _processRecord(record);
-      }
+      _processRecord(record);
     });
   }
 
-  void _processRecord(record) {
+  void _processRecord(TrainRecord record) {
     _notificationService.showTrainNotification(record);
     _historyScreenKey.currentState?.addNewRecord(record);
-    _recordCount++;
-    if (mounted) setState(() {});
+    _scheduleRecordCountRefresh();
   }
 
   void _showConnectionDialog() {
@@ -886,14 +594,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     showDialog(
       context: context,
       barrierDismissible: true,
-      builder: (context) => _PixelPerfectBluetoothDialog(
-        bleService: _bleService,
-        inputSource: _inputSource,
-      ),
+      builder: (context) =>
+          _PixelPerfectBluetoothDialog(bleService: _bleService),
     ).then((_) {
       _bleService.setAutoConnectBlocked(false);
-      if (_inputSource == InputSource.bluetooth &&
-          !_bleService.isManualDisconnect) {
+      if (!_bleService.isManualDisconnect) {
         _bleService.ensureConnection();
       }
     });
@@ -923,12 +628,6 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       );
     }
 
-    final IconData statusIcon = switch (_inputSource) {
-      InputSource.rtlTcp => Icons.wifi,
-      InputSource.audioInput => Icons.mic,
-      InputSource.bluetooth => Icons.bluetooth,
-    };
-
     return AppBar(
       backgroundColor: AppTheme.primaryBlack,
       elevation: 0,
@@ -945,16 +644,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         Row(
           children: [
             _ConnectionStatusWidget(
-              bleService: _bleService,
-              rtlTcpService: _rtlTcpService,
               lastReceivedTime: _lastReceivedTime,
-              rtlTcpLastReceivedTime: _rtlTcpLastReceivedTime,
-              audioLastReceivedTime: _audioLastReceivedTime,
-              inputSource: _inputSource,
-              rtlTcpConnected: _rtlTcpConnected,
+              isConnected: _isConnected,
+              deviceStatus: _bleService.deviceStatus,
             ),
             IconButton(
-              icon: Icon(statusIcon, color: Colors.white),
+              icon: const Icon(Icons.bluetooth, color: Colors.white),
               onPressed: _showConnectionDialog,
             ),
           ],
@@ -1056,7 +751,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       body: IndexedStack(index: _currentIndex, children: pages),
       bottomNavigationBar: NavigationBar(
         backgroundColor: AppTheme.secondaryBlack,
-        indicatorColor: AppTheme.accentBlue.withValues(alpha: 0.2),
+        indicatorColor: AppTheme.navigationIndicator,
+        indicatorShape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: const BorderSide(color: Colors.white54),
+        ),
+        labelTextStyle: WidgetStateProperty.resolveWith<TextStyle?>(
+          (states) => TextStyle(
+            color: states.contains(WidgetState.selected)
+                ? Colors.white
+                : Colors.white70,
+            fontWeight: states.contains(WidgetState.selected)
+                ? FontWeight.w700
+                : FontWeight.w500,
+          ),
+        ),
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {
           if (index == 0) {
@@ -1289,11 +998,7 @@ enum _ScanState { initial, scanning, finished }
 
 class _PixelPerfectBluetoothDialog extends StatefulWidget {
   final BLEService bleService;
-  final InputSource inputSource;
-  const _PixelPerfectBluetoothDialog({
-    required this.bleService,
-    required this.inputSource,
-  });
+  const _PixelPerfectBluetoothDialog({required this.bleService});
   @override
   State<_PixelPerfectBluetoothDialog> createState() =>
       _PixelPerfectBluetoothDialogState();
@@ -1304,10 +1009,6 @@ class _PixelPerfectBluetoothDialogState
   List<BluetoothDevice> _devices = [];
   _ScanState _scanState = _ScanState.initial;
   StreamSubscription? _connectionSubscription;
-  StreamSubscription? _lastReceivedTimeSubscription;
-  DateTime? _lastReceivedTime;
-  StreamSubscription? _rtlTcpConnectionSubscription;
-  bool _rtlTcpConnected = false;
 
   @override
   void initState() {
@@ -1316,25 +1017,7 @@ class _PixelPerfectBluetoothDialogState
       if (mounted) setState(() {});
     });
 
-    _rtlTcpConnectionSubscription = widget
-        .bleService
-        .rtlTcpService
-        ?.connectionStream
-        .listen((connected) {
-          if (mounted) {
-            setState(() {
-              _rtlTcpConnected = connected;
-            });
-          }
-        });
-
-    if (widget.inputSource == InputSource.rtlTcp &&
-        widget.bleService.rtlTcpService != null) {
-      _rtlTcpConnected = widget.bleService.rtlTcpService!.isConnected;
-    }
-
-    if (!widget.bleService.isConnected &&
-        widget.inputSource == InputSource.bluetooth) {
+    if (!widget.bleService.isConnected) {
       _startScan();
     }
   }
@@ -1342,8 +1025,6 @@ class _PixelPerfectBluetoothDialogState
   @override
   void dispose() {
     _connectionSubscription?.cancel();
-    _rtlTcpConnectionSubscription?.cancel();
-    _lastReceivedTimeSubscription?.cancel();
     super.dispose();
   }
 
@@ -1364,10 +1045,11 @@ class _PixelPerfectBluetoothDialogState
       );
       await Future<void>.delayed(const Duration(seconds: 8));
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('扫描失败：$e')));
+      }
     }
     if (mounted) setState(() => _scanState = _ScanState.finished);
   }
@@ -1389,22 +1071,15 @@ class _PixelPerfectBluetoothDialogState
 
   @override
   Widget build(BuildContext context) {
-    final (String title, Widget content) = switch (widget.inputSource) {
-      InputSource.rtlTcp => ('RTL-TCP 服务器', _buildRtlTcpView(context)),
-      InputSource.audioInput => ('音频输入', _buildAudioInputView(context)),
-      InputSource.bluetooth => (
-        '蓝牙设备',
-        widget.bleService.isConnected
-            ? _buildConnectedView(context, widget.bleService.connectedDevice)
-            : _buildDisconnectedView(context),
-      ),
-    };
-
     return AlertDialog(
-      title: Text(title),
+      title: const Text('蓝牙设备'),
       content: SizedBox(
         width: double.maxFinite,
-        child: SingleChildScrollView(child: content),
+        child: SingleChildScrollView(
+          child: widget.bleService.isConnected
+              ? _buildConnectedView(context, widget.bleService.connectedDevice)
+              : _buildDisconnectedView(context),
+        ),
       ),
       actions: [
         TextButton(
@@ -1476,42 +1151,6 @@ class _PixelPerfectBluetoothDialogState
         const SizedBox(height: 16),
         if (_devices.isNotEmpty) _buildDeviceListView(),
       ],
-    );
-  }
-
-  Widget _buildRtlTcpView(BuildContext context) {
-    final isConnected = _rtlTcpConnected;
-    final currentAddress =
-        widget.bleService.rtlTcpService?.currentAddress ?? '未配置';
-
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(
-          Icons.wifi,
-          size: 48,
-          color: isConnected ? Colors.green : Colors.red,
-        ),
-        const SizedBox(height: 16),
-        Text(
-          isConnected ? '已连接' : '未连接',
-          style: Theme.of(
-            context,
-          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 8),
-        Text(
-          currentAddress,
-          style: TextStyle(color: isConnected ? Colors.green : Colors.grey),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildAudioInputView(BuildContext context) {
-    return const Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [SizedBox(height: 8), AudioWaterfallWidget()],
     );
   }
 

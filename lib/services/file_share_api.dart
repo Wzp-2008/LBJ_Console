@@ -9,8 +9,14 @@ class FileShareApi {
     : _httpClient = httpClient ?? HttpClient();
 
   static const String _baseUrl = 'https://wzpmc.cn:83';
+  static const _connectionTimeout = Duration(seconds: 20);
+  static const _responseTimeout = Duration(seconds: 30);
 
   final HttpClient _httpClient;
+
+  void _configureClient() {
+    _httpClient.connectionTimeout = _connectionTimeout;
+  }
 
   /// 列出文件夹中的文件。
   ///
@@ -78,39 +84,14 @@ class FileShareApi {
     return Uri.parse('$_baseUrl/api/file/download/$code');
   }
 
-  /// 下载 [downloadUrl] 指向的文件并保存到 [savePath]，返回保存后的文件。
-  ///
-  /// 下载使用流式写入，不会把整个文件一次性读入内存。目标文件已存在时会覆盖。
-  Future<File> downloadFile({
-    required Uri downloadUrl,
-    required String savePath,
-  }) async {
-    final request = await _httpClient.getUrl(downloadUrl);
-    final response = await request.close();
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      final message = await utf8.decoder.bind(response).join();
-      throw FileShareApiException(
-        '文件下载失败（HTTP ${response.statusCode}）${message.isEmpty ? '' : ': $message'}',
-        statusCode: response.statusCode,
-      );
-    }
-
-    final file = File(savePath);
-    await file.parent.create(recursive: true);
-    final sink = file.openWrite();
-    try {
-      await response.pipe(sink);
-    } catch (_) {
-      await sink.close();
-      rethrow;
-    }
-    return file;
-  }
-
   Future<Map<String, dynamic>> _getJson(Uri uri) async {
-    final request = await _httpClient.getUrl(uri);
-    final response = await request.close();
-    final responseBody = await utf8.decoder.bind(response).join();
+    _configureClient();
+    final request = await _httpClient.getUrl(uri).timeout(_connectionTimeout);
+    final response = await request.close().timeout(_responseTimeout);
+    final responseBody = await utf8.decoder
+        .bind(response)
+        .join()
+        .timeout(_responseTimeout);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw FileShareApiException(
         '请求失败（HTTP ${response.statusCode}）${responseBody.isEmpty ? '' : ': $responseBody'}',
@@ -124,8 +105,7 @@ class FileShareApi {
     }
     final body = Map<String, dynamic>.from(decoded);
     final apiStatus = body['status'];
-    if (apiStatus is num && apiStatus < 200 ||
-        apiStatus is num && apiStatus >= 300) {
+    if (apiStatus is num && (apiStatus < 200 || apiStatus >= 300)) {
       throw FileShareApiException(
         body['msg']?.toString() ?? '文件分享站接口返回错误',
         statusCode: apiStatus.toInt(),
@@ -153,6 +133,24 @@ class FileSharePage {
   final List<Map<String, dynamic>> files;
   final int total;
 }
+
+String fileShareFileName(Map<String, dynamic> item) =>
+    (item['name'] ?? item['filename'] ?? item['fileName'] ?? '').toString();
+
+String fileShareExtension(Map<String, dynamic> item) =>
+    (item['ext'] ?? item['extension'] ?? '')
+        .toString()
+        .toLowerCase()
+        .replaceFirst('.', '');
+
+int? fileShareId(Map<String, dynamic> item) {
+  final value = item['id'] ?? item['fileId'];
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString() ?? '');
+}
+
+String? fileShareUploadTime(Map<String, dynamic> item) =>
+    (item['time'] ?? item['uploadTime'] ?? item['createdAt'])?.toString();
 
 class FileShareApiException implements Exception {
   const FileShareApiException(this.message, {this.statusCode});

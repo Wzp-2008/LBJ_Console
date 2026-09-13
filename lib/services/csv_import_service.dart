@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:gbk_codec/gbk_codec.dart';
+import 'package:lbjconsole/util/csv_parser.dart';
 
 /// Outcome of importing CSV files from a Windows drive.
 class CsvImportResult {
@@ -23,16 +24,34 @@ class CsvImportResult {
 /// data — we skip the first two lines and parse every data row against this
 /// fixed header (the on-disk header is ignored, exactly as the Python does).
 const List<String> _kHeaders = [
-  '温度', '电压', '系统时间', '日期', '时间', 'LBJ时间', '方向', '级别', '车次',
-  '速度', '公里标', '机车编号', '线路', '纬度', '经度', 'HEX', 'RSSI', 'FER',
-  'PPM(FER)', 'PPM(CURRENT)', '原始数据', '错误', '错误率',
+  '温度',
+  '电压',
+  '系统时间',
+  '日期',
+  '时间',
+  'LBJ时间',
+  '方向',
+  '级别',
+  '车次',
+  '速度',
+  '公里标',
+  '机车编号',
+  '线路',
+  '纬度',
+  '经度',
+  'HEX',
+  'RSSI',
+  'FER',
+  'PPM(FER)',
+  'PPM(CURRENT)',
+  '原始数据',
+  '错误',
+  '错误率',
 ];
 
-/// Direction code mapping, matching `direction_map` in `csv_json.py`. The app
-/// stores 上行 as 1 and 下行 as 3 (same convention the Python-written
-/// `LBJ_Console_output.json` uses, which the JSON import already consumes),
-/// so CSV-imported records line up with JSON-imported ones.
-const Map<String, int> _kDirectionMap = {'上行': 1, '下行': 3};
+/// Direction code mapping at the CSV boundary. The device convention used by
+/// the model is 0=unknown, 1=down and 3=up.
+const Map<String, int> _kDirectionMap = {'上行': 3, '下行': 1};
 
 /// Top-level entry for [compute]: reads every CSV file in `input['files']`
 /// (trying utf-8 then gbk, the same fallback order as `csv_json.py`'s
@@ -75,7 +94,7 @@ Map<String, dynamic> parseCsvFilesToRecords(Map<String, dynamic> input) {
       if (line.isEmpty) continue;
       if (line.runes.every((c) => c == 0x2C)) continue; // all commas
 
-      final fields = _parseCsvLine(line);
+      final fields = parseCsvLine(line);
       if (fields.length < 16) continue;
 
       final data = <String, String>{};
@@ -124,8 +143,9 @@ Map<String, dynamic> parseCsvFilesToRecords(Map<String, dynamic> input) {
   }
 
   // Sort by timestamp descending — same as `records.sort(key=lambda r: r["timestamp"], reverse=True)`.
-  records.sort((a, b) =>
-      (b['timestamp'] as int).compareTo(a['timestamp'] as int));
+  records.sort(
+    (a, b) => (b['timestamp'] as int).compareTo(a['timestamp'] as int),
+  );
   return <String, dynamic>{'records': records};
 }
 
@@ -146,28 +166,6 @@ String? _decodeFile(String path) {
     return gbk_bytes.decode(bytes);
   } catch (_) {}
   return null;
-}
-
-/// Parse a CSV line, honouring quoted fields that may contain commas.
-/// Direct port of `parse_csv_line` in `csv_json.py`.
-List<String> _parseCsvLine(String line) {
-  final fields = <String>[];
-  final buf = StringBuffer();
-  var inQuotes = false;
-  for (final c in line.runes) {
-    if (c == 0x22) {
-      // "
-      inQuotes = !inQuotes;
-    } else if (c == 0x2C && !inQuotes) {
-      // ,
-      fields.add(buf.toString());
-      buf.clear();
-    } else {
-      buf.writeCharCode(c);
-    }
-  }
-  fields.add(buf.toString());
-  return fields;
 }
 
 /// Strip placeholder tokens. Direct port of `clean` in `csv_json.py`.

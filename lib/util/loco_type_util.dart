@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter/services.dart';
+import 'csv_parser.dart';
 
 class LocoTypeUtil {
   static final LocoTypeUtil _instance = LocoTypeUtil._internal();
@@ -9,51 +9,22 @@ class LocoTypeUtil {
   factory LocoTypeUtil() => _instance;
 
   LocoTypeUtil._internal() {
-    _syncInitialize();
+    _initialization = _loadMappings();
   }
 
   final Map<String, String> _locoTypeMap = {};
-  bool _isInitialized = false;
+  late final Future<void> _initialization;
 
-  void _syncInitialize() {
+  Future<void> _loadMappings() async {
     try {
-      rootBundle.loadString('assets/loco_type_info.csv').then((csvData) {
-        final lines = const LineSplitter().convert(csvData);
-        for (final line in lines) {
-          final trimmedLine = line.trim();
-          if (trimmedLine.isEmpty) continue;
-          final parts = trimmedLine.split(',');
-          if (parts.length >= 2) {
-            final code = parts[0].trim();
-            final type = parts[1].trim();
-            _locoTypeMap[code] = type;
-          }
-        }
-        _isInitialized = true;
-      });
-    } catch (e) {}
-  }
-
-  @deprecated
-  Future<void> initialize() async {}
-
-  String? getLocoTypeByCode(String code) {
-    if (_locoTypeMap.containsKey(code)) {
-      return _locoTypeMap[code];
+      final csvData = await rootBundle.loadString('assets/loco_type_info.csv');
+      _locoTypeMap.addAll(parseLocoTypeMap(csvData));
+    } catch (_) {
+      // An unavailable optional asset leaves lookups as a safe pass-through.
     }
-
-    if (code.length >= 4) {
-      final prefix3 = code.substring(0, 3);
-      return _locoTypeMap[prefix3];
-    }
-
-    return null;
   }
 
-  String? getLocoTypeByLocoNumber(String locoNumber) {
-    final parsed = queryTypeNameAndId(locoNumber);
-    return parsed?.$1;
-  }
+  Future<void> initialize() => _initialization;
 
   static const int _crLocoIdLength = 4;
 
@@ -95,10 +66,7 @@ class LocoTypeUtil {
         if (thirdValueName.startsWith('CR')) {
           return _parseCrLoco(thirdValueName, locoNo, 3);
         }
-        if (thirdValueName.startsWith('G') || thirdValueName.contains('轨道车')) {
-          return (thirdValueName, locoNo.substring(3));
-        }
-        return (thirdValueName, locoNo.length >= 4 ? locoNo.substring(4) : '');
+        return (thirdValueName, locoNo.substring(3));
       }
     }
 
@@ -124,12 +92,4 @@ class LocoTypeUtil {
     }
     return '';
   }
-
-  Map<String, String> getAllMappings() {
-    return Map.from(_locoTypeMap);
-  }
-
-  bool get isInitialized => _isInitialized;
-
-  int get mappingCount => _locoTypeMap.length;
 }

@@ -30,21 +30,4 @@ class MergedTrainRecord {
   void setDetailRecords(List<TrainRecord> loaded) {
     _detailRecords = loaded;
   }
-
-  bool containsRecordId(String uniqueId) => memberUniqueIds.contains(uniqueId);
-
-  /// Resolve from in-memory page cache without hitting the database.
-  List<TrainRecord> resolveFromCache(List<TrainRecord> cache) {
-    if (hasLoadedDetails) return _detailRecords!;
-    final fromCache =
-        cache.where((r) => memberUniqueIds.contains(r.uniqueId)).toList();
-    if (fromCache.length >= memberUniqueIds.length) {
-      fromCache.sort(
-        (a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp),
-      );
-      return fromCache;
-    }
-    return records;
-  }
 }
-

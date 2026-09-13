@@ -11,22 +11,14 @@ import 'recovery_ota.dart';
 import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart';
 import 'package:lbjconsole/models/train_record.dart';
 import 'package:lbjconsole/services/database_service.dart';
-import 'package:lbjconsole/services/rtl_tcp_service.dart';
 
 class BLEService {
   static final BLEService _instance = BLEService._internal();
 
   factory BLEService() => _instance;
 
-  BLEService._internal() {
-    _rtlTcpService = RtlTcpService();
-  }
+  BLEService._internal();
 
-  late final RtlTcpService _rtlTcpService;
-
-  RtlTcpService? get rtlTcpService => _rtlTcpService;
-
-  static const String TAG = "LBJ_BT_FLUTTER";
   static final Guid serviceUuid = Guid("0000ffe0-0000-1000-8000-00805f9b34fb");
   static final Guid charUuid = Guid("0000ffe1-0000-1000-8000-00805f9b34fb");
   static final Guid otaServiceUuid = Guid(
@@ -43,8 +35,6 @@ class BLEService {
   StreamSubscription<BluetoothConnectionState>? _connectionStateSubscription;
   StreamSubscription<List<ScanResult>>? _scanResultsSubscription;
 
-  final StreamController<String> _statusController =
-      StreamController<String>.broadcast();
   final StreamController<TrainRecord> _dataController =
       StreamController<TrainRecord>.broadcast();
   final StreamController<bool> _connectionController =
@@ -57,8 +47,6 @@ class BLEService {
       StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<Map<String, dynamic>> _deviceNameResultController =
       StreamController<Map<String, dynamic>>.broadcast();
-
-  Stream<String> get statusStream => _statusController.stream;
 
   Stream<TrainRecord> get dataStream => _dataController.stream;
 
@@ -76,7 +64,6 @@ class BLEService {
   String? _lastKnownDeviceDisplayName;
   String? _firmwareVersion;
   bool _initialized = false;
-  StreamSubscription<BluetoothAdapterState>? _adapterSubscription;
   DateTime? _lastReceivedTime;
 
   bool _isConnecting = false;
@@ -92,7 +79,6 @@ class BLEService {
   final BleJsonDecoder _otaDecoder = BleJsonDecoder();
   BluetoothCharacteristic? _otaControlCharacteristic;
   bool _otaActive = false;
-  SppOtaTransport? _activeSppTransport;
   int _negotiatedMtu = 23;
 
   Future<void> initialize() async {
@@ -102,7 +88,7 @@ class BLEService {
     BleDiagnostics.log(
       'Initialize; remembered MAC=$_lastKnownDeviceAddress; log=${BleDiagnostics.logPath}',
     );
-    _adapterSubscription = FlutterBluePlus.adapterState.listen((state) {
+    FlutterBluePlus.adapterState.listen((state) {
       BleDiagnostics.log('Adapter state=$state');
       _adapterOn = state == BluetoothAdapterState.on;
       if (state == BluetoothAdapterState.on) {
@@ -151,8 +137,6 @@ class BLEService {
 
   Future<void> _tryReconnectDirectly() async {
     _isConnecting = true;
-    _statusController.add("正在重连...");
-
     try {
       final connected = FlutterBluePlus.connectedDevices;
 
@@ -186,8 +170,6 @@ class BLEService {
       await FlutterBluePlus.stopScan();
     }
 
-    _statusController.add("正在扫描...");
-
     _scanResultsSubscription?.cancel();
     _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
       final allFoundDevices = results.map((r) => r.device).toList();
@@ -218,7 +200,6 @@ class BLEService {
       await FlutterBluePlus.startScan(timeout: timeout);
     } catch (e, stack) {
       BleDiagnostics.log("Scan failed", e, stack);
-      _statusController.add("扫描失败");
       rethrow;
     }
   }
@@ -262,7 +243,6 @@ class BLEService {
     _isConnecting = true;
     _connectingDevice = device;
     _isManualDisconnect = false;
-    _statusController.add("正在连接: ${device.platformName}");
     BleDiagnostics.log(
       "Connecting MAC=${device.remoteId.str} name=${device.platformName}",
     );
@@ -359,7 +339,6 @@ class BLEService {
     int? generation,
     int attempts = 3,
   }) async {
-    Object? lastError;
     for (var attempt = 0; attempt < attempts; attempt++) {
       try {
         if (generation != null) _checkConnectionAttempt(generation, device);
@@ -372,14 +351,13 @@ class BLEService {
         final services = await device.discoverServices();
         if (generation != null) _checkConnectionAttempt(generation, device);
         return services;
-      } catch (e) {
-        lastError = e;
+      } catch (_) {
         if (!Platform.isWindows || attempt >= attempts - 1) {
           rethrow;
         }
       }
     }
-    throw lastError ?? Exception('discoverServices failed');
+    throw Exception('discoverServices failed');
   }
 
   Future<void> _writeTimeSyncToWritableCharacteristics(
@@ -477,7 +455,6 @@ class BLEService {
 
       _checkConnectionAttempt(generation, device);
       _characteristic = mainCharacteristic;
-      _otaControlCharacteristic = otaControl;
       _connectedDevice = device;
       _updateConnectionState(true, "已连接");
       _isConnecting = false;
@@ -630,7 +607,6 @@ class BLEService {
       Future<SppOtaTransport> connectSpp() async {
         BleDiagnostics.log('Connecting Classic SPP MAC=$address');
         final transport = await ClassicSppService.connectOtaTransport(address);
-        _activeSppTransport = transport;
         return transport;
       }
 
@@ -663,17 +639,8 @@ class BLEService {
       BleDiagnostics.log('OTA failed MAC=$address', e, stack);
       rethrow;
     } finally {
-      _activeSppTransport = null;
       _otaActive = false;
       ensureConnection();
-    }
-  }
-
-  Future<void> cancelFirmwareOta() async {
-    if (_activeSppTransport?.connected == true) {
-      await _activeSppTransport!.control('CANCEL');
-    } else if (_otaActive && _otaControlCharacteristic != null) {
-      await _otaControlCharacteristic!.write(utf8.encode('CANCEL'));
     }
   }
 
@@ -745,11 +712,12 @@ class BLEService {
   void _parseAndNotify(String jsonData) {
     try {
       final decodedJson = jsonDecode(jsonData);
-      if (decodedJson is Map<String, dynamic>) {
-        if (_tryHandleFirmwareVersion(decodedJson)) return;
-        if (_tryHandleDeviceNameResult(decodedJson)) return;
+      if (decodedJson is Map) {
+        final decoded = Map<String, dynamic>.from(decodedJson);
+        if (_tryHandleFirmwareVersion(decoded)) return;
+        if (_tryHandleDeviceNameResult(decoded)) return;
         final now = DateTime.now();
-        final recordData = Map<String, dynamic>.from(decodedJson);
+        final recordData = decoded;
         recordData['uniqueId'] =
             '${now.millisecondsSinceEpoch}_${Random().nextInt(9999)}';
         recordData['receivedTimestamp'] = now.millisecondsSinceEpoch;
@@ -763,9 +731,19 @@ class BLEService {
 
         final trainRecord = TrainRecord.fromJson(recordData);
         _dataController.add(trainRecord);
-        DatabaseService.instance.insertRecord(trainRecord);
+        unawaited(_persistRecord(trainRecord));
       }
-    } catch (e) {}
+    } catch (e, stack) {
+      BleDiagnostics.log('BLE 数据解析失败', e, stack);
+    }
+  }
+
+  Future<void> _persistRecord(TrainRecord record) async {
+    try {
+      await DatabaseService.instance.insertRecord(record);
+    } catch (e, stack) {
+      BleDiagnostics.log('BLE 记录保存失败', e, stack);
+    }
   }
 
   bool _tryHandleDeviceNameResult(Map<String, dynamic> decoded) {
@@ -788,7 +766,6 @@ class BLEService {
       _lastReceivedTime = null;
       _lastReceivedTimeController.add(null);
     }
-    _statusController.add(_deviceStatus);
     _connectionController.add(connected);
   }
 
@@ -813,8 +790,6 @@ class BLEService {
 
   String get deviceStatus => _deviceStatus;
 
-  String? get deviceAddress => connectedDeviceAddress;
-
   String get connectedDeviceName {
     final liveName = _connectedDevice?.platformName.trim();
     if (liveName != null && liveName.isNotEmpty) return liveName;
@@ -831,24 +806,9 @@ class BLEService {
     return _lastKnownDeviceAddress;
   }
 
-  bool get isScanning => FlutterBluePlus.isScanningNow;
-
   BluetoothDevice? get connectedDevice => _connectedDevice;
 
   bool get isManualDisconnect => _isManualDisconnect;
-
-  void dispose() {
-    _heartbeatTimer?.cancel();
-    _adapterSubscription?.cancel();
-    disconnect();
-    _statusController.close();
-    _dataController.close();
-    _connectionController.close();
-    _lastReceivedTimeController.close();
-    _firmwareVersionController.close();
-    _otaStateController.close();
-    _deviceNameResultController.close();
-  }
 }
 
 class _BleMainOtaTransport implements MainOtaTransport {

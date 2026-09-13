@@ -8,16 +8,14 @@ import 'package:lbjconsole/services/ble_diagnostics.dart';
 import 'package:lbjconsole/services/database_service.dart';
 import 'package:lbjconsole/services/background_service.dart';
 import 'package:lbjconsole/services/notification_service.dart';
-import 'package:lbjconsole/services/audio_input_service.dart';
-import 'package:lbjconsole/services/rtl_tcp_service.dart';
+import 'package:lbjconsole/services/map_state_service.dart';
 import 'package:lbjconsole/themes/app_theme.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:url_launcher_platform_interface/url_launcher_platform_interface.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:lbjconsole/services/app_update_service.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class SettingsScreen extends StatefulWidget {
   final VoidCallback? onSettingsChanged;
@@ -47,60 +45,57 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   late DatabaseService _databaseService;
-  late TextEditingController _rtlTcpHostController;
-  late TextEditingController _rtlTcpPortController;
 
   bool _settingsLoaded = false;
-  Timer? _saveDebounceTimer;
+  final Set<String> _pendingSettings = <String>{};
 
   bool _backgroundServiceEnabled = false;
   bool _notificationsEnabled = true;
-  int _recordCount = 0;
   bool _mergeRecordsEnabled = false;
   bool _hideUngroupableRecords = false;
   bool _changingDeviceName = false;
-
-  InputSource _inputSource = InputSource.bluetooth;
-
-  String _rtlTcpHost = '127.0.0.1';
-  String _rtlTcpPort = '14423';
 
   @override
   void initState() {
     super.initState();
     _databaseService = DatabaseService.instance;
-    _rtlTcpHostController = TextEditingController();
-    _rtlTcpPortController = TextEditingController();
     _loadSettings();
-    _loadRecordCount();
   }
 
   Future<void> _loadSettings() async {
     final settingsMap = await _databaseService.getAllSettings() ?? {};
     if (mounted) {
       setState(() {
-        _backgroundServiceEnabled =
-            (settingsMap['backgroundServiceEnabled'] ?? 0) == 1;
-        _notificationsEnabled = (settingsMap['notificationEnabled'] ?? 1) == 1;
-        _mergeRecordsEnabled = (settingsMap['mergeRecordsEnabled'] ?? 0) == 1;
-        _hideUngroupableRecords =
-            (settingsMap['hideUngroupableRecords'] ?? 0) == 1;
-
-        _rtlTcpHost = settingsMap['rtlTcpHost']?.toString() ?? '127.0.0.1';
-        _rtlTcpPort = settingsMap['rtlTcpPort']?.toString() ?? '14423';
-        _rtlTcpHostController.text = _rtlTcpHost;
-        _rtlTcpPortController.text = _rtlTcpPort;
-
-        final sourceStr = settingsMap['inputSource'] as String? ?? 'bluetooth';
-        _inputSource = InputSource.values.firstWhere(
-          (e) => e.name == sourceStr,
-          orElse: () => InputSource.bluetooth,
-        );
-
+        _applySettings(settingsMap);
         _settingsLoaded = true;
+        _pendingSettings.clear();
       });
     }
   }
+
+  void _applySettings(Map<String, dynamic> settings) {
+    if (!_pendingSettings.contains('backgroundServiceEnabled')) {
+      _backgroundServiceEnabled =
+          (settings['backgroundServiceEnabled'] ?? 0) == 1;
+    }
+    if (!_pendingSettings.contains('notificationEnabled')) {
+      _notificationsEnabled = (settings['notificationEnabled'] ?? 1) == 1;
+    }
+    if (!_pendingSettings.contains('mergeRecordsEnabled')) {
+      _mergeRecordsEnabled = (settings['mergeRecordsEnabled'] ?? 0) == 1;
+    }
+    if (!_pendingSettings.contains('hideUngroupableRecords')) {
+      _hideUngroupableRecords = (settings['hideUngroupableRecords'] ?? 0) == 1;
+    }
+  }
+
+  Map<String, dynamic> _collectSettings({bool reset = false}) => {
+    'backgroundServiceEnabled': reset ? 0 : (_backgroundServiceEnabled ? 1 : 0),
+    'notificationEnabled': reset ? 1 : (_notificationsEnabled ? 1 : 0),
+    'mergeRecordsEnabled': reset ? 0 : (_mergeRecordsEnabled ? 1 : 0),
+    'hideUngroupableRecords': reset ? 0 : (_hideUngroupableRecords ? 1 : 0),
+    if (reset) 'specifiedDeviceAddress': null,
+  };
 
   Future<void> _openBrickRecoveryMode() async {
     final mode = await showDialog<String>(
@@ -150,52 +145,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  Future<void> _saveSettings() async {
-    if (!_settingsLoaded) return;
-
-    await _databaseService.updateSettings({
-      'backgroundServiceEnabled': _backgroundServiceEnabled ? 1 : 0,
-      'notificationEnabled': _notificationsEnabled ? 1 : 0,
-      'mergeRecordsEnabled': _mergeRecordsEnabled ? 1 : 0,
-      'hideUngroupableRecords': _hideUngroupableRecords ? 1 : 0,
-      'inputSource': _inputSource.name,
-      'rtlTcpHost': _rtlTcpHost,
-      'rtlTcpPort': _rtlTcpPort,
-    });
-    widget.onSettingsChanged?.call();
-  }
-
-  void _scheduleSave() {
-    _saveDebounceTimer?.cancel();
-    _saveDebounceTimer = Timer(const Duration(milliseconds: 500), () {
-      _saveImmediately();
-    });
-  }
-
-  Future<void> _saveImmediately() async {
-    _saveDebounceTimer?.cancel();
-    await _saveSettings();
-  }
-
-  Future<void> _switchInputSource(InputSource newSource) async {
-    await AudioInputService().stopListening();
-    await RtlTcpService().disconnect();
-    setState(() {
-      _inputSource = newSource;
-    });
-
-    switch (newSource) {
-      case InputSource.audioInput:
-        await AudioInputService().startListening();
-        break;
-      case InputSource.rtlTcp:
-        RtlTcpService().connect(host: _rtlTcpHost, port: _rtlTcpPort);
-        break;
-      case InputSource.bluetooth:
-        break;
+  Future<void> _saveSetting(String key, dynamic value) async {
+    _pendingSettings.add(key);
+    await _databaseService.setSetting(key, value);
+    if (mounted && _settingsLoaded) {
+      setState(() => _pendingSettings.remove(key));
     }
-
-    _saveImmediately();
+    widget.onSettingsChanged?.call();
   }
 
   Future<void> _changeRemoteDeviceName() async {
@@ -271,11 +227,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               );
                             }
                           } catch (e) {
-                            if (context.mounted)
+                            if (context.mounted) {
                               update(() {
                                 saving = false;
                                 error = e.toString();
                               });
+                            }
                           }
                         },
                   child: const Text('保存到设备'),
@@ -295,264 +252,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _saveDebounceTimer?.cancel();
-    _rtlTcpHostController.dispose();
-    _rtlTcpPortController.dispose();
     super.dispose();
   }
 
-  Widget _buildInputSourceSettings() {
+  Widget _buildBluetoothSettings() {
+    return _buildSettingsCard(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.input, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 12),
+              const Text('蓝牙设置', style: AppTheme.titleMedium),
+            ],
+          ),
+          const SizedBox(height: 16),
+
+          const SizedBox(height: 16),
+          Text(
+            '已记住的设备地址：${BLEService().connectedDeviceAddress ?? "尚未选择"}',
+            style: AppTheme.bodyMedium,
+          ),
+          const Text(
+            '首次请在蓝牙设备列表中手动选择。连接成功后按地址自动重连，扫描不筛选名称。',
+            style: AppTheme.caption,
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed:
+                widget.isBluetoothConnected &&
+                    widget.canChangeDeviceName &&
+                    !_changingDeviceName &&
+                    !BLEService().isOtaActive
+                ? _changeRemoteDeviceName
+                : null,
+            icon: _changingDeviceName
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.edit, size: 18),
+            label: const Text('修改设备名称'),
+          ),
+          const SizedBox(height: 4),
+          const Text('名称最多 16 个 UTF-8 字节，保存后需重启设备生效', style: AppTheme.caption),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSettingsCard(Widget child) {
     return Card(
       color: AppTheme.tertiaryBlack,
       elevation: 0,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.input, color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 12),
-                const Text('信号源设置', style: AppTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 16),
-
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('信号源', style: AppTheme.bodyLarge),
-                DropdownButton<InputSource>(
-                  value: _inputSource,
-                  items: const [
-                    DropdownMenuItem(
-                      value: InputSource.bluetooth,
-                      child: Text('蓝牙设备', style: AppTheme.bodyMedium),
-                    ),
-                    DropdownMenuItem(
-                      value: InputSource.rtlTcp,
-                      child: Text('RTL-TCP', style: AppTheme.bodyMedium),
-                    ),
-                    DropdownMenuItem(
-                      value: InputSource.audioInput,
-                      child: Text('音频输入', style: AppTheme.bodyMedium),
-                    ),
-                  ],
-                  onChanged: (value) {
-                    if (value != null) {
-                      _switchInputSource(value);
-                    }
-                  },
-                  dropdownColor: AppTheme.secondaryBlack,
-                  style: AppTheme.bodyMedium,
-                  underline: Container(height: 0),
-                ),
-              ],
-            ),
-
-            if (_inputSource == InputSource.bluetooth) ...[
-              const SizedBox(height: 16),
-              Text(
-                '已记住的设备地址：${BLEService().connectedDeviceAddress ?? "尚未选择"}',
-                style: AppTheme.bodyMedium,
-              ),
-              const Text(
-                '首次请在蓝牙设备列表中手动选择。连接成功后按地址自动重连，扫描不筛选名称。',
-                style: AppTheme.caption,
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed:
-                    widget.isBluetoothConnected &&
-                        widget.canChangeDeviceName &&
-                        !_changingDeviceName &&
-                        !BLEService().isOtaActive
-                    ? _changeRemoteDeviceName
-                    : null,
-                icon: _changingDeviceName
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.edit, size: 18),
-                label: const Text('修改设备名称'),
-              ),
-              const SizedBox(height: 4),
-              const Text(
-                '名称最多 16 个 UTF-8 字节，保存后需重启设备生效',
-                style: AppTheme.caption,
-              ),
-            ],
-
-            if (_inputSource == InputSource.rtlTcp) ...[
-              const SizedBox(height: 16),
-              TextField(
-                decoration: InputDecoration(
-                  labelText: '服务器地址',
-                  hintText: '127.0.0.1',
-                  labelStyle: const TextStyle(color: Colors.white70),
-                  hintStyle: const TextStyle(color: Colors.white54),
-                  border: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                ),
-                style: const TextStyle(color: Colors.white),
-                controller: _rtlTcpHostController,
-                onChanged: (value) {
-                  setState(() {
-                    _rtlTcpHost = value;
-                  });
-                  _scheduleSave();
-                },
-                enabled: !RtlTcpService().isConnected,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                decoration: InputDecoration(
-                  labelText: '服务器端口',
-                  hintText: '14423',
-                  labelStyle: const TextStyle(color: Colors.white70),
-                  hintStyle: const TextStyle(color: Colors.white54),
-                  border: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: const BorderSide(color: Colors.white54),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    borderRadius: BorderRadius.circular(12.0),
-                  ),
-                ),
-                style: const TextStyle(color: Colors.white),
-                controller: _rtlTcpPortController,
-                keyboardType: TextInputType.number,
-                onChanged: (value) {
-                  setState(() {
-                    _rtlTcpPort = value;
-                  });
-                  _scheduleSave();
-                },
-                enabled: !RtlTcpService().isConnected,
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () {
-                    final service = RtlTcpService();
-                    if (service.isEnabled) {
-                      service.disconnect();
-                      return;
-                    }
-                    service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
-                  },
-                  icon: Icon(
-                    RtlTcpService().isEnabled ? Icons.circle : Icons.refresh,
-                    color: RtlTcpService().isConnected
-                        ? Colors.green
-                        : RtlTcpService().isEnabled
-                        ? Colors.orange
-                        : Colors.white,
-                  ),
-                  label: Text(
-                    RtlTcpService().isConnected
-                        ? "已连接"
-                        : RtlTcpService().isEnabled
-                        ? "正在连接..."
-                        : "连接 RTL-TCP",
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.secondaryBlack,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () async {
-                    final service = RtlTcpService();
-                    if (service.isEnabled) {
-                      return;
-                    }
-                    final result = await UrlLauncherPlatform.instance.launchUrl(
-                      "iqsrc://-a $_rtlTcpHost -p $_rtlTcpPort -f 821237500 -s 240000 -T 0 -g 600",
-                      const LaunchOptions(),
-                    );
-                    if (result) {
-                      service.connect(host: _rtlTcpHost, port: _rtlTcpPort);
-                      return;
-                    }
-                    if (mounted) {
-                      ScaffoldMessenger.of(
-                        context,
-                      ).showSnackBar(const SnackBar(content: Text('启动失败，请重试')));
-                    }
-                  },
-                  icon: const Icon(Icons.auto_mode),
-                  label: const Text("调用驱动自动连接"),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppTheme.secondaryBlack,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-
-            if (_inputSource == InputSource.audioInput) ...[
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.blue.withValues(alpha: 0.1),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
-                ),
-                child: const Row(
-                  children: [
-                    Icon(Icons.mic, color: Colors.blue),
-                    SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        '音频解调已启用。请通过音频线 (Line-in) 或麦克风输入信号。',
-                        style: TextStyle(color: Colors.white70, fontSize: 13),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
+      child: Padding(padding: const EdgeInsets.all(20.0), child: child),
     );
   }
 
@@ -563,7 +319,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildInputSourceSettings(),
+          _buildBluetoothSettings(),
           const SizedBox(height: 20),
           _buildAppSettings(),
           const SizedBox(height: 20),
@@ -578,233 +334,215 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _buildAppSettings() {
-    return Card(
-      color: AppTheme.tertiaryBlack,
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.settings,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 12),
-                const Text('应用设置', style: AppTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Platform.isWindows
-                ? const SizedBox()
-                : Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [Text('后台保活服务', style: AppTheme.bodyLarge)],
-                      ),
-                      Switch(
-                        value: _backgroundServiceEnabled,
-                        onChanged: (value) async {
-                          setState(() {
-                            _backgroundServiceEnabled = value;
-                          });
-                          await _saveSettings();
-
-                          if (value) {
-                            await BackgroundService.startService();
-                          } else {
-                            await BackgroundService.stopService();
-                          }
-                        },
-                        activeThumbColor: Theme.of(context).colorScheme.primary,
-                      ),
-                    ],
-                  ),
-            SizedBox(height: Platform.isWindows ? 0 : 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [Text('通知服务', style: AppTheme.bodyLarge)],
-                ),
-                Switch(
-                  value: _notificationsEnabled,
-                  onChanged: (value) async {
-                    setState(() {
-                      _notificationsEnabled = value;
-                    });
-                    // Sync the user-intent flag so the toggle actually gates
-                    // notifications, then request the runtime permission when
-                    // turning on (Android 13+).
-                    await NotificationService.instance.enableNotifications(
-                      value,
-                    );
-                    if (value) {
-                      final granted = await NotificationService.instance
-                          .requestPermission();
-                      if (!granted && mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text('通知权限未授予，请在系统设置中开启通知权限'),
-                          ),
-                        );
-                      }
-                    }
-                    _saveImmediately();
-                  },
-                  activeThumbColor: Theme.of(context).colorScheme.primary,
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMergeSettings() {
-    return Card(
-      color: AppTheme.tertiaryBlack,
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.merge_type,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 12),
-                const Text('记录合并', style: AppTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [Text('启用记录合并', style: AppTheme.bodyLarge)],
-                ),
-                Switch(
-                  value: _mergeRecordsEnabled,
-                  onChanged: (value) {
-                    setState(() {
-                      _mergeRecordsEnabled = value;
-                    });
-                    _saveImmediately();
-                  },
-                  activeThumbColor: Theme.of(context).colorScheme.primary,
-                ),
-              ],
-            ),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const SizedBox(height: 16),
-                Row(
+    return _buildSettingsCard(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.settings,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(width: 12),
+              const Text('应用设置', style: AppTheme.titleMedium),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Platform.isWindows
+              ? const SizedBox()
+              : Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     const Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('隐藏不可分组记录', style: AppTheme.bodyLarge),
-                        Text(
-                          '无车次和机车号的记录',
-                          style: TextStyle(color: Colors.grey, fontSize: 12),
-                        ),
-                      ],
+                      children: [Text('后台保活服务', style: AppTheme.bodyLarge)],
                     ),
                     Switch(
-                      value: _hideUngroupableRecords,
-                      onChanged: (value) {
+                      value: _backgroundServiceEnabled,
+                      onChanged: (value) async {
                         setState(() {
-                          _hideUngroupableRecords = value;
+                          _backgroundServiceEnabled = value;
                         });
-                        _saveImmediately();
+                        await _saveSetting(
+                          'backgroundServiceEnabled',
+                          value ? 1 : 0,
+                        );
+
+                        if (value) {
+                          await BackgroundService.startService();
+                        } else {
+                          await BackgroundService.stopService();
+                        }
                       },
                       activeThumbColor: Theme.of(context).colorScheme.primary,
                     ),
                   ],
                 ),
-              ],
-            ),
-          ],
-        ),
+          SizedBox(height: Platform.isWindows ? 0 : 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [Text('通知服务', style: AppTheme.bodyLarge)],
+              ),
+              Switch(
+                value: _notificationsEnabled,
+                onChanged: (value) async {
+                  _pendingSettings.add('notificationEnabled');
+                  setState(() {
+                    _notificationsEnabled = value;
+                  });
+                  // Sync the user-intent flag so the toggle actually gates
+                  // notifications, then request the runtime permission when
+                  // turning on (Android 13+).
+                  await NotificationService.instance.enableNotifications(value);
+                  if (value) {
+                    final granted = await NotificationService.instance
+                        .requestPermission();
+                    if (!granted && mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('通知权限未授予，请在系统设置中开启通知权限')),
+                      );
+                    }
+                  }
+                  await _saveSetting('notificationEnabled', value ? 1 : 0);
+                },
+                activeThumbColor: Theme.of(context).colorScheme.primary,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMergeSettings() {
+    return _buildSettingsCard(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                Icons.merge_type,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(width: 12),
+              const Text('记录合并', style: AppTheme.titleMedium),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [Text('启用记录合并', style: AppTheme.bodyLarge)],
+              ),
+              Switch(
+                value: _mergeRecordsEnabled,
+                onChanged: (value) async {
+                  setState(() {
+                    _mergeRecordsEnabled = value;
+                  });
+                  await _saveSetting('mergeRecordsEnabled', value ? 1 : 0);
+                },
+                activeThumbColor: Theme.of(context).colorScheme.primary,
+              ),
+            ],
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('隐藏不可分组记录', style: AppTheme.bodyLarge),
+                      Text(
+                        '无车次和机车号的记录',
+                        style: TextStyle(color: Colors.grey, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                  Switch(
+                    value: _hideUngroupableRecords,
+                    onChanged: (value) async {
+                      setState(() {
+                        _hideUngroupableRecords = value;
+                      });
+                      await _saveSetting(
+                        'hideUngroupableRecords',
+                        value ? 1 : 0,
+                      );
+                    },
+                    activeThumbColor: Theme.of(context).colorScheme.primary,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
 
   Widget _buildDataManagement() {
-    return Card(
-      color: AppTheme.tertiaryBlack,
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.storage,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 12),
-                const Text('数据管理', style: AppTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 16),
-            _buildActionButton(
-              icon: Icons.share,
-              title: '分享数据',
-              subtitle: '将记录分享为 JSON 文件',
-              onTap: _shareData,
-            ),
-            const SizedBox(height: 12),
-            _buildActionButton(
-              icon: Icons.file_download,
-              title: '导入数据',
-              subtitle: '从 JSON 文件导入记录和设置',
-              onTap: _importData,
-            ),
-            if (Platform.isWindows) ...[
-              const SizedBox(height: 12),
-              _buildActionButton(
-                icon: Icons.usb,
-                title: '从盘符导入 CSV',
-                subtitle: '读取 U 盘 CSVTEST 文件夹中的所有 CSV 文件',
-                onTap: _importCsvFromDrive,
-              ),
+    return _buildSettingsCard(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.storage, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 12),
+              const Text('数据管理', style: AppTheme.titleMedium),
             ],
+          ),
+          const SizedBox(height: 16),
+          _buildActionButton(
+            icon: Icons.share,
+            title: '分享数据',
+            subtitle: '将记录分享为 JSON 文件',
+            onTap: _shareData,
+          ),
+          const SizedBox(height: 12),
+          _buildActionButton(
+            icon: Icons.file_download,
+            title: '导入数据',
+            subtitle: '从 JSON 文件导入记录和设置',
+            onTap: _importData,
+          ),
+          if (Platform.isWindows) ...[
             const SizedBox(height: 12),
             _buildActionButton(
-              icon: Icons.cached,
-              title: '重建合并缓存',
-              subtitle: '修复合并卡片显示陈旧/错误数据',
-              onTap: _rebuildMergeCache,
-            ),
-            const SizedBox(height: 12),
-            _buildActionButton(
-              icon: Icons.clear_all,
-              title: '清空数据',
-              subtitle: '删除所有记录和设置',
-              onTap: _clearAllData,
-              isDestructive: true,
+              icon: Icons.usb,
+              title: '从盘符导入 CSV',
+              subtitle: '读取 U 盘 CSVTEST 文件夹中的所有 CSV 文件',
+              onTap: _importCsvFromDrive,
             ),
           ],
-        ),
+          const SizedBox(height: 12),
+          _buildActionButton(
+            icon: Icons.cached,
+            title: '重建合并缓存',
+            subtitle: '修复合并卡片显示陈旧/错误数据',
+            onTap: _rebuildMergeCache,
+          ),
+          const SizedBox(height: 12),
+          _buildActionButton(
+            icon: Icons.clear_all,
+            title: '清空数据',
+            subtitle: '删除所有记录和设置',
+            onTap: _clearAllData,
+            isDestructive: true,
+          ),
+        ],
       ),
     );
   }
@@ -864,15 +602,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Future<void> _loadRecordCount() async {
-    final count = await _databaseService.getRecordCount();
-    if (mounted) {
-      setState(() {
-        _recordCount = count;
-      });
-    }
-  }
-
   Future<String> _getAppVersion() async {
     try {
       final packageInfo = await PackageInfo.fromPlatform();
@@ -882,23 +611,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  void _showBlockingDialog(String message) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        content: Row(
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(width: 16),
+            Text(message),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<bool> _confirm(
+    String title,
+    String content, {
+    String confirmLabel = '继续',
+    bool destructive = false,
+  }) async {
+    return await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(title),
+            content: Text(content),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                style: destructive
+                    ? TextButton.styleFrom(foregroundColor: Colors.red)
+                    : null,
+                child: Text(confirmLabel),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+  }
+
   Future<void> _shareData() async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     try {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Text('正在准备分享数据...'),
-            ],
-          ),
-        ),
-      );
+      _showBlockingDialog('正在准备分享数据...');
 
       try {
         final exportedPath = await _databaseService.exportDataAsJson();
@@ -930,23 +692,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _importData() async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('导入数据'),
-        content: const Text('导入将替换所有现有数据，是否继续？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('继续'),
-          ),
-        ],
-      ),
-    );
+    final result = await _confirm('导入数据', '导入将替换所有现有数据，是否继续？');
 
     if (result != true) return;
 
@@ -959,19 +705,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final selectedFile = resultFile.files.single.path;
     if (selectedFile == null) return;
     if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Text('正在导入数据...'),
-            ],
-          ),
-        ),
-      );
+      _showBlockingDialog('正在导入数据...');
     }
 
     try {
@@ -984,8 +718,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据导入成功')));
 
         await _loadSettings();
-        await _loadRecordCount();
-        setState(() {});
       } else {
         scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据导入失败')));
       }
@@ -1001,23 +733,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     // CSV import replaces all existing data, same as the JSON import above.
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('从盘符导入 CSV'),
-        content: const Text('导入将替换所有现有数据，是否继续？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('继续'),
-          ),
-        ],
-      ),
-    );
+    final confirmed = await _confirm('从盘符导入 CSV', '导入将替换所有现有数据，是否继续？');
     if (confirmed != true) return;
     if (!mounted) return;
 
@@ -1030,19 +746,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (drive == null || drive.isEmpty) return;
 
     if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Text('正在读取并导入 CSV...'),
-            ],
-          ),
-        ),
-      );
+      _showBlockingDialog('正在读取并导入 CSV...');
     }
 
     try {
@@ -1053,8 +757,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       scaffoldMessenger.showSnackBar(SnackBar(content: Text(result.message)));
       if (result.success) {
         await _loadSettings();
-        await _loadRecordCount();
-        setState(() {});
       }
     } catch (e) {
       if (mounted) {
@@ -1068,19 +770,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
     if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Text('正在重建合并缓存...'),
-            ],
-          ),
-        ),
-      );
+      _showBlockingDialog('正在重建合并缓存...');
     }
 
     try {
@@ -1098,52 +788,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _clearAllData() async {
     final scaffoldMessenger = ScaffoldMessenger.of(context);
 
-    final result = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('清空数据'),
-        content: const Text('此操作将删除所有记录和设置，无法撤销。是否继续？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('确认清空'),
-          ),
-        ],
-      ),
+    final result = await _confirm(
+      '清空数据',
+      '此操作将删除所有记录和设置，无法撤销。是否继续？',
+      confirmLabel: '确认清空',
+      destructive: true,
     );
 
     if (result != true) return;
 
     if (mounted) {
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: 16),
-              Text('正在清空数据...'),
-            ],
-          ),
-        ),
-      );
+      _showBlockingDialog('正在清空数据...');
     }
 
     try {
+      await BackgroundService.stopService();
       await _databaseService.deleteAllRecords();
-      await _databaseService.updateSettings({
-        'backgroundServiceEnabled': 0,
-        'notificationEnabled': 1,
-        'mergeRecordsEnabled': 0,
-        'hideUngroupableRecords': 0,
-        'inputSource': 'bluetooth',
-      });
+      await MapStateService.instance.clearAllMapStates();
+      await NotificationService.instance.enableNotifications(true);
+      await _databaseService.updateSettings(_collectSettings(reset: true));
 
       if (mounted) {
         Navigator.pop(context);
@@ -1152,8 +815,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       scaffoldMessenger.showSnackBar(const SnackBar(content: Text('数据已清空')));
 
       await _loadSettings();
-      await _loadRecordCount();
-      setState(() {});
     } catch (e) {
       if (mounted) {
         Navigator.pop(context);
@@ -1163,86 +824,80 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _buildAboutSection() {
-    return Card(
-      color: AppTheme.tertiaryBlack,
-      elevation: 0,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16.0)),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.info, color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 12),
-                const Text('关于', style: AppTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 16),
-            const Text('LBJ Console', style: AppTheme.titleMedium),
+    return _buildSettingsCard(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.info, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 12),
+              const Text('关于', style: AppTheme.titleMedium),
+            ],
+          ),
+          const SizedBox(height: 16),
+          const Text('LBJ Console', style: AppTheme.titleMedium),
+          const SizedBox(height: 8),
+          FutureBuilder<String>(
+            future: _getAppVersion(),
+            builder: (context, snapshot) {
+              if (snapshot.hasData) {
+                return Text(snapshot.data!, style: AppTheme.bodyMedium);
+              } else {
+                return const Text(
+                  'v15.0.2-flutter',
+                  style: AppTheme.bodyMedium,
+                );
+              }
+            },
+          ),
+          const SizedBox(height: 8),
+          Text('构建 hash：$appBuildHash', style: AppTheme.caption),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: widget.onCheckForUpdates,
+            icon: const Icon(Icons.system_update),
+            label: const Text('检查更新'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: widget.onWirelessBrickRecovery == null
+                ? null
+                : _openBrickRecoveryMode,
+            icon: const Icon(Icons.build_circle_outlined),
+            label: const Text('救砖模式'),
+          ),
+          SelectableText(
+            '蓝牙诊断日志：${BleDiagnostics.logPath}',
+            style: AppTheme.caption,
+          ),
+          if (widget.isBluetoothConnected) ...[
             const SizedBox(height: 8),
-            FutureBuilder<String>(
-              future: _getAppVersion(),
-              builder: (context, snapshot) {
-                if (snapshot.hasData) {
-                  return Text(snapshot.data!, style: AppTheme.bodyMedium);
-                } else {
-                  return const Text(
-                    'v0.1.3-flutter',
-                    style: AppTheme.bodyMedium,
-                  );
-                }
-              },
-            ),
-            const SizedBox(height: 8),
-            Text('构建 hash：$appBuildHash', style: AppTheme.caption),
-            const SizedBox(height: 12),
-            OutlinedButton.icon(
-              onPressed: widget.onCheckForUpdates,
-              icon: const Icon(Icons.system_update),
-              label: const Text('检查更新'),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-              onPressed: widget.onWirelessBrickRecovery == null
-                  ? null
-                  : _openBrickRecoveryMode,
-              icon: const Icon(Icons.build_circle_outlined),
-              label: const Text('救砖模式'),
-            ),
-            SelectableText(
-              '蓝牙诊断日志：${BleDiagnostics.logPath}',
+            Text(
+              '当前固件：${widget.firmwareVersion ?? '未知（可尝试恢复升级）'}',
               style: AppTheme.caption,
             ),
-            if (widget.isBluetoothConnected) ...[
-              const SizedBox(height: 8),
-              Text(
-                '当前固件：${widget.firmwareVersion ?? '未知（可尝试恢复升级）'}',
-                style: AppTheme.caption,
-              ),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                onPressed: widget.onCheckFirmwareUpdate,
-                icon: const Icon(Icons.memory),
-                label: const Text('检查固件更新'),
-              ),
-            ],
-            const SizedBox(height: 16),
-            GestureDetector(
-              onTap: () async {
-                final url = Uri.parse('https://github.com/undef-i/LBJConsole');
-                if (await canLaunchUrl(url)) {
-                  await launchUrl(url);
-                }
-              },
-              child: const Text(
-                'https://github.com/undef-i/LBJConsole',
-                style: AppTheme.caption,
-              ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: widget.onCheckFirmwareUpdate,
+              icon: const Icon(Icons.memory),
+              label: const Text('检查固件更新'),
             ),
           ],
-        ),
+          const SizedBox(height: 16),
+          GestureDetector(
+            onTap: () async {
+              final url = Uri.parse('https://github.com/undef-i/LBJConsole');
+              if (await canLaunchUrl(url)) {
+                await launchUrl(url);
+              }
+            },
+            child: const Text(
+              'https://github.com/undef-i/LBJConsole',
+              style: AppTheme.caption,
+            ),
+          ),
+        ],
       ),
     );
   }

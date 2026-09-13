@@ -80,8 +80,10 @@ class MergeService {
       receivedTimestamp: latest.receivedTimestamp,
       train: bestTrainRecord?.train ?? _bestField(records, (r) => r.train),
       direction: records
-          .firstWhere((r) => r.direction == 0 || r.direction == 1,
-              orElse: () => latest)
+          .firstWhere(
+            (record) => record.hasDirectionValue,
+            orElse: () => latest,
+          )
           .direction,
       speed: _bestField(records, (r) => r.speed),
       position: _bestField(records, (r) => r.position),

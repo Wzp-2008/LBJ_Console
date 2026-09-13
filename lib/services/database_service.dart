@@ -12,12 +12,7 @@ import 'package:lbjconsole/models/train_record.dart';
 import 'package:lbjconsole/services/csv_import_service.dart';
 import 'package:lbjconsole/services/display_group_cache.dart';
 import 'package:lbjconsole/services/sqflite_initializer.dart';
-
-enum InputSource {
-  bluetooth,
-  rtlTcp,
-  audioInput
-}
+import 'package:lbjconsole/util/csv_parser.dart';
 
 class DatabaseService {
   // Singleton. `instance` is a getter so tests can swap in a DatabaseService
@@ -30,12 +25,11 @@ class DatabaseService {
   DatabaseService._internal();
 
   static const String _databaseName = 'train_database';
-  static const _databaseVersion = 17;
+  static const _databaseVersion = 19;
 
   static const String trainRecordsTable = 'train_records';
   static const String trainRecordsFtsTable = 'train_records_fts';
   static const String appSettingsTable = 'app_settings';
-  static const int mapDisplayRecordLimit = 10000;
   static const int _maxFuzzyCharGapLength = 10;
   static const int _exportBatchSize = 500;
 
@@ -51,27 +45,9 @@ class DatabaseService {
   }
 
   Future<Database> get database async {
-    try {
-      if (_database != null) {
-        return _database!;
-      }
-      _database = await _initDatabase();
-      return _database!;
-    } catch (e) {
-      rethrow;
-    }
-  }
-
-  Future<bool> isDatabaseConnected() async {
-    try {
-      if (_database == null) {
-        return false;
-      }
-
-      return true;
-    } catch (e) {
-      return false;
-    }
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
   }
 
   /// Connection-wide SQLite tuning applied once when the database is opened.
@@ -91,110 +67,55 @@ class DatabaseService {
   }
 
   Future<Database> _initDatabase() async {
-    try {
-      await initializeSqflite();
+    await initializeSqflite();
 
-      final directory = await getApplicationDocumentsDirectory();
-      final path = join(directory.path, _databaseName);
-      final db = await openDatabase(
-        path,
-        version: _databaseVersion,
-        onConfigure: _onConfigure,
-        onCreate: _onCreate,
-        onUpgrade: _onUpgrade,
-      );
-      _fts5Available = await _probeFts5Available(db);
-      if (_fts5Available && !await _tableExists(db, trainRecordsFtsTable)) {
-        await _createFtsTable(db);
-        await _rebuildFtsTable(db);
-      }
-
-      // Safety net: rebuild the merge cache if it is missing while records
-      // exist (e.g. interrupted migration).
-      if (await DisplayGroupCache.isEmpty(db)) {
-        final countRows =
-            await db.rawQuery('SELECT COUNT(*) AS cnt FROM $trainRecordsTable');
-        final count = (countRows.first['cnt'] as num?)?.toInt() ?? 0;
-        if (count > 0) {
-          await DisplayGroupCache.rebuild(db, recordsTable: trainRecordsTable);
-        }
-      }
-
-      return db;
-    } catch (e) {
-      rethrow;
+    final directory = await getApplicationDocumentsDirectory();
+    final path = join(directory.path, _databaseName);
+    final db = await openDatabase(
+      path,
+      version: _databaseVersion,
+      onConfigure: _onConfigure,
+      onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
+    );
+    _fts5Available = await _probeFts5Available(db);
+    if (_fts5Available && !await _tableExists(db, trainRecordsFtsTable)) {
+      await _createFtsTable(db);
+      await _rebuildFtsTable(db);
     }
+
+    // Safety net for interrupted writes/migrations.  An empty-cache check
+    // alone cannot detect orphaned members or stale group counts.
+    if (await DisplayGroupCache.needsRebuild(
+      db,
+      recordsTable: trainRecordsTable,
+    )) {
+      await DisplayGroupCache.rebuild(db, recordsTable: trainRecordsTable);
+    }
+
+    return db;
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
-    developer.log('Database upgrading from $oldVersion to $newVersion', name: 'Database');
+    developer.log(
+      'Database upgrading from $oldVersion to $newVersion',
+      name: 'Database',
+    );
 
-    if (oldVersion < 2) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN hideTimeOnlyRecords INTEGER NOT NULL DEFAULT 0');
-    }
-    if (oldVersion < 3) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN mapTimeFilter TEXT NOT NULL DEFAULT "unlimited"');
-    }
-    if (oldVersion < 4) {
-      try {
-        await db.execute(
-            'ALTER TABLE $appSettingsTable ADD COLUMN mapTimeFilter TEXT NOT NULL DEFAULT "unlimited"');
-      } catch (e) {}
-    }
-    if (oldVersion < 5) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN mapType TEXT NOT NULL DEFAULT "webview"');
-    }
     if (oldVersion < 6) {
       await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN hideUngroupableRecords INTEGER NOT NULL DEFAULT 0');
-    }
-    if (oldVersion < 7) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN mapSettingsTimestamp INTEGER');
-    }
-    if (oldVersion < 8) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN rtlTcpEnabled INTEGER NOT NULL DEFAULT 0');
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN rtlTcpHost TEXT NOT NULL DEFAULT "127.0.0.1"');
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN rtlTcpPort TEXT NOT NULL DEFAULT "14423"');
-    }
-    if (oldVersion < 9) {
-      await db.execute(
-          'ALTER TABLE $appSettingsTable ADD COLUMN inputSource TEXT NOT NULL DEFAULT "bluetooth"');
-
-      try {
-        final List<Map<String, dynamic>> results = await db.query(appSettingsTable, columns: ['rtlTcpEnabled'], where: 'id = 1');
-        if (results.isNotEmpty) {
-          final int rtlTcpEnabled = results.first['rtlTcpEnabled'] as int? ?? 0;
-          if (rtlTcpEnabled == 1) {
-            await db.update(
-              appSettingsTable,
-              {'inputSource': 'rtlTcp'},
-              where: 'id = 1'
-            );
-            developer.log('Migrated V8 settings: inputSource set to rtlTcp', name: 'Database');
-          }
-        }
-      } catch (e) {
-        developer.log('Migration V8->V9 data update failed: $e', name: 'Database');
-      }
+        'ALTER TABLE $appSettingsTable ADD COLUMN hideUngroupableRecords INTEGER NOT NULL DEFAULT 0',
+      );
     }
     if (oldVersion < 10) {
       await db.execute(
-          'CREATE INDEX IF NOT EXISTS idx_records_timestamp ON $trainRecordsTable(timestamp)');
-      await db.execute(
-          'CREATE INDEX IF NOT EXISTS idx_records_received ON $trainRecordsTable(receivedTimestamp)');
+        'CREATE INDEX IF NOT EXISTS idx_records_timestamp ON $trainRecordsTable(timestamp)',
+      );
     }
     if (oldVersion < 11) {
       await _ensureSearchTextColumn(db);
     }
     if (oldVersion < 12) {
-      await _ensureSearchTextColumn(db);
       _fts5Available = await _probeFts5Available(db);
       if (_fts5Available) {
         if (!await _tableExists(db, trainRecordsFtsTable)) {
@@ -236,30 +157,65 @@ class DatabaseService {
       // data migration, no cache rebuild; existing cache rows are queryable
       // as-is.
       await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_mdg_cursor ON ${DisplayGroupCache.groupsTable}(latestReceivedTimestamp DESC, groupId ASC)');
+        'CREATE INDEX IF NOT EXISTS idx_mdg_cursor ON ${DisplayGroupCache.groupsTable}(latestReceivedTimestamp DESC, groupId ASC)',
+      );
       await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_cursor ON $trainRecordsTable(receivedTimestamp DESC, uniqueId DESC)');
+        'CREATE INDEX IF NOT EXISTS idx_records_cursor ON $trainRecordsTable(receivedTimestamp DESC, uniqueId DESC)',
+      );
     }
+    if (oldVersion < 18) {
+      await db.execute('DROP INDEX IF EXISTS idx_records_received');
+      await db.execute('DROP INDEX IF EXISTS idx_mdg_latest');
+    }
+  }
+
+  Future<void> _createSettingsTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS $appSettingsTable (
+        id INTEGER PRIMARY KEY,
+        specifiedDeviceAddress TEXT,
+        backgroundServiceEnabled INTEGER NOT NULL DEFAULT 0,
+        notificationEnabled INTEGER NOT NULL DEFAULT 0,
+        mergeRecordsEnabled INTEGER NOT NULL DEFAULT 0,
+        hideUngroupableRecords INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+  }
+
+  Map<String, dynamic> _defaultSettings() {
+    return {
+      'id': 1,
+      'specifiedDeviceAddress': null,
+      'backgroundServiceEnabled': 0,
+      'notificationEnabled': 0,
+      'mergeRecordsEnabled': 0,
+      'hideUngroupableRecords': 0,
+    };
   }
 
   Future<void> _ensureDerivedColumns(Database db) async {
     if (!await _columnExists(db, trainRecordsTable, 'isTimeOnly')) {
       await db.execute(
-          'ALTER TABLE $trainRecordsTable ADD COLUMN isTimeOnly INTEGER NOT NULL DEFAULT 0');
+        'ALTER TABLE $trainRecordsTable ADD COLUMN isTimeOnly INTEGER NOT NULL DEFAULT 0',
+      );
     }
     if (!await _columnExists(db, trainRecordsTable, 'trainKey')) {
       await db.execute(
-          'ALTER TABLE $trainRecordsTable ADD COLUMN trainKey TEXT');
+        'ALTER TABLE $trainRecordsTable ADD COLUMN trainKey TEXT',
+      );
     }
     if (!await _columnExists(db, trainRecordsTable, 'locoKey')) {
       await db.execute(
-          'ALTER TABLE $trainRecordsTable ADD COLUMN locoKey TEXT');
+        'ALTER TABLE $trainRecordsTable ADD COLUMN locoKey TEXT',
+      );
     }
     await _backfillDerivedColumns(db);
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_trainkey ON $trainRecordsTable(trainKey)');
+      'CREATE INDEX IF NOT EXISTS idx_records_trainkey ON $trainRecordsTable(trainKey)',
+    );
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_locokey ON $trainRecordsTable(locoKey)');
+      'CREATE INDEX IF NOT EXISTS idx_records_locokey ON $trainRecordsTable(locoKey)',
+    );
   }
 
   Future<void> _backfillDerivedColumns(Database db) async {
@@ -289,10 +245,9 @@ class DatabaseService {
     }
   }
 
-  ({
-    String whereSql,
-    List<dynamic> whereArgs,
-  }) _buildSearchWhere(String normalizedQuery) {
+  ({String whereSql, List<dynamic> whereArgs}) _buildSearchWhere(
+    String normalizedQuery,
+  ) {
     final filters = _buildSearchFilters(normalizedQuery);
     return (
       whereSql: filters.whereClauses.map((c) => '($c)').join(' OR '),
@@ -300,10 +255,9 @@ class DatabaseService {
     );
   }
 
-  ({
-    String whereSql,
-    List<dynamic> whereArgs,
-  }) _buildSearchWhereFallback(String normalizedQuery) {
+  ({String whereSql, List<dynamic> whereArgs}) _buildSearchWhereFallback(
+    String normalizedQuery,
+  ) {
     final filters = _buildSearchFilters(normalizedQuery);
     final whereSql = filters.charGapPattern != null
         ? 'searchText LIKE ? OR searchText LIKE ?'
@@ -368,21 +322,23 @@ class DatabaseService {
       return;
     }
     await db.delete(trainRecordsFtsTable);
-    final rows = await db.query(trainRecordsTable, columns: ['uniqueId', 'searchText']);
-    if (rows.isEmpty) return;
-    final batch = db.batch();
-    for (final row in rows) {
-      batch.insert(trainRecordsFtsTable, {
-        'uniqueId': row['uniqueId'],
-        'searchText': row['searchText'] ?? '',
-      });
-    }
-    await batch.commit(noResult: true);
+    await db.execute(
+      'INSERT INTO $trainRecordsFtsTable(uniqueId, searchText) '
+      'SELECT uniqueId, searchText FROM $trainRecordsTable',
+    );
   }
 
-  Future<void> _syncFtsUpsert(DatabaseExecutor db, String uniqueId, String searchText) async {
+  Future<void> _syncFtsUpsert(
+    DatabaseExecutor db,
+    String uniqueId,
+    String searchText,
+  ) async {
     if (!_fts5Available) return;
-    await db.delete(trainRecordsFtsTable, where: 'uniqueId = ?', whereArgs: [uniqueId]);
+    await db.delete(
+      trainRecordsFtsTable,
+      where: 'uniqueId = ?',
+      whereArgs: [uniqueId],
+    );
     await db.insert(trainRecordsFtsTable, {
       'uniqueId': uniqueId,
       'searchText': searchText,
@@ -391,7 +347,11 @@ class DatabaseService {
 
   Future<void> _syncFtsDelete(DatabaseExecutor db, String uniqueId) async {
     if (!_fts5Available) return;
-    await db.delete(trainRecordsFtsTable, where: 'uniqueId = ?', whereArgs: [uniqueId]);
+    await db.delete(
+      trainRecordsFtsTable,
+      where: 'uniqueId = ?',
+      whereArgs: [uniqueId],
+    );
   }
 
   String _escapeFtsToken(String token) => token.replaceAll('"', '""');
@@ -416,7 +376,8 @@ class DatabaseService {
     String ftsQuery,
     List<String> whereClauses,
     List<dynamic> whereArgs,
-  }) _buildSearchFilters(String normalizedQuery) {
+  })
+  _buildSearchFilters(String normalizedQuery) {
     final containsPattern = '%$normalizedQuery%';
     final charGapPattern =
         !_isTrainLikeQuery(normalizedQuery) &&
@@ -438,9 +399,7 @@ class DatabaseService {
     whereClauses.add('r.searchText LIKE ?');
     whereArgs.add(containsPattern);
 
-    whereClauses.add(
-      "replace(lower(r.lbjClass || r.train), '-', '') LIKE ?",
-    );
+    whereClauses.add("replace(lower(r.lbjClass || r.train), '-', '') LIKE ?");
     whereArgs.add(containsPattern);
 
     whereClauses.add("replace(lower(r.route), '-', '') LIKE ?");
@@ -450,9 +409,7 @@ class DatabaseService {
     whereArgs.add(containsPattern);
 
     if (!_isTrainLikeQuery(normalizedQuery)) {
-      whereClauses.add(
-        "replace(lower(r.locoType || r.loco), '-', '') LIKE ?",
-      );
+      whereClauses.add("replace(lower(r.locoType || r.loco), '-', '') LIKE ?");
       whereArgs.add(containsPattern);
       whereClauses.add("replace(lower(r.loco), '-', '') LIKE ?");
       whereArgs.add(containsPattern);
@@ -559,85 +516,24 @@ END)''';
       )
     ''');
 
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS $appSettingsTable (
-        id INTEGER PRIMARY KEY,
-        deviceName TEXT NOT NULL DEFAULT 'LBJReceiver',
-        currentTab INTEGER NOT NULL DEFAULT 0,
-        historyEditMode INTEGER NOT NULL DEFAULT 0,
-        historySelectedRecords TEXT NOT NULL DEFAULT '',
-        historyExpandedStates TEXT NOT NULL DEFAULT '',
-        historyScrollPosition INTEGER NOT NULL DEFAULT 0,
-        historyScrollOffset INTEGER NOT NULL DEFAULT 0,
-        settingsScrollPosition INTEGER NOT NULL DEFAULT 0,
-        mapCenterLat REAL,
-        mapCenterLon REAL,
-        mapZoomLevel REAL NOT NULL DEFAULT 10.0,
-        mapRailwayLayerVisible INTEGER NOT NULL DEFAULT 1,
-        mapRotation REAL NOT NULL DEFAULT 0.0,
-        mapType TEXT NOT NULL DEFAULT 'webview',
-        specifiedDeviceAddress TEXT,
-        searchOrderList TEXT NOT NULL DEFAULT '',
-        autoConnectEnabled INTEGER NOT NULL DEFAULT 1,
-        backgroundServiceEnabled INTEGER NOT NULL DEFAULT 0,
-        notificationEnabled INTEGER NOT NULL DEFAULT 0,
-        mergeRecordsEnabled INTEGER NOT NULL DEFAULT 0,
-        hideTimeOnlyRecords INTEGER NOT NULL DEFAULT 0,
-        groupBy TEXT NOT NULL DEFAULT 'trainAndLoco',
-        timeWindow TEXT NOT NULL DEFAULT 'unlimited',
-        mapTimeFilter TEXT NOT NULL DEFAULT 'unlimited',
-        hideUngroupableRecords INTEGER NOT NULL DEFAULT 0,
-        mapSettingsTimestamp INTEGER,
-        rtlTcpEnabled INTEGER NOT NULL DEFAULT 0,
-        rtlTcpHost TEXT NOT NULL DEFAULT '127.0.0.1',
-        rtlTcpPort TEXT NOT NULL DEFAULT '14423',
-        inputSource TEXT NOT NULL DEFAULT 'bluetooth'
-      )
-    ''');
-
-    await db.insert(appSettingsTable, {
-      'id': 1,
-      'deviceName': 'LBJReceiver',
-      'currentTab': 0,
-      'historyEditMode': 0,
-      'historySelectedRecords': '',
-      'historyExpandedStates': '',
-      'historyScrollPosition': 0,
-      'historyScrollOffset': 0,
-      'settingsScrollPosition': 0,
-      'mapZoomLevel': 10.0,
-      'mapRailwayLayerVisible': 1,
-      'mapRotation': 0.0,
-      'mapType': 'webview',
-      'searchOrderList': '',
-      'autoConnectEnabled': 1,
-      'backgroundServiceEnabled': 0,
-      'notificationEnabled': 0,
-      'mergeRecordsEnabled': 0,
-      'hideTimeOnlyRecords': 0,
-      'groupBy': 'trainAndLoco',
-      'timeWindow': 'unlimited',
-      'mapTimeFilter': 'unlimited',
-      'hideUngroupableRecords': 0,
-      'mapSettingsTimestamp': null,
-      'rtlTcpEnabled': 0,
-      'rtlTcpHost': '127.0.0.1',
-      'rtlTcpPort': '14423',
-      'inputSource': 'bluetooth',
-    });
+    await _createSettingsTable(db);
+    await db.insert(appSettingsTable, _defaultSettings());
 
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_timestamp ON $trainRecordsTable(timestamp)');
+      'CREATE INDEX IF NOT EXISTS idx_records_timestamp ON $trainRecordsTable(timestamp)',
+    );
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_received ON $trainRecordsTable(receivedTimestamp)');
+      'CREATE INDEX IF NOT EXISTS idx_records_search ON $trainRecordsTable(searchText)',
+    );
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_search ON $trainRecordsTable(searchText)');
+      'CREATE INDEX IF NOT EXISTS idx_records_cursor ON $trainRecordsTable(receivedTimestamp DESC, uniqueId DESC)',
+    );
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_cursor ON $trainRecordsTable(receivedTimestamp DESC, uniqueId DESC)');
+      'CREATE INDEX IF NOT EXISTS idx_records_trainkey ON $trainRecordsTable(trainKey)',
+    );
     await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_trainkey ON $trainRecordsTable(trainKey)');
-    await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_records_locokey ON $trainRecordsTable(locoKey)');
+      'CREATE INDEX IF NOT EXISTS idx_records_locokey ON $trainRecordsTable(locoKey)',
+    );
     _fts5Available = await _probeFts5Available(db);
     if (_fts5Available) {
       await _createFtsTable(db);
@@ -649,18 +545,27 @@ END)''';
     return _runInDbQueue(() async {
       final db = await database;
       final json = record.toDatabaseJson()..addAll(record.derivedColumns());
-      final result = await db.insert(
-        trainRecordsTable,
-        json,
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-      await _syncFtsUpsert(db, record.uniqueId, record.searchText);
-      await DisplayGroupCache.applyNewRecord(
-        db,
-        recordsTable: trainRecordsTable,
-        record: record,
-      );
-      return result;
+      return db.transaction((txn) async {
+        // A replace can change the grouping keys. Remove the old membership
+        // before inserting the new row so the previous group is recomputed.
+        await DisplayGroupCache.removeRecords(
+          txn,
+          recordsTable: trainRecordsTable,
+          uniqueIds: [record.uniqueId],
+        );
+        final result = await txn.insert(
+          trainRecordsTable,
+          json,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        await _syncFtsUpsert(txn, record.uniqueId, record.searchText);
+        await DisplayGroupCache.applyNewRecord(
+          txn,
+          recordsTable: trainRecordsTable,
+          record: record,
+        );
+        return result;
+      });
     });
   }
 
@@ -676,61 +581,27 @@ END)''';
     });
   }
 
-  Future<List<TrainRecord>> getRecentRecords({int limit = mapDisplayRecordLimit}) async {
-    return getRecordsBatch(limit: limit, offset: 0);
-  }
-
-  Future<List<TrainRecord>> getRecordsWithinTimeRange(Duration duration,
-      {int? limit}) async {
-    return _runInDbQueue(() async {
-      final db = await database;
-      final cutoffTime = DateTime.now().subtract(duration).millisecondsSinceEpoch;
-      final result = await db.query(
-        trainRecordsTable,
-        where: 'timestamp >= ?',
-        whereArgs: [cutoffTime],
-        orderBy: 'receivedTimestamp DESC',
-        limit: limit,
-      );
-      return result.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
-    });
-  }
-
-  Future<List<TrainRecord>> getRecordsWithinReceivedTimeRange(
-      Duration duration,
-      {int? limit}) async {
-    return _runInDbQueue(() async {
-      final db = await database;
-      final cutoffTime =
-          DateTime.now().subtract(duration).millisecondsSinceEpoch;
-
-      final result = await db.query(
-        trainRecordsTable,
-        where: 'receivedTimestamp >= ?',
-        whereArgs: [cutoffTime],
-        orderBy: 'receivedTimestamp DESC',
-        limit: limit,
-      );
-      return result.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
-    });
-  }
-
   Future<int> deleteRecord(String uniqueId) async {
     return _runInDbQueue(() async {
       final db = await database;
-      final result = await db.delete(
-        trainRecordsTable,
-        where: 'uniqueId = ?',
-        whereArgs: [uniqueId],
-      );
+      final result = await db.transaction((txn) async {
+        final deleted = await txn.delete(
+          trainRecordsTable,
+          where: 'uniqueId = ?',
+          whereArgs: [uniqueId],
+        );
+        if (deleted > 0) {
+          await _syncFtsDelete(txn, uniqueId);
+          await DisplayGroupCache.removeRecords(
+            txn,
+            recordsTable: trainRecordsTable,
+            uniqueIds: [uniqueId],
+          );
+        }
+        return deleted;
+      });
 
       if (result > 0) {
-        await _syncFtsDelete(db, uniqueId);
-        await DisplayGroupCache.removeRecords(
-          db,
-          recordsTable: trainRecordsTable,
-          uniqueIds: [uniqueId],
-        );
         _notifyRecordDeleted([uniqueId]);
       }
 
@@ -741,11 +612,14 @@ END)''';
   Future<int> deleteAllRecords() async {
     return _runInDbQueue(() async {
       final db = await database;
-      final result = await db.delete(trainRecordsTable);
-      if (_fts5Available) {
-        await db.delete(trainRecordsFtsTable);
-      }
-      await DisplayGroupCache.clear(db);
+      final result = await db.transaction((txn) async {
+        final deleted = await txn.delete(trainRecordsTable);
+        if (_fts5Available) {
+          await txn.delete(trainRecordsFtsTable);
+        }
+        await DisplayGroupCache.clear(txn);
+        return deleted;
+      });
 
       if (result > 0) {
         _notifyRecordDeleted([]);
@@ -758,12 +632,17 @@ END)''';
   Future<int> getRecordCount() async {
     return _runInDbQueue(() async {
       final db = await database;
-      final result = await db.rawQuery('SELECT COUNT(*) FROM $trainRecordsTable');
+      final result = await db.rawQuery(
+        'SELECT COUNT(*) FROM $trainRecordsTable',
+      );
       return Sqflite.firstIntValue(result) ?? 0;
     });
   }
 
-  Future<List<TrainRecord>> getRecordsBatch({required int limit, required int offset}) async {
+  Future<List<TrainRecord>> getRecordsBatch({
+    required int limit,
+    required int offset,
+  }) async {
     return _runInDbQueue(() async {
       final db = await database;
       final result = await db.query(
@@ -827,7 +706,9 @@ END)''';
         orderBy: 'receivedTimestamp DESC, uniqueId DESC',
         limit: limit,
       );
-      final items = rows.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
+      final items = rows
+          .map((json) => TrainRecord.fromDatabaseJson(json))
+          .toList();
       final next = rows.length < limit
           ? null
           : PageCursor(
@@ -866,8 +747,10 @@ END)''';
           hideUngroupable: hideUngroupable,
         );
       } catch (e) {
-        developer.log('Merged FTS search failed, falling back to LIKE: $e',
-            name: 'Database');
+        developer.log(
+          'Merged FTS search failed, falling back to LIKE: $e',
+          name: 'Database',
+        );
         final fallback = _buildSearchWhereFallback(normalizedQuery);
         return DisplayGroupCache.fetchSearchPage(
           db,
@@ -928,20 +811,25 @@ END)''';
     });
   }
 
-  Future<List<TrainRecord>> getRecordsByUniqueIds(List<String> uniqueIds) async {
+  Future<List<TrainRecord>> getRecordsByUniqueIds(
+    List<String> uniqueIds,
+  ) async {
     if (uniqueIds.isEmpty) return [];
     return _runInDbQueue(() async {
       final db = await database;
-      final placeholders = List.filled(uniqueIds.length, '?').join(',');
-      final result = await db.rawQuery(
-        '''
-        SELECT * FROM $trainRecordsTable
-        WHERE uniqueId IN ($placeholders)
-        ORDER BY receivedTimestamp DESC
-        ''',
-        uniqueIds,
+      final records = <TrainRecord>[];
+      for (final chunk in DisplayGroupCache.chunks(uniqueIds)) {
+        final placeholders = List.filled(chunk.length, '?').join(',');
+        final rows = await db.rawQuery(
+          'SELECT * FROM $trainRecordsTable WHERE uniqueId IN ($placeholders)',
+          chunk,
+        );
+        records.addAll(rows.map(TrainRecord.fromDatabaseJson));
+      }
+      records.sort(
+        (a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp),
       );
-      return result.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
+      return records;
     });
   }
 
@@ -949,6 +837,7 @@ END)''';
     required String query,
     required int limit,
     required int offset,
+    bool hideUngroupable = false,
   }) async {
     return _runInDbQueue(() async {
       final db = await database;
@@ -957,92 +846,82 @@ END)''';
 
       final filters = _buildSearchFilters(normalizedQuery);
       final scoreArgs = _searchRelevanceScoreArgs(normalizedQuery);
-      final queryArgs = [
-        ...filters.whereArgs,
-        ...scoreArgs,
-        limit,
-        offset,
-      ];
+      final baseWhere = <String>['r.isTimeOnly = 0'];
+      if (hideUngroupable) {
+        baseWhere.add('(r.trainKey IS NOT NULL OR r.locoKey IS NOT NULL)');
+      }
+      final queryArgs = [...filters.whereArgs, ...scoreArgs, limit, offset];
 
       try {
         final result = await db.rawQuery('''
           SELECT r.* FROM $trainRecordsTable r
-          WHERE r.isTimeOnly = 0 AND (${filters.whereClauses.join(' OR ')})
+          WHERE ${baseWhere.join(' AND ')}
+            AND (${filters.whereClauses.join(' OR ')})
           ORDER BY $_searchOrderByClause
           LIMIT ? OFFSET ?
         ''', queryArgs);
-        return result.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
+        return result
+            .map((json) => TrainRecord.fromDatabaseJson(json))
+            .toList();
       } catch (e) {
-        developer.log('FTS search failed, falling back to LIKE: $e', name: 'Database');
-        final fallbackWhere = filters.charGapPattern != null
-            ? 'searchText LIKE ? OR searchText LIKE ?'
-            : 'searchText LIKE ?';
-        final fallbackArgs = filters.charGapPattern != null
-            ? [filters.containsPattern, filters.charGapPattern]
-            : [filters.containsPattern];
-        final fallbackScoreArgs = _searchRelevanceScoreArgs(normalizedQuery);
-        final result = await db.rawQuery('''
+        developer.log(
+          'FTS search failed, falling back to LIKE: $e',
+          name: 'Database',
+        );
+        final fallback = _buildSearchWhereFallback(normalizedQuery);
+        final result = await db.rawQuery(
+          '''
           SELECT r.* FROM $trainRecordsTable r
-          WHERE r.isTimeOnly = 0 AND ($fallbackWhere)
+          WHERE ${baseWhere.join(' AND ')} AND (${fallback.whereSql})
           ORDER BY $_searchOrderByClause
           LIMIT ? OFFSET ?
-        ''', [...fallbackArgs, ...fallbackScoreArgs, limit, offset]);
-        return result.map((json) => TrainRecord.fromDatabaseJson(json)).toList();
+        ''',
+          [...fallback.whereArgs, ...scoreArgs, limit, offset],
+        );
+        return result
+            .map((json) => TrainRecord.fromDatabaseJson(json))
+            .toList();
       }
     });
   }
 
-  Future<int> countSearchResults(String query) async {
+  Future<int> countSearchResults(
+    String query, {
+    bool hideUngroupable = false,
+  }) async {
     return _runInDbQueue(() async {
       final db = await database;
       final normalizedQuery = _normalizeSearchQuery(query);
       if (normalizedQuery == null) return 0;
 
       final filters = _buildSearchFilters(normalizedQuery);
+      final baseWhere = <String>['r.isTimeOnly = 0'];
+      if (hideUngroupable) {
+        baseWhere.add('(r.trainKey IS NOT NULL OR r.locoKey IS NOT NULL)');
+      }
 
       try {
         final result = await db.rawQuery('''
           SELECT COUNT(DISTINCT r.uniqueId) AS cnt FROM $trainRecordsTable r
-          WHERE r.isTimeOnly = 0 AND (${filters.whereClauses.join(' OR ')})
+          WHERE ${baseWhere.join(' AND ')}
+            AND (${filters.whereClauses.join(' OR ')})
         ''', filters.whereArgs);
         return Sqflite.firstIntValue(result) ?? 0;
       } catch (e) {
-        final fallbackWhere = filters.charGapPattern != null
-            ? 'searchText LIKE ? OR searchText LIKE ?'
-            : 'searchText LIKE ?';
-        final fallbackArgs = filters.charGapPattern != null
-            ? [filters.containsPattern, filters.charGapPattern]
-            : [filters.containsPattern];
+        final fallback = _buildSearchWhereFallback(normalizedQuery);
         final result = await db.rawQuery(
-          'SELECT COUNT(*) AS cnt FROM $trainRecordsTable WHERE isTimeOnly = 0 AND ($fallbackWhere)',
-          fallbackArgs,
+          'SELECT COUNT(*) AS cnt FROM $trainRecordsTable r '
+          'WHERE ${baseWhere.join(' AND ')} AND (${fallback.whereSql})',
+          fallback.whereArgs,
         );
         return Sqflite.firstIntValue(result) ?? 0;
       }
     });
   }
 
-  Future<TrainRecord?> getLatestRecord() async {
-    return _runInDbQueue(() async {
-      final db = await database;
-      final result = await db.query(
-        trainRecordsTable,
-        orderBy: 'receivedTimestamp DESC',
-        limit: 1,
-      );
-      if (result.isNotEmpty) {
-        return TrainRecord.fromDatabaseJson(result.first);
-      }
-      return null;
-    });
-  }
-
   Future<Map<String, dynamic>?> _loadSettingsFromDb(Database db) async {
     try {
-      final result = await db.query(
-        appSettingsTable,
-        where: 'id = 1',
-      );
+      final result = await db.query(appSettingsTable, where: 'id = 1');
       if (result.isEmpty) return null;
       return result.first;
     } catch (e) {
@@ -1079,77 +958,36 @@ END)''';
   }
 
   Future<int> setSetting(String key, dynamic value) async {
-    return _runInDbQueue(() async {
-      final db = await database;
-      final result = await db.update(
-        appSettingsTable,
-        {key: value},
-        where: 'id = 1',
-      );
-      if (result > 0) {
-        _settingsCache = await _loadSettingsFromDb(db);
-        if (_settingsCache != null) {
-          _notifySettingsChanged(_settingsCache!);
-        }
-      }
-      return result;
-    });
-  }
-
-  Future<Map<String, dynamic>> getDatabaseInfo() async {
-    final db = await database;
-    final count = await getRecordCount();
-    final settings = await getAllSettings();
-    return {
-      'databaseVersion': _databaseVersion,
-      'trainRecordCount': count,
-      'appSettings': settings,
-      'path': db.path,
-    };
-  }
-
-  Future<String?> backupDatabase() async {try {
-      final db = await database;
-      final directory = await getApplicationDocumentsDirectory();
-      final originalPath = db.path;
-      final backupDirectory = Directory(join(directory.path, 'backups'));
-      if (!await backupDirectory.exists()) {
-        await backupDirectory.create(recursive: true);
-      }
-      final backupPath = join(backupDirectory.path,
-          'train_database_backup_${DateTime.now().millisecondsSinceEpoch}.db');
-      await File(originalPath).copy(backupPath);
-      return backupPath;
-    } catch (e) {
-      return null;
-    }
+    return updateSettings({key: value});
   }
 
   Future<void> deleteRecords(List<String> uniqueIds) async {
     if (uniqueIds.isEmpty) return;
     await _runInDbQueue(() async {
       final db = await database;
-      final batch = db.batch();
-      for (String id in uniqueIds) {
-        batch.delete(
-          trainRecordsTable,
-          where: 'uniqueId = ?',
-          whereArgs: [id],
-        );
-        if (_fts5Available) {
+      await db.transaction((txn) async {
+        final batch = txn.batch();
+        for (final id in uniqueIds) {
           batch.delete(
-            trainRecordsFtsTable,
+            trainRecordsTable,
             where: 'uniqueId = ?',
             whereArgs: [id],
           );
+          if (_fts5Available) {
+            batch.delete(
+              trainRecordsFtsTable,
+              where: 'uniqueId = ?',
+              whereArgs: [id],
+            );
+          }
         }
-      }
-      await batch.commit(noResult: true);
-      await DisplayGroupCache.removeRecords(
-        db,
-        recordsTable: trainRecordsTable,
-        uniqueIds: uniqueIds,
-      );
+        await batch.commit(noResult: true);
+        await DisplayGroupCache.removeRecords(
+          txn,
+          recordsTable: trainRecordsTable,
+          uniqueIds: uniqueIds,
+        );
+      });
       _notifyRecordDeleted(uniqueIds);
     });
   }
@@ -1169,10 +1007,7 @@ END)''';
     await _runInDbQueue(() async {
       final db = await database;
       await _backfillDerivedColumns(db);
-      await DisplayGroupCache.rebuild(
-        db,
-        recordsTable: trainRecordsTable,
-      );
+      await DisplayGroupCache.rebuild(db, recordsTable: trainRecordsTable);
     });
     final currentSettings = await getAllSettings();
     if (currentSettings != null) {
@@ -1198,7 +1033,8 @@ END)''';
   }
 
   StreamSubscription<void> onSettingsChanged(
-      Function(Map<String, dynamic>) listener) {
+    Function(Map<String, dynamic>) listener,
+  ) {
     _settingsListeners.add(listener);
     return _CallbackSubscription(() {
       _settingsListeners.remove(listener);
@@ -1245,7 +1081,9 @@ END)''';
   /// Number of merge-display groups currently cached, optionally excluding
   /// ungroupable singletons. Used by tests to assert pagination coverage.
   @visibleForTesting
-  Future<int> countDisplayGroupsForTesting({bool hideUngroupable = false}) async {
+  Future<int> countDisplayGroupsForTesting({
+    bool hideUngroupable = false,
+  }) async {
     return _runInDbQueue(() async {
       final db = await database;
       final where = hideUngroupable ? 'WHERE isUngroupable = 0' : '';
@@ -1265,15 +1103,11 @@ END)''';
     required bool mergeEnabled,
     bool hideUngroupable = false,
   }) async {
+    if (mergeEnabled) {
+      return countDisplayGroupsForTesting(hideUngroupable: hideUngroupable);
+    }
     return _runInDbQueue(() async {
       final db = await database;
-      if (mergeEnabled) {
-        final where = hideUngroupable ? 'WHERE isUngroupable = 0' : '';
-        final r = await db.rawQuery(
-          'SELECT COUNT(*) AS cnt FROM ${DisplayGroupCache.groupsTable} $where',
-        );
-        return Sqflite.firstIntValue(r) ?? 0;
-      }
       final r = await db.rawQuery(
         'SELECT COUNT(*) AS cnt FROM $trainRecordsTable '
         "WHERE isTimeOnly = 0 "
@@ -1323,10 +1157,20 @@ END)''';
   Future<bool> importDataFromJson(String filePath) async {
     try {
       final jsonString = await File(filePath).readAsString();
-      final importData = jsonDecode(jsonString);
-      final rawRecords = importData['records'] != null
-          ? List<Map<String, dynamic>>.from(importData['records'] as List)
-          : <Map<String, dynamic>>[];
+      final decoded = jsonDecode(jsonString);
+      if (decoded is! Map) {
+        throw const FormatException('备份根节点必须是 JSON 对象');
+      }
+      final recordsValue = decoded['records'];
+      if (recordsValue is! List) {
+        throw const FormatException('备份必须包含 records 数组');
+      }
+      final rawRecords = recordsValue.map<Map<String, dynamic>>((value) {
+        if (value is! Map) {
+          throw const FormatException('records 中包含非对象元素');
+        }
+        return Map<String, dynamic>.from(value);
+      }).toList();
       return await importRawRecords(rawRecords);
     } catch (e) {
       developer.log('importDataFromJson failed: $e', name: 'Database');
@@ -1340,11 +1184,13 @@ END)''';
   /// same isolate prepare + single-transaction insert + FTS rebuild.
   Future<bool> importRawRecords(List<Map<String, dynamic>> rawRecords) async {
     try {
+      _validateImportRecords(rawRecords);
       // Prepare insert-ready rows (searchText + derived columns) and the
       // merge-group payload in a single isolate pass so the UI thread stays
       // responsive and we avoid computing twice (once for the rows, once for
       // the cache rebuild).
-      final payload = rawRecords.length > DisplayGroupCache.isolateRebuildThreshold
+      final payload =
+          rawRecords.length > DisplayGroupCache.isolateRebuildThreshold
           ? await compute(prepareImportPayload, rawRecords)
           : prepareImportPayload(rawRecords);
       final rows = (payload['rows'] as List).cast<Map<String, dynamic>>();
@@ -1359,8 +1205,11 @@ END)''';
 
           var batch = txn.batch();
           for (final row in rows) {
-            batch.insert(trainRecordsTable, row,
-                conflictAlgorithm: ConflictAlgorithm.replace);
+            batch.insert(
+              trainRecordsTable,
+              row,
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
           }
           await batch.commit(noResult: true);
 
@@ -1387,6 +1236,43 @@ END)''';
     } catch (e) {
       developer.log('importRawRecords failed: $e', name: 'Database');
       return false;
+    }
+  }
+
+  void _validateImportRecords(List<Map<String, dynamic>> records) {
+    final seenIds = <String>{};
+    const requiredFields = <String, List<String>>{
+      'uniqueId': ['uniqueId', 'unique_id'],
+      'timestamp': ['timestamp'],
+      'receivedTimestamp': ['receivedTimestamp', 'received_timestamp'],
+      'train': ['train'],
+      'direction': ['direction', 'dir'],
+      'speed': ['speed'],
+      'position': ['position', 'pos'],
+      'time': ['time'],
+      'loco': ['loco'],
+      'locoType': ['locoType', 'loco_type'],
+      'lbjClass': ['lbjClass', 'lbj_class'],
+      'route': ['route'],
+      'positionInfo': ['positionInfo', 'position_info'],
+      'rssi': ['rssi'],
+    };
+    for (var index = 0; index < records.length; index++) {
+      final record = records[index];
+      final missing = requiredFields.entries
+          .where((entry) => !entry.value.any(record.containsKey))
+          .map((entry) => entry.key)
+          .toList();
+      if (missing.isNotEmpty) {
+        throw FormatException('第 ${index + 1} 条记录缺少字段：${missing.join(', ')}');
+      }
+      final parsed = TrainRecord.fromJson(record);
+      if (parsed.uniqueId.isEmpty) {
+        throw FormatException('第 ${index + 1} 条记录的 uniqueId 不能为空');
+      }
+      if (!seenIds.add(parsed.uniqueId)) {
+        throw FormatException('记录 uniqueId 重复：${parsed.uniqueId}');
+      }
     }
   }
 
@@ -1417,8 +1303,7 @@ END)''';
       return CsvImportResult(success: false, message: '读取目录失败：$e');
     }
     if (csvFiles.isEmpty) {
-      return CsvImportResult(
-          success: false, message: '未在 $dirPath 找到 CSV 文件');
+      return CsvImportResult(success: false, message: '未在 $dirPath 找到 CSV 文件');
     }
     csvFiles.sort();
 
@@ -1428,10 +1313,7 @@ END)''';
     try {
       payload = await compute<Map<String, dynamic>, Map<String, dynamic>>(
         parseCsvFilesToRecords,
-        <String, dynamic>{
-          'files': csvFiles,
-          'locoTypeMap': locoTypeMap,
-        },
+        <String, dynamic>{'files': csvFiles, 'locoTypeMap': locoTypeMap},
       );
     } catch (e) {
       return CsvImportResult(success: false, message: '解析 CSV 失败：$e');
@@ -1451,9 +1333,7 @@ END)''';
       success: ok,
       fileCount: csvFiles.length,
       recordCount: records.length,
-      message: ok
-          ? '导入 ${records.length} 条记录（${csvFiles.length} 个文件）'
-          : '导入失败',
+      message: ok ? '导入 ${records.length} 条记录（${csvFiles.length} 个文件）' : '导入失败',
     );
   }
 
@@ -1463,31 +1343,9 @@ END)''';
   Future<Map<String, String>> _loadLocoTypeMap() async {
     try {
       final csv = await rootBundle.loadString('assets/loco_type_info.csv');
-      final map = <String, String>{};
-      for (final line in const LineSplitter().convert(csv)) {
-        final trimmed = line.trim();
-        if (trimmed.isEmpty) continue;
-        final parts = trimmed.split(',');
-        if (parts.length >= 2) {
-          map[parts[0].trim()] = parts[1].trim();
-        }
-      }
-      return map;
+      return parseLocoTypeMap(csv);
     } catch (e) {
       return {};
-    }
-  }
-
-  Future<bool> deleteExportFile(String filePath) async {
-    try {
-      final file = File(filePath);
-      if (await file.exists()) {
-        await file.delete();
-        return true;
-      }
-      return false;
-    } catch (e) {
-      return false;
     }
   }
 }

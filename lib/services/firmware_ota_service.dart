@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'ble_service.dart';
 import 'ble_diagnostics.dart';
 import 'file_share_api.dart';
+import 'http_download.dart';
 import 'recovery_ota.dart';
 
 class FirmwareUpdateInfo {
@@ -55,17 +56,12 @@ class FirmwareOtaService {
     );
     final versionPattern = RegExp(r'^firmware-([0-9a-fA-F]{16})$');
     for (final item in page.files) {
-      final extension = (item['ext'] ?? item['extension'] ?? '')
-          .toString()
-          .toLowerCase()
-          .replaceFirst('.', '');
+      final extension = fileShareExtension(item);
       if (extension != 'bin') continue;
 
-      final baseName =
-          (item['name'] ?? item['filename'] ?? item['fileName'] ?? '')
-              .toString();
+      final baseName = fileShareFileName(item);
       final match = versionPattern.firstMatch(baseName);
-      final fileId = _fileId(item);
+      final fileId = fileShareId(item);
       if (match == null || fileId == null) continue;
 
       final version = match.group(1)!.toUpperCase();
@@ -74,7 +70,7 @@ class FirmwareOtaService {
         version: version,
         fileId: fileId,
         fileName: '$baseName.$extension',
-        uploadTime: _uploadTime(item),
+        uploadTime: fileShareUploadTime(item),
       );
     }
     return null;
@@ -85,19 +81,14 @@ class FirmwareOtaService {
     void Function(double progress)? onProgress,
     void Function(Map<String, dynamic> state)? onState,
   }) async {
-    onState?.call({'state': 'downloading'});
-    BleDiagnostics.log(
-      'Download firmware id=${update.fileId} name=${update.fileName}',
+    final downloaded = await _fetchFirmware(
+      update,
+      logMessage: 'Download firmware',
+      onProgress: onProgress,
+      onState: onState,
     );
-    final url = await _api.getDownloadUrl(fileId: update.fileId);
-    final directory = Directory(
-      p.join(Directory.systemTemp.path, 'LBJConsole', 'firmware_update'),
-    );
-    await directory.create(recursive: true);
-    final firmware = File(p.join(directory.path, update.fileName));
-    await _download(url, firmware, onProgress);
-
-    final digest = (await sha256.bind(firmware.openRead()).first).toString();
+    final firmware = downloaded.$1;
+    final digest = downloaded.$2;
     await _bleService.startFirmwareOta(
       firmware,
       sha256: digest,
@@ -112,19 +103,14 @@ class FirmwareOtaService {
     void Function(double progress)? onProgress,
     void Function(Map<String, dynamic> state)? onState,
   }) async {
-    onState?.call({'state': 'downloading'});
-    BleDiagnostics.log(
-      'Download rescue firmware id=${update.fileId} name=${update.fileName}',
+    final downloaded = await _fetchFirmware(
+      update,
+      logMessage: 'Download rescue firmware',
+      onProgress: onProgress,
+      onState: onState,
     );
-    final url = await _api.getDownloadUrl(fileId: update.fileId);
-    final directory = Directory(
-      p.join(Directory.systemTemp.path, 'LBJConsole', 'firmware_update'),
-    );
-    await directory.create(recursive: true);
-    final firmware = File(p.join(directory.path, update.fileName));
-    await _download(url, firmware, onProgress);
-
-    final digest = (await sha256.bind(firmware.openRead()).first).toString();
+    final firmware = downloaded.$1;
+    final digest = downloaded.$2;
     final total = await firmware.length();
 
     Future<void> transferFromStart() => SppRecoveryOta(
@@ -145,52 +131,24 @@ class FirmwareOtaService {
     }
   }
 
-  Future<void> _download(
-    Uri url,
-    File destination,
+  Future<(File, String)> _fetchFirmware(
+    FirmwareUpdateInfo update, {
+    required String logMessage,
     void Function(double progress)? onProgress,
-  ) async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 20);
-    try {
-      final request = await client.getUrl(url);
-      final response = await request.close().timeout(
-        const Duration(seconds: 30),
-      );
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw FileShareApiException(
-          '固件下载失败（HTTP ${response.statusCode}）',
-          statusCode: response.statusCode,
-        );
-      }
-      final total = response.contentLength;
-      var received = 0;
-      final sink = destination.openWrite();
-      try {
-        await for (final chunk in response.timeout(
-          const Duration(seconds: 30),
-        )) {
-          sink.add(chunk);
-          received += chunk.length;
-          if (total > 0) onProgress?.call(received / total);
-        }
-        await sink.close();
-      } catch (_) {
-        await sink.close();
-        rethrow;
-      }
-      onProgress?.call(1);
-    } finally {
-      client.close(force: true);
-    }
+    void Function(Map<String, dynamic> state)? onState,
+  }) async {
+    onState?.call({'state': 'downloading'});
+    BleDiagnostics.log(
+      '$logMessage id=${update.fileId} name=${update.fileName}',
+    );
+    final url = await _api.getDownloadUrl(fileId: update.fileId);
+    final directory = Directory(
+      p.join(Directory.systemTemp.path, 'LBJConsole', 'firmware_update'),
+    );
+    await directory.create(recursive: true);
+    final firmware = File(p.join(directory.path, update.fileName));
+    await HttpDownload.download(url, firmware, onProgress: onProgress);
+    final digest = (await sha256.bind(firmware.openRead()).first).toString();
+    return (firmware, digest);
   }
-
-  int? _fileId(Map<String, dynamic> item) {
-    final value = item['id'] ?? item['fileId'];
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString() ?? '');
-  }
-
-  String? _uploadTime(Map<String, dynamic> item) =>
-      (item['time'] ?? item['uploadTime'] ?? item['createdAt'])?.toString();
 }

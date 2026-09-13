@@ -24,6 +24,52 @@ std::wstring CommandLineQuote(const std::wstring& value) {
   return L"\"" + value + L"\"";
 }
 
+std::wstring FullPath(const std::wstring& path) {
+  wchar_t buffer[MAX_PATH]{};
+  const DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, buffer, nullptr);
+  return length == 0 || length >= MAX_PATH ? L"" : std::wstring(buffer, length);
+}
+
+bool IsWithin(const std::wstring& parent, const std::wstring& child) {
+  if (parent.empty() || child.size() <= parent.size()) return false;
+  if (_wcsnicmp(parent.c_str(), child.c_str(), parent.size()) != 0) return false;
+  return child[parent.size()] == L'\\';
+}
+
+bool IsRegularFile(const std::wstring& path) {
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+         (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
+bool IsSafeUpdateDirectory(const std::wstring& directory,
+                           const std::wstring& zipPath) {
+  wchar_t tempPath[MAX_PATH]{};
+  const DWORD length = GetTempPathW(MAX_PATH, tempPath);
+  if (length == 0 || length >= MAX_PATH) return false;
+
+  const std::wstring root = FullPath(std::wstring(tempPath) + L"LBJConsole");
+  const std::wstring target = FullPath(directory);
+  const std::wstring zip = FullPath(zipPath);
+  if (!IsWithin(root, target) || !IsWithin(target, zip)) return false;
+  if (zip.substr(zip.find_last_of(L"\\/") + 1) != L"update.zip") return false;
+  const auto separator = target.find_last_of(L"\\/");
+  if (separator == std::wstring::npos ||
+      target.substr(separator + 1).rfind(L"update_", 0) != 0) {
+    return false;
+  }
+
+  const DWORD targetAttributes = GetFileAttributesW(target.c_str());
+  if (targetAttributes == INVALID_FILE_ATTRIBUTES ||
+      (targetAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+      (targetAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    return false;
+  }
+  return IsRegularFile(zip) &&
+         IsRegularFile(target + L"\\.lbj-update-marker");
+}
+
 bool RunPowerShell(const std::wstring& command) {
   std::wstring commandLine =
       L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" +
@@ -102,6 +148,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE previous,
   const std::wstring cleanupDirectory = arguments[3];
   LocalFree(arguments);
   const std::wstring executable = installDirectory + L"\\lbjconsole.exe";
+
+  if (!IsSafeUpdateDirectory(cleanupDirectory, zipPath)) {
+    Log(L"Rejected unsafe update directory or archive.");
+    MessageBoxW(nullptr, L"Invalid update staging directory.",
+                L"LBJ Console Update Failed", MB_OK | MB_ICONERROR);
+    return 2;
+  }
 
   const std::wstring stagingDirectory = cleanupDirectory + L"\\staging";
   const std::wstring extractCommand =

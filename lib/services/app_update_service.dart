@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 import 'file_share_api.dart';
+import 'http_download.dart';
 
 const String appBuildHash = String.fromEnvironment(
   'LBJ_BUILD_HASH',
@@ -50,11 +51,11 @@ class AppUpdateService {
     final pattern = RegExp(r'^LBJ-Console-([0-9a-f]{8})$');
 
     for (final item in page.files) {
-      final baseName = _fileName(item);
-      final itemExtension = _extension(item);
+      final baseName = fileShareFileName(item);
+      final itemExtension = fileShareExtension(item);
       if (itemExtension != extension) continue;
       final match = pattern.firstMatch(baseName);
-      final fileId = _fileId(item);
+      final fileId = fileShareId(item);
       if (match != null && fileId != null) {
         final hash = match.group(1)!;
         final name = '$baseName.$itemExtension';
@@ -63,7 +64,7 @@ class AppUpdateService {
             hash: hash,
             fileName: name,
             fileId: fileId,
-            uploadTime: _uploadTime(item),
+            uploadTime: fileShareUploadTime(item),
           );
         }
         return null;
@@ -78,8 +79,9 @@ class AppUpdateService {
   }) async {
     final url = await _api.getDownloadUrl(fileId: update.fileId);
     final directory = await _createUpdateDirectory(update.hash);
-    final downloaded = File(p.join(directory.path, update.fileName));
-    await _downloadWithProgress(url, downloaded, onProgress);
+    final downloadedName = Platform.isWindows ? 'update.zip' : update.fileName;
+    final downloaded = File(p.join(directory.path, downloadedName));
+    await HttpDownload.download(url, downloaded, onProgress: onProgress);
 
     if (Platform.isAndroid) {
       await _androidChannel.invokeMethod<void>('installApk', {
@@ -116,11 +118,10 @@ class AppUpdateService {
       p.join(updateDirectory.path, 'bootstrap'),
     );
     await bootstrapDirectory.create(recursive: true);
-    final zipPath = Directory(updateDirectory.path)
-        .listSync()
-        .whereType<File>()
-        .firstWhere((file) => file.path.toLowerCase().endsWith('.zip'))
-        .path;
+    final zipPath = p.join(updateDirectory.path, 'update.zip');
+    if (!await File(zipPath).exists()) {
+      throw const FileShareApiException('更新目录中缺少 update.zip');
+    }
     final command =
         "Expand-Archive -LiteralPath '${_powerShellQuote(zipPath)}' "
         "-DestinationPath '${_powerShellQuote(bootstrapDirectory.path)}' -Force";
@@ -156,61 +157,11 @@ class AppUpdateService {
       ),
     );
     await directory.create(recursive: true);
+    await File(
+      p.join(directory.path, '.lbj-update-marker'),
+    ).writeAsString('LBJ Console update\n');
     return directory;
   }
-
-  Future<void> _downloadWithProgress(
-    Uri url,
-    File destination,
-    void Function(double progress)? onProgress,
-  ) async {
-    final client = HttpClient();
-    try {
-      final request = await client.getUrl(url);
-      final response = await request.close();
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw FileShareApiException(
-          '下载更新失败（HTTP ${response.statusCode}）',
-          statusCode: response.statusCode,
-        );
-      }
-      final total = response.contentLength;
-      var received = 0;
-      final sink = destination.openWrite();
-      try {
-        await for (final chunk in response) {
-          sink.add(chunk);
-          received += chunk.length;
-          if (total > 0) onProgress?.call(received / total);
-        }
-        await sink.close();
-      } catch (_) {
-        await sink.close();
-        rethrow;
-      }
-      onProgress?.call(1);
-    } finally {
-      client.close(force: true);
-    }
-  }
-
-  String _fileName(Map<String, dynamic> item) =>
-      (item['name'] ?? item['filename'] ?? item['fileName'] ?? '').toString();
-
-  String _extension(Map<String, dynamic> item) =>
-      (item['ext'] ?? item['extension'] ?? '')
-          .toString()
-          .toLowerCase()
-          .replaceFirst('.', '');
-
-  int? _fileId(Map<String, dynamic> item) {
-    final value = item['id'] ?? item['fileId'];
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString() ?? '');
-  }
-
-  String? _uploadTime(Map<String, dynamic> item) =>
-      (item['time'] ?? item['uploadTime'] ?? item['createdAt'])?.toString();
 
   static Future<void> cleanupFromArguments(List<String> args) async {
     if (!Platform.isWindows) return;
@@ -218,11 +169,26 @@ class AppUpdateService {
     for (final arg in args) {
       if (arg.startsWith(prefix)) {
         try {
-          await Directory(arg.substring(prefix.length)).delete(recursive: true);
+          final path = arg.substring(prefix.length);
+          if (await _isSafeUpdateDirectory(path)) {
+            await Directory(path).delete(recursive: true);
+          }
         } catch (_) {
           // Cleanup is best effort; a failed cleanup must not block startup.
         }
       }
     }
+  }
+
+  static Future<bool> _isSafeUpdateDirectory(String path) async {
+    final directory = Directory(path);
+    if (path.contains('..') || !await directory.exists()) return false;
+    final root = Directory(p.join(Directory.systemTemp.path, 'LBJConsole'));
+    final rootPath = p.normalize(root.absolute.path).toLowerCase();
+    final targetPath = p.normalize(directory.absolute.path).toLowerCase();
+    if (!p.isWithin(rootPath, targetPath)) return false;
+    final name = p.basename(targetPath);
+    if (!name.startsWith('update_')) return false;
+    return await File(p.join(directory.path, '.lbj-update-marker')).exists();
   }
 }

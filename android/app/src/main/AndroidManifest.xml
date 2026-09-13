@@ -1,17 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     
-    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
-
     <uses-permission android:name="android.permission.BLUETOOTH"/>
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"/>
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" android:usesPermissionFlags="neverForLocation"/>
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" android:usesPermissionFlags="neverForLocation"/>
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <!-- tools:node="replace"：flutter_blue_plus 的清单以 maxSdkVersion="30" 声明这两个权限，
+         合并器会取更严格的一方，导致 Android 12+ 上应用根本未申请定位权限
+         （geolocator 抛 PermissionDefinitionsNotFoundException）。此处强制以本声明的无限期版本为准。 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" tools:node="replace"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" tools:node="replace"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>

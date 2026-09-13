@@ -15,11 +15,18 @@ class IpcDecoder {
         throw const FormatException('BLE IPC frame exceeds 16 MiB');
       }
       if (_buffer.length - cursor - 4 < length) break;
-      cursor += 4;
-      messages.add(
-        jsonDecode(utf8.decode(_buffer.sublist(cursor, cursor + length))),
-      );
-      cursor += length;
+      final payloadStart = cursor + 4;
+      final payloadEnd = payloadStart + length;
+      // Consume the complete frame before decoding it. A malformed JSON
+      // payload must be dropped without poisoning all following frames.
+      cursor = payloadEnd;
+      try {
+        messages.add(jsonDecode(utf8.decode(
+          _buffer.sublist(payloadStart, payloadEnd),
+        )));
+      } on FormatException {
+        // Ignore one malformed frame and continue with the next complete one.
+      }
     }
     _buffer.removeRange(0, cursor);
     return messages;

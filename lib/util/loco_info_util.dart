@@ -1,6 +1,9 @@
+import 'dart:developer' as developer;
+
 import 'package:flutter/services.dart';
 
 import 'package:lbjconsole/util/loco_type_util.dart';
+import 'package:lbjconsole/util/csv_parser.dart';
 
 class LocoInfoUtil {
   static final List<LocoInfo> _locoData = [];
@@ -16,7 +19,7 @@ class LocoInfoUtil {
       for (final line in lines) {
         if (line.trim().isEmpty) continue;
 
-        final fields = _parseCsvLine(line);
+        final fields = parseCsvLine(line);
         if (fields.length >= 4) {
           try {
             final model = fields[0];
@@ -26,43 +29,30 @@ class LocoInfoUtil {
             final alias = fields.length > 4 ? fields[4] : '';
             final manufacturer = fields.length > 5 ? fields[5] : '';
 
-            _locoData.add(LocoInfo(
-              model: model,
-              start: start,
-              end: end,
-              owner: owner,
-              alias: alias,
-              manufacturer: manufacturer,
-            ));
-          } catch (e) {}
+            _locoData.add(
+              LocoInfo(
+                model: model,
+                start: start,
+                end: end,
+                owner: owner,
+                alias: alias,
+                manufacturer: manufacturer,
+              ),
+            );
+          } catch (e, stack) {
+            developer.log(
+              '跳过无效机车资料：$e',
+              name: 'LocoInfoUtil',
+              stackTrace: stack,
+            );
+          }
         }
       }
       _initialized = true;
-    } catch (e) {
+    } catch (e, stack) {
+      developer.log('加载机车资料失败：$e', name: 'LocoInfoUtil', stackTrace: stack);
       _initialized = true;
     }
-  }
-
-  static List<String> _parseCsvLine(String line) {
-    final fields = <String>[];
-    final buffer = StringBuffer();
-    bool inQuotes = false;
-
-    for (int i = 0; i < line.length; i++) {
-      final char = line[i];
-
-      if (char == '"') {
-        inQuotes = !inQuotes;
-      } else if (char == ',' && !inQuotes) {
-        fields.add(buffer.toString().trim());
-        buffer.clear();
-      } else {
-        buffer.write(char);
-      }
-    }
-
-    fields.add(buffer.toString().trim());
-    return fields;
   }
 
   static int? _parseLocoNumber(String number) {
@@ -118,17 +108,6 @@ class LocoInfoUtil {
     }
 
     return null;
-  }
-
-  static LocoInfo? findLocoInfo(String model, String number) {
-    if (!_initialized || model.isEmpty || number.isEmpty) {
-      return null;
-    }
-
-    final numberInt = _parseLocoNumber(number);
-    if (numberInt == null) return null;
-
-    return _findMatchingInfo(model.trim(), numberInt);
   }
 
   static String? getLocoInfoDisplay(String model, String number) {

@@ -14,13 +14,12 @@ captures
 .cxx
 local.properties
 *.ps1
+!tool/run_android_integration_test.ps1
 .*.bat
 *.jks
 *.keystore
 *.base64
 docs
-linux
-windows
 flutter/ephemeral/
 *.suo
 *.user

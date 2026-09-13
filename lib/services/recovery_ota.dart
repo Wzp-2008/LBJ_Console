@@ -44,6 +44,48 @@ int? _jsonInt(Object? value) {
   return null;
 }
 
+void _emitOtaPhase(
+  String phase, {
+  required void Function(String)? log,
+  required void Function(Map<String, dynamic>)? onState,
+}) {
+  log?.call('OTA phase=$phase');
+  onState?.call({'state': phase});
+}
+
+StateError? _otaStateError(Map<String, dynamic> state) {
+  final name = state['state']?.toString();
+  if (name != 'error' && name != 'aborted') return null;
+  final code = state['code']?.toString() ?? 'unknown';
+  return StateError('${otaErrorLabel(code)} ($code)');
+}
+
+Future<void> _waitForOtaState({
+  required bool Function() condition,
+  required Duration timeout,
+  required String phase,
+  required Object? Function() error,
+}) async {
+  final watch = Stopwatch()..start();
+  while (!condition()) {
+    final currentError = error();
+    if (currentError != null) throw currentError;
+    if (watch.elapsed >= timeout) {
+      throw TimeoutException('OTA ${otaStateLabel(phase)}超时', timeout);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+  final currentError = error();
+  if (currentError != null) throw currentError;
+}
+
+void _validateOtaPayload(int total, String sha256) {
+  if (total <= 0) throw ArgumentError('固件文件为空');
+  if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(sha256)) {
+    throw ArgumentError('SHA-256 格式无效');
+  }
+}
+
 /// The current Updater protocol does not permit retransmitting a block after
 /// an ACK timeout. The SPP session must be closed and the whole OTA restarted.
 class SppAckTimeoutException extends TimeoutException {
@@ -102,6 +144,213 @@ Stream<List<int>> _fixedSppPayloads(
   if (buffer.isNotEmpty) yield List<int>.of(buffer);
 }
 
+/// Shared Classic SPP transfer state machine used by normal OTA and rescue
+/// OTA. Their only difference is how the SPP session is reached; once the
+/// Updater is connected, framing, ACK validation and cleanup are identical.
+Future<void> _runSppTransfer({
+  required SppConnector connectSpp,
+  required Stream<List<int>> firmware,
+  required int total,
+  required String sha256,
+  required Duration reconnectTimeout,
+  required Duration retryDelay,
+  required Duration stateTimeout,
+  required Duration startAckTimeout,
+  required Duration ackTimeout,
+  required Duration frameDelay,
+  required Duration finishTimeout,
+  void Function(Map<String, dynamic>)? onState,
+  void Function(double)? onProgress,
+  void Function(String)? log,
+}) async {
+  var phase = 'starting';
+  Map<String, dynamic>? lastState;
+  Object? error;
+  var success = false;
+  final pendingAcks = <int>[];
+  final terminalError = Completer<Object>();
+  var remoteFailure = false;
+
+  void emit(String value) {
+    phase = value;
+    _emitOtaPhase(value, log: log, onState: onState);
+  }
+
+  void fail(Object value) {
+    error ??= value;
+    if (!terminalError.isCompleted) terminalError.complete(value);
+  }
+
+  void handleState(Map<String, dynamic> state) {
+    lastState = state;
+    log?.call('OTA status=$state');
+    final stateError = _otaStateError(state);
+    if (stateError != null) {
+      error = stateError;
+      remoteFailure = true;
+      fail(error!);
+    } else if (state['state']?.toString() == 'success' &&
+        phase == 'verifying') {
+      success = true;
+    }
+    if (state['state']?.toString() == 'ack') {
+      final received = _jsonInt(state['received']);
+      final ackTotal = _jsonInt(state['total']);
+      if (received == null || ackTotal == null || ackTotal != total) {
+        remoteFailure = true;
+        fail(
+          StateError(
+            'Updater SPP ACK 字段无效：received=${state['received']} '
+            'total=${state['total']}，期待 total=$total',
+          ),
+        );
+      } else {
+        pendingAcks.add(received);
+      }
+    }
+    onState?.call(state);
+  }
+
+  Future<void> waitFor(bool Function() condition, Duration timeout) async {
+    await _waitForOtaState(
+      condition: condition,
+      timeout: timeout,
+      phase: phase,
+      error: () => error,
+    );
+  }
+
+  Future<SppOtaTransport> connectWithRetry() async {
+    final watch = Stopwatch()..start();
+    Object? lastError;
+    StackTrace? lastStack;
+    var delay = retryDelay;
+    while (true) {
+      final remaining = reconnectTimeout - watch.elapsed;
+      if (remaining <= Duration.zero) break;
+      Future<SppOtaTransport>? attempt;
+      try {
+        attempt = connectSpp();
+        return await attempt.timeout(remaining);
+      } catch (value, stack) {
+        lastError = value;
+        lastStack = stack;
+        log?.call('SPP connect attempt failed: $value');
+        if (value is TimeoutException && attempt != null) {
+          unawaited(
+            attempt.then<void>((transport) async {
+              try {
+                await transport.close();
+              } catch (_) {}
+            }, onError: (_, _) {}),
+          );
+        }
+      }
+      final afterAttempt = reconnectTimeout - watch.elapsed;
+      if (afterAttempt <= Duration.zero) break;
+      final wait = delay < afterAttempt ? delay : afterAttempt;
+      if (wait > Duration.zero) await Future<void>.delayed(wait);
+      delay = Duration(milliseconds: min(delay.inMilliseconds * 2, 2000));
+    }
+    final finalError =
+        lastError ?? TimeoutException('SPP 连接超时', reconnectTimeout);
+    Error.throwWithStackTrace(finalError, lastStack ?? StackTrace.current);
+  }
+
+  SppOtaTransport? spp;
+  StreamSubscription<Map<String, dynamic>>? stateSubscription;
+  StreamSubscription<void>? disconnectSubscription;
+  try {
+    emit('reconnecting');
+    spp = await connectWithRetry();
+    stateSubscription = spp.states.listen(handleState);
+    disconnectSubscription = spp.disconnected.listen((_) {
+      if (!success) fail(StateError(otaErrorLabel('disconnected')));
+    });
+    await spp.ready.timeout(stateTimeout);
+
+    lastState = null;
+    emit('receiving');
+    await _raceSppOperation(
+      spp.control('OTA_START $total $sha256'),
+      terminalError.future,
+    );
+    final receivingWatch = Stopwatch()..start();
+    while (lastState?['state'] != 'receiving') {
+      if (error != null) throw error!;
+      if (!spp.connected) throw StateError(otaErrorLabel('disconnected'));
+      if (receivingWatch.elapsed >= startAckTimeout) {
+        log?.call(
+          'SPP did not report receiving; proceeding with ordered data stream',
+        );
+        break;
+      }
+      await _raceSppOperation(
+        Future<void>.delayed(const Duration(milliseconds: 20)),
+        terminalError.future,
+      );
+    }
+    if (error != null) throw error!;
+
+    var sent = 0;
+    onProgress?.call(0);
+    final payloadSize = min(spp.maxPayload, maxOtaSppPayload);
+    if (payloadSize <= 0) throw StateError('SPP 数据包大小无效');
+    await for (final payload in _fixedSppPayloads(firmware, payloadSize)) {
+      if (error != null) throw error!;
+      if (sent + payload.length > total) {
+        throw StateError('固件文件在传输时发生变化');
+      }
+      await _raceSppOperation(
+        spp.write(otaSppFrame(payload)),
+        terminalError.future,
+      );
+      sent += payload.length;
+      await _waitForSppAck(
+        pendingAcks: pendingAcks,
+        expectedReceived: sent,
+        timeout: ackTimeout,
+        terminalError: terminalError.future,
+      );
+      onProgress?.call(sent / total);
+      if (frameDelay > Duration.zero) {
+        await _raceSppOperation(
+          Future<void>.delayed(frameDelay),
+          terminalError.future,
+        );
+      }
+    }
+    if (error != null) throw error!;
+    if (sent != total) throw StateError('固件文件读取不完整');
+
+    emit('verifying');
+    await _raceSppOperation(spp.control('FINISH'), terminalError.future);
+    await waitFor(() => success, finishTimeout);
+    emit('success');
+  } catch (value) {
+    final ackTimedOut = value is SppAckTimeoutException;
+    if (ackTimedOut && spp?.connected == true) {
+      try {
+        await spp!.close();
+      } catch (_) {}
+    }
+    if (spp?.connected == true &&
+        !success &&
+        !remoteFailure &&
+        !ackTimedOut &&
+        (phase == 'receiving' || phase == 'verifying')) {
+      try {
+        await spp!.control('CANCEL');
+      } catch (_) {}
+    }
+    rethrow;
+  } finally {
+    await stateSubscription?.cancel();
+    await disconnectSubscription?.cancel();
+    await spp?.close();
+  }
+}
+
 /// Transfers a firmware image to a device that is already running its
 /// Updater over Classic Bluetooth SPP.
 ///
@@ -145,226 +394,24 @@ class SppRecoveryOta {
   final void Function(double)? onProgress;
   final void Function(String)? log;
 
-  String _phase = 'starting';
-  Map<String, dynamic>? _lastState;
-  Object? _error;
-  bool _success = false;
-
-  void _emit(String phase) {
-    _phase = phase;
-    log?.call('OTA phase=$phase');
-    onState?.call({'state': phase});
-  }
-
-  void _handleState(Map<String, dynamic> state) {
-    _lastState = state;
-    log?.call('OTA status=$state');
-    final name = state['state']?.toString();
-    if (name == 'error' || name == 'aborted') {
-      final code = state['code']?.toString() ?? 'unknown';
-      _error = StateError('${otaErrorLabel(code)} ($code)');
-    } else if (name == 'success' && _phase == 'verifying') {
-      _success = true;
-    }
-    onState?.call(state);
-  }
-
-  Future<void> _wait(bool Function() condition, Duration timeout) async {
-    final watch = Stopwatch()..start();
-    while (!condition()) {
-      if (_error != null) throw _error!;
-      if (watch.elapsed >= timeout) {
-        throw TimeoutException('OTA ${otaStateLabel(_phase)}超时', timeout);
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-    }
-    if (_error != null) throw _error!;
-  }
-
-  Future<SppOtaTransport> _connectSppWithRetry() async {
-    final watch = Stopwatch()..start();
-    Object? lastError;
-    StackTrace? lastStack;
-    var delay = sppRetryDelay;
-
-    while (true) {
-      final remaining = sppReconnectTimeout - watch.elapsed;
-      if (remaining <= Duration.zero) break;
-
-      log?.call(
-        'SPP rescue connect attempt; remaining=${remaining.inMilliseconds}ms',
-      );
-      Future<SppOtaTransport>? attempt;
-      try {
-        attempt = connectSpp();
-        return await attempt.timeout(remaining);
-      } catch (error, stack) {
-        lastError = error;
-        lastStack = stack;
-        log?.call('SPP rescue connect attempt failed: $error');
-        if (error is TimeoutException && attempt != null) {
-          unawaited(
-            attempt.then<void>((transport) async {
-              try {
-                await transport.close();
-              } catch (_) {}
-            }, onError: (_, _) {}),
-          );
-        }
-      }
-
-      final afterAttempt = sppReconnectTimeout - watch.elapsed;
-      if (afterAttempt <= Duration.zero) break;
-      final wait = delay < afterAttempt ? delay : afterAttempt;
-      if (wait > Duration.zero) await Future<void>.delayed(wait);
-      delay = Duration(milliseconds: min(delay.inMilliseconds * 2, 2000));
-    }
-
-    final error =
-        lastError ?? TimeoutException('SPP 连接超时', sppReconnectTimeout);
-    Error.throwWithStackTrace(error, lastStack ?? StackTrace.current);
-  }
-
   Future<void> run(Stream<List<int>> firmware, int total, String sha256) async {
-    if (total <= 0) throw ArgumentError('固件文件为空');
-    if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(sha256)) {
-      throw ArgumentError('SHA-256 格式无效');
-    }
-
-    final start = 'OTA_START $total $sha256';
-    SppOtaTransport? spp;
-    StreamSubscription<Map<String, dynamic>>? sppStates;
-    StreamSubscription<void>? sppDisconnect;
-    final terminalError = Completer<Object>();
-    final pendingAcks = <int>[];
-    var remoteFailure = false;
-
-    void fail(Object error) {
-      _error ??= error;
-      if (!terminalError.isCompleted) terminalError.complete(error);
-    }
-
-    void handleSppState(Map<String, dynamic> state) {
-      _handleState(state);
-      if (_error != null) {
-        remoteFailure = true;
-        fail(_error!);
-        return;
-      }
-      if (state['state'] == 'ack') {
-        final received = _jsonInt(state['received']);
-        final ackTotal = _jsonInt(state['total']);
-        if (received == null || ackTotal == null || ackTotal != total) {
-          remoteFailure = true;
-          fail(
-            StateError(
-              'Updater SPP ACK 字段无效：received=${state['received']} '
-              'total=${state['total']}，期待 total=$total',
-            ),
-          );
-          return;
-        }
-        pendingAcks.add(received);
-      }
-    }
-
-    try {
-      _lastState = null;
-      _error = null;
-      _success = false;
-      _emit('reconnecting');
-      spp = await _connectSppWithRetry();
-      sppStates = spp.states.listen(handleSppState);
-      sppDisconnect = spp.disconnected.listen((_) {
-        if (!_success) fail(StateError(otaErrorLabel('disconnected')));
-      });
-      await spp.ready.timeout(stateTimeout);
-
-      _lastState = null;
-      _emit('receiving');
-      await _raceSppOperation(spp.control(start), terminalError.future);
-      final receivingAckWatch = Stopwatch()..start();
-      while (_lastState?['state'] != 'receiving') {
-        if (_error != null) throw _error!;
-        if (!spp.connected) {
-          throw StateError(otaErrorLabel('disconnected'));
-        }
-        if (receivingAckWatch.elapsed >= startAckTimeout) {
-          log?.call(
-            'SPP did not report receiving; proceeding with ordered data stream',
-          );
-          break;
-        }
-        await _raceSppOperation(
-          Future<void>.delayed(const Duration(milliseconds: 20)),
-          terminalError.future,
-        );
-      }
-      if (_error != null) throw _error!;
-
-      var sent = 0;
-      onProgress?.call(0);
-      final payloadSize = min(spp.maxPayload, maxOtaSppPayload);
-      if (payloadSize <= 0) throw StateError('SPP 数据包大小无效');
-      await for (final payload in _fixedSppPayloads(firmware, payloadSize)) {
-        if (_error != null) throw _error!;
-        if (sent + payload.length > total) {
-          throw StateError('固件文件在传输时发生变化');
-        }
-        await _raceSppOperation(
-          spp.write(otaSppFrame(payload)),
-          terminalError.future,
-        );
-        sent += payload.length;
-        await _waitForSppAck(
-          pendingAcks: pendingAcks,
-          expectedReceived: sent,
-          timeout: ackTimeout,
-          terminalError: terminalError.future,
-        );
-        onProgress?.call(sent / total);
-        if (frameDelay > Duration.zero) {
-          await _raceSppOperation(
-            Future<void>.delayed(frameDelay),
-            terminalError.future,
-          );
-        }
-      }
-      if (_error != null) throw _error!;
-      if (sent != total) throw StateError('固件文件读取不完整');
-      log?.call('SPP rescue wrote $sent/$total payload bytes');
-
-      _emit('verifying');
-      if (_error != null) throw _error!;
-      await _raceSppOperation(spp.control('FINISH'), terminalError.future);
-      await _wait(() => _success, finishTimeout);
-      _emit('success');
-    } catch (error) {
-      final ackTimedOut = error is SppAckTimeoutException;
-      if (ackTimedOut && spp?.connected == true) {
-        log?.call(
-          'SPP ACK timeout at received=${error.expectedReceived}; '
-          'closing session so OTA can restart from the beginning',
-        );
-        try {
-          await spp!.close();
-        } catch (_) {}
-      }
-      if (spp?.connected == true &&
-          !_success &&
-          !remoteFailure &&
-          !ackTimedOut &&
-          (_phase == 'receiving' || _phase == 'verifying')) {
-        try {
-          await spp!.control('CANCEL');
-        } catch (_) {}
-      }
-      rethrow;
-    } finally {
-      await sppStates?.cancel();
-      await sppDisconnect?.cancel();
-      await spp?.close();
-    }
+    _validateOtaPayload(total, sha256);
+    return _runSppTransfer(
+      connectSpp: connectSpp,
+      firmware: firmware,
+      total: total,
+      sha256: sha256,
+      reconnectTimeout: sppReconnectTimeout,
+      retryDelay: sppRetryDelay,
+      stateTimeout: stateTimeout,
+      startAckTimeout: startAckTimeout,
+      ackTimeout: ackTimeout,
+      frameDelay: frameDelay,
+      finishTimeout: finishTimeout,
+      onState: onState,
+      onProgress: onProgress,
+      log: log,
+    );
   }
 }
 
@@ -411,244 +458,71 @@ class RecoveryOta {
   String _phase = 'starting';
   Map<String, dynamic>? _lastState;
   Object? _error;
-  bool _success = false;
 
   void _emit(String phase) {
     _phase = phase;
-    log?.call('OTA phase=$phase');
-    onState?.call({'state': phase});
+    _emitOtaPhase(phase, log: log, onState: onState);
   }
 
-  void _handleState(Map<String, dynamic> state, {required bool forward}) {
+  void _handleState(Map<String, dynamic> state) {
     _lastState = state;
     log?.call('OTA status=$state');
-    final name = state['state']?.toString();
-    if (name == 'error' || name == 'aborted') {
-      final code = state['code']?.toString() ?? 'unknown';
-      _error = StateError('${otaErrorLabel(code)} ($code)');
-    } else if (name == 'success' && _phase == 'verifying') {
-      _success = true;
-    }
-    if (forward) onState?.call(state);
-  }
-
-  Future<void> _wait(bool Function() condition, Duration timeout) async {
-    final watch = Stopwatch()..start();
-    while (!condition()) {
-      if (_error != null) throw _error!;
-      if (watch.elapsed >= timeout) {
-        throw TimeoutException('OTA ${otaStateLabel(_phase)}超时', timeout);
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-    }
-    if (_error != null) throw _error!;
-  }
-
-  Future<SppOtaTransport> _connectSppWithRetry() async {
-    final watch = Stopwatch()..start();
-    Object? lastError;
-    StackTrace? lastStack;
-    var delay = sppRetryDelay;
-
-    while (true) {
-      final remaining = sppReconnectTimeout - watch.elapsed;
-      if (remaining <= Duration.zero) break;
-
-      log?.call('SPP connect attempt; remaining=${remaining.inMilliseconds}ms');
-      Future<SppOtaTransport>? attempt;
-      try {
-        attempt = connectSpp();
-        return await attempt.timeout(remaining);
-      } catch (error, stack) {
-        lastError = error;
-        lastStack = stack;
-        log?.call('SPP connect attempt failed: $error');
-
-        // A timed-out native attempt may complete later. Do not leave a
-        // successful late connection alive when the retry loop has moved on.
-        if (error is TimeoutException && attempt != null) {
-          unawaited(
-            attempt.then<void>((transport) async {
-              try {
-                await transport.close();
-              } catch (_) {}
-            }, onError: (_, _) {}),
-          );
-        }
-      }
-
-      final afterAttempt = sppReconnectTimeout - watch.elapsed;
-      if (afterAttempt <= Duration.zero) break;
-      final wait = delay < afterAttempt ? delay : afterAttempt;
-      if (wait > Duration.zero) await Future<void>.delayed(wait);
-      final nextMilliseconds = min(delay.inMilliseconds * 2, 2000);
-      delay = Duration(milliseconds: nextMilliseconds);
-    }
-
-    final error =
-        lastError ?? TimeoutException('SPP 连接超时', sppReconnectTimeout);
-    Error.throwWithStackTrace(error, lastStack ?? StackTrace.current);
+    _error = _otaStateError(state);
   }
 
   Future<void> run(Stream<List<int>> firmware, int total, String sha256) async {
-    if (total <= 0) throw ArgumentError('固件文件为空');
-    if (!RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(sha256)) {
-      throw ArgumentError('SHA-256 格式无效');
-    }
+    _validateOtaPayload(total, sha256);
     final start = 'OTA_START $total $sha256';
     if (utf8.encode(start).length > mainTransport.maxControlPayload) {
       throw StateError('BLE MTU 不足以向 Main 发送完整 SHA-256，请重新连接');
     }
 
     var mainDisconnected = false;
-    final mainStates = mainTransport.states.listen(
-      (state) => _handleState(state, forward: false),
-    );
+    final mainStates = mainTransport.states.listen(_handleState);
     final mainConnections = mainTransport.connections.listen((connected) {
       if (!connected) {
         mainDisconnected = true;
         log?.call('Expected Main BLE disconnect for Updater reboot');
       }
     });
-    SppOtaTransport? spp;
-    StreamSubscription<Map<String, dynamic>>? sppStates;
-    StreamSubscription<void>? sppDisconnect;
-    final terminalError = Completer<Object>();
-    final pendingAcks = <int>[];
-    var remoteFailure = false;
-
-    void fail(Object error) {
-      _error ??= error;
-      if (!terminalError.isCompleted) terminalError.complete(error);
-    }
-
-    void handleSppState(Map<String, dynamic> state) {
-      _handleState(state, forward: true);
-      if (_error != null) {
-        remoteFailure = true;
-        fail(_error!);
-        return;
-      }
-      if (state['state'] == 'ack') {
-        final received = _jsonInt(state['received']);
-        final ackTotal = _jsonInt(state['total']);
-        if (received == null || ackTotal == null || ackTotal != total) {
-          remoteFailure = true;
-          fail(
-            StateError(
-              'Updater SPP ACK 字段无效：received=${state['received']} '
-              'total=${state['total']}，期待 total=$total',
-            ),
-          );
-          return;
-        }
-        pendingAcks.add(received);
-      }
-    }
-
     try {
       _emit('starting');
       await mainTransport.control(start);
-      await _wait(
-        () => _lastState?['state'] == 'receiving' || mainDisconnected,
-        stateTimeout,
+      await _waitForOtaState(
+        condition: () =>
+            _lastState?['state'] == 'receiving' || mainDisconnected,
+        timeout: stateTimeout,
+        phase: _phase,
+        error: () => _error,
       );
       _emit('switching');
-      await _wait(() => mainDisconnected, handoffTimeout);
+      await _waitForOtaState(
+        condition: () => mainDisconnected,
+        timeout: handoffTimeout,
+        phase: _phase,
+        error: () => _error,
+      );
       await mainStates.cancel();
       await mainConnections.cancel();
 
-      _lastState = null;
-      _error = null;
-      _emit('reconnecting');
-      spp = await _connectSppWithRetry();
-      sppStates = spp.states.listen(handleSppState);
-      sppDisconnect = spp.disconnected.listen((_) {
-        if (!_success) {
-          fail(StateError(otaErrorLabel('disconnected')));
-        }
-      });
-      await spp.ready.timeout(stateTimeout);
-
-      _lastState = null;
-      _emit('receiving');
-      await _raceSppOperation(spp.control(start), terminalError.future);
-      final receivingAckWatch = Stopwatch()..start();
-      while (_lastState?['state'] != 'receiving') {
-        if (_error != null) throw _error!;
-        if (!spp.connected) {
-          throw StateError(otaErrorLabel('disconnected'));
-        }
-        if (receivingAckWatch.elapsed >= startAckTimeout) {
-          log?.call(
-            'SPP did not report receiving; proceeding with ordered data stream',
-          );
-          break;
-        }
-        await _raceSppOperation(
-          Future<void>.delayed(const Duration(milliseconds: 20)),
-          terminalError.future,
-        );
-      }
-      if (_error != null) throw _error!;
-
-      var sent = 0;
-      onProgress?.call(0);
-      final payloadSize = min(spp.maxPayload, maxOtaSppPayload);
-      if (payloadSize <= 0) throw StateError('SPP 数据包大小无效');
-      await for (final payload in _fixedSppPayloads(firmware, payloadSize)) {
-        if (_error != null) throw _error!;
-        if (sent + payload.length > total) {
-          throw StateError('固件文件在传输时发生变化');
-        }
-        await _raceSppOperation(
-          spp.write(otaSppFrame(payload)),
-          terminalError.future,
-        );
-        sent += payload.length;
-        await _waitForSppAck(
-          pendingAcks: pendingAcks,
-          expectedReceived: sent,
-          timeout: ackTimeout,
-          terminalError: terminalError.future,
-        );
-        onProgress?.call(sent / total);
-        if (frameDelay > Duration.zero) {
-          await _raceSppOperation(
-            Future<void>.delayed(frameDelay),
-            terminalError.future,
-          );
-        }
-      }
-      if (_error != null) throw _error!;
-      if (sent != total) throw StateError('固件文件读取不完整');
-      log?.call('SPP wrote $sent/$total payload bytes');
-
-      _emit('verifying');
-      if (_error != null) throw _error!;
-      await _raceSppOperation(spp.control('FINISH'), terminalError.future);
-      await _wait(() => _success, finishTimeout);
-      _emit('success');
+      await _runSppTransfer(
+        connectSpp: connectSpp,
+        firmware: firmware,
+        total: total,
+        sha256: sha256,
+        reconnectTimeout: sppReconnectTimeout,
+        retryDelay: sppRetryDelay,
+        stateTimeout: stateTimeout,
+        startAckTimeout: startAckTimeout,
+        ackTimeout: ackTimeout,
+        frameDelay: frameDelay,
+        finishTimeout: finishTimeout,
+        onState: onState,
+        onProgress: onProgress,
+        log: log,
+      );
     } catch (error) {
-      final ackTimedOut = error is SppAckTimeoutException;
-      if (ackTimedOut && spp?.connected == true) {
-        log?.call(
-          'SPP ACK timeout at received=${error.expectedReceived}; '
-          'closing session so OTA can restart from the beginning',
-        );
-        try {
-          await spp!.close();
-        } catch (_) {}
-      }
-      if (spp?.connected == true &&
-          !_success &&
-          !remoteFailure &&
-          !ackTimedOut &&
-          (_phase == 'receiving' || _phase == 'verifying')) {
-        try {
-          await spp!.control('CANCEL');
-        } catch (_) {}
-      } else if (!mainDisconnected && mainTransport.connected) {
+      if (!mainDisconnected && mainTransport.connected) {
         try {
           await mainTransport.control('CANCEL');
         } catch (_) {}
@@ -657,9 +531,6 @@ class RecoveryOta {
     } finally {
       await mainStates.cancel();
       await mainConnections.cancel();
-      await sppStates?.cancel();
-      await sppDisconnect?.cancel();
-      await spp?.close();
     }
   }
 }

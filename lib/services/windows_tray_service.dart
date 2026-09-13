@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:path/path.dart' as p;
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -17,23 +18,44 @@ class WindowsTrayService with WindowListener, TrayListener {
     if (!isSupported || _initialized) return;
 
     await windowManager.ensureInitialized();
-    await windowManager.setPreventClose(true);
-    windowManager.addListener(this);
+    try {
+      final executableDirectory = File(Platform.resolvedExecutable).parent.path;
+      final packagedIcon = p.join(
+        executableDirectory,
+        'data',
+        'flutter_assets',
+        'assets',
+        'tray_icon.ico',
+      );
+      final developmentIcon = p.join(Directory.current.path, 'assets', 'tray_icon.ico');
+      final iconPath = await File(packagedIcon).exists()
+          ? packagedIcon
+          : developmentIcon;
+      if (!await File(iconPath).exists()) {
+        throw StateError('找不到系统托盘图标：$iconPath');
+      }
 
-    await trayManager.setIcon('assets/tray_icon.ico');
-    await trayManager.setToolTip('LBJ Console');
-    await trayManager.setContextMenu(
-      Menu(
-        items: [
-          MenuItem(key: 'show', label: '显示主窗口'),
-          MenuItem.separator(),
-          MenuItem(key: 'exit', label: '退出'),
-        ],
-      ),
-    );
-    trayManager.addListener(this);
-
-    _initialized = true;
+      await trayManager.setIcon(iconPath);
+      await trayManager.setToolTip('LBJ Console');
+      await trayManager.setContextMenu(
+        Menu(
+          items: [
+            MenuItem(key: 'show', label: '显示主窗口'),
+            MenuItem.separator(),
+            MenuItem(key: 'exit', label: '退出'),
+          ],
+        ),
+      );
+      await windowManager.setPreventClose(true);
+      windowManager.addListener(this);
+      trayManager.addListener(this);
+      _initialized = true;
+    } catch (_) {
+      await windowManager.setPreventClose(false);
+      windowManager.removeListener(this);
+      trayManager.removeListener(this);
+      rethrow;
+    }
   }
 
   Future<void> showMainWindow() async {

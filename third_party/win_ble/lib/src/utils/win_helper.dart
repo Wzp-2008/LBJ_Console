@@ -1,12 +1,12 @@
 /// This class is used to store the device map and subscription map
 /// and some other helper methods
 class WinHelper {
-  static Map deviceMap = {};
-  static Map<String, Map<String, String>> subscriptions = {};
+  static final Map<String, String> deviceMap = {};
+  static final Map<String, Map<String, String>> subscriptions = {};
   static bool showLog = false;
 
   /// enableLog in [initialize] method
-  static void printLog(log) {
+  static void printLog(Object? log) {
     // ignore: avoid_print
     if (showLog) print(log);
   }
@@ -17,36 +17,19 @@ class WinHelper {
       uuid.replaceAll("{", "").replaceAll("}", "");
 
   static String getDeviceFromAddress(String address) {
-    if (deviceMap[address] == null) {
-      throw "Device not found !";
-    } else {
-      return deviceMap[address];
-    }
+    return deviceMap[address] ??
+        (throw StateError('Device not found: $address'));
   }
 
   static String? getAddressFromDevice(String device) {
-    String? address;
-    deviceMap.forEach((key, value) {
-      if (value == device) {
-        address = key;
-      }
-    });
-    return address;
+    for (final entry in deviceMap.entries) {
+      if (entry.value == device) return entry.key;
+    }
+    return null;
   }
 
-  static Map<String, String>? getDataFromSubscriptionKey(subscriptionKey) {
-    try {
-      Map<String, String> data = {};
-      if (subscriptions.isEmpty) return null;
-      subscriptions.forEach((key, value) {
-        if (key == subscriptionKey) {
-          data = value;
-        }
-      });
-      return data.isEmpty ? null : data;
-    } catch (e) {
-      printLog("Error in _getSubscriptionKey :  $e");
-      return null;
-    }
+  static Map<String, String>? getDataFromSubscriptionKey(
+      String subscriptionKey) {
+    return subscriptions[subscriptionKey];
   }
 }

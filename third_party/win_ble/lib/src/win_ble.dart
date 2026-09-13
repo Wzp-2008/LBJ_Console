@@ -51,7 +51,7 @@ class WinBle {
     _channel.dispose();
   }
 
-  static void _handleMessages(message) {
+  static void _handleMessages(dynamic message) {
     WinHelper.printLog("Received Message : $message");
     switch (message["_type"]) {
       /// ScanResult events
@@ -148,27 +148,23 @@ class WinBle {
   /// true if connected
   /// false if disconnected
   static Future<void> connect(String address) async {
-    try {
-      var result = await _channel.invokeMethod("connect", args: {
-        "address": address.replaceAll(":", ""),
-      });
-      WinHelper.deviceMap[address] = result;
-      // we have to perform an operation on device in order to make a connection
-      var services = await discoverServices(address, forceRefresh: true);
-      // A temporary way of detecting connection : if services are empty then connection is failed
-      bool connectionFailed = services.isEmpty;
-      _connectionStreamController.add({
-        "device": address,
-        "connected": !connectionFailed,
-      });
-    } catch (e) {
-      rethrow;
-    }
+    final result = await _channel.invokeMethod("connect", args: {
+      "address": address.replaceAll(":", ""),
+    });
+    WinHelper.deviceMap[address] = result;
+    // we have to perform an operation on device in order to make a connection
+    final services = await discoverServices(address, forceRefresh: true);
+    // A temporary way of detecting connection : if services are empty then connection is failed
+    final connectionFailed = services.isEmpty;
+    _connectionStreamController.add({
+      "device": address,
+      "connected": !connectionFailed,
+    });
   }
 
   /// [disconnect] will update a Stream of boolean [getConnectionStream]
   /// and also ignore if that device is already disconnected
-  static Future<void> disconnect(address) async {
+  static Future<void> disconnect(String address) async {
     try {
       await _channel.invokeMethod("disconnect", args: {
         "device": WinHelper.getDeviceFromAddress(address),
@@ -177,7 +173,7 @@ class WinBle {
         "device": address,
         "connected": false,
       });
-      WinHelper.deviceMap[address] = null;
+      WinHelper.deviceMap.remove(address);
     } catch (e) {
       if (e.toString().contains("not found")) {
         // ignore for now
@@ -189,14 +185,10 @@ class WinBle {
 
   /// [canPair] will return a boolean
   static Future<bool> canPair(String address) async {
-    try {
-      var result = await _channel.invokeMethod("canPair", args: {
-        "device": WinHelper.getDeviceFromAddress(address),
-      });
-      return result != null && result;
-    } catch (e) {
-      rethrow;
-    }
+    final result = await _channel.invokeMethod("canPair", args: {
+      "device": WinHelper.getDeviceFromAddress(address),
+    });
+    return result != null && result;
   }
 
   /// [isPaired] will return a boolean
@@ -205,51 +197,39 @@ class WinBle {
     String address, {
     bool forceRefresh = false,
   }) async {
-    try {
-      var result = await _channel.invokeMethod("isPaired", args: {
-        "device": forceRefresh
-            ? address.replaceAll(":", "")
-            : WinHelper.getDeviceFromAddress(address),
-        "forceRefresh": forceRefresh,
-      });
-      return result != null && result;
-    } catch (e) {
-      rethrow;
-    }
+    final result = await _channel.invokeMethod("isPaired", args: {
+      "device": forceRefresh
+          ? address.replaceAll(":", "")
+          : WinHelper.getDeviceFromAddress(address),
+      "forceRefresh": forceRefresh,
+    });
+    return result != null && result;
   }
 
   /// [pair] will send a pairing command
   /// it will be completed on Successful Pairing
   /// or it will throw Error on Unsuccessful Pairing
   static Future<void> pair(String address) async {
-    try {
-      var result = await _channel.invokeMethod("pair", args: {
-        "device": WinHelper.getDeviceFromAddress(address),
-      });
-      if (result == null || result != "Paired") {
-        throw result;
-      }
-    } catch (e) {
-      rethrow;
+    final result = await _channel.invokeMethod("pair", args: {
+      "device": WinHelper.getDeviceFromAddress(address),
+    });
+    if (result == null || result != "Paired") {
+      throw result;
     }
   }
 
   /// [unPair] will try to Un-pair
   static Future<void> unPair(String address) async {
-    try {
-      var result = await _channel.invokeMethod("unPair", args: {
-        "device": WinHelper.getDeviceFromAddress(address),
-      });
-      if (result == null || result != "Unpaired") {
-        throw result;
-      }
-    } catch (e) {
-      rethrow;
+    final result = await _channel.invokeMethod("unPair", args: {
+      "device": WinHelper.getDeviceFromAddress(address),
+    });
+    if (result == null || result != "Unpaired") {
+      throw result;
     }
   }
 
   /// [discoverServices] will return a list of services List
-  static Future<List<String>> discoverServices(address,
+  static Future<List<String>> discoverServices(String address,
       {bool forceRefresh = false}) async {
     List? services = await _channel.invokeMethod("services", args: {
       "device": WinHelper.getDeviceFromAddress(address),
@@ -272,7 +252,7 @@ class WinBle {
         data.map((e) => BleCharacteristic.fromJson(e)));
   }
 
-  /// [read] will read characteristic value and returns a List<int>
+  /// [read] will read characteristic value and returns a `List<int>`.
   static Future<List<int>> read(
       {required String address,
       required String serviceId,

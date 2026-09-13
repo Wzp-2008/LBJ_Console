@@ -61,10 +61,6 @@ class DisplayGroupCache {
       ON $groupsTable(isUngroupable, latestReceivedTimestamp DESC)
     ''');
     await db.execute('''
-      CREATE INDEX IF NOT EXISTS idx_mdg_latest
-      ON $groupsTable(latestReceivedTimestamp DESC)
-    ''');
-    await db.execute('''
       CREATE INDEX IF NOT EXISTS idx_mdg_cursor
       ON $groupsTable(latestReceivedTimestamp DESC, groupId ASC)
     ''');
@@ -87,9 +83,56 @@ class DisplayGroupCache {
   }
 
   static Future<bool> isEmpty(DatabaseExecutor db) async {
-    final row =
-        await db.rawQuery('SELECT 1 FROM $groupsTable LIMIT 1');
+    final row = await db.rawQuery('SELECT 1 FROM $groupsTable LIMIT 1');
     return row.isEmpty;
+  }
+
+  /// Returns true when the cache is incomplete or its denormalized counts no
+  /// longer agree with the source records.  Checking only whether the cache
+  /// is empty misses interrupted writes and orphaned members.
+  static Future<bool> needsRebuild(
+    DatabaseExecutor db, {
+    required String recordsTable,
+  }) async {
+    final orphanMember = await db.rawQuery('''
+      SELECT 1 FROM $membersTable m
+      LEFT JOIN $recordsTable r ON r.uniqueId = m.uniqueId
+      WHERE r.uniqueId IS NULL LIMIT 1
+    ''');
+    if (orphanMember.isNotEmpty) return true;
+
+    final orphanGroup = await db.rawQuery('''
+      SELECT 1 FROM $groupsTable g
+      LEFT JOIN $recordsTable r ON r.uniqueId = g.representativeUniqueId
+      WHERE r.uniqueId IS NULL LIMIT 1
+    ''');
+    if (orphanGroup.isNotEmpty) return true;
+
+    final counts = await db.rawQuery('''
+      SELECT
+        (SELECT COUNT(*) FROM $recordsTable WHERE isTimeOnly = 0) AS records_count,
+        (SELECT COUNT(*) FROM $membersTable) AS members_count,
+        (SELECT COUNT(*) FROM $groupsTable) AS groups_count
+    ''');
+    final count = counts.single;
+    final recordCount = (count['records_count'] as num).toInt();
+    final memberCount = (count['members_count'] as num).toInt();
+    final groupCount = (count['groups_count'] as num).toInt();
+    if (recordCount != memberCount ||
+        (recordCount > 0 && groupCount == 0) ||
+        (recordCount == 0 && groupCount != 0)) {
+      return true;
+    }
+
+    final badGroup = await db.rawQuery('''
+      SELECT g.groupId
+      FROM $groupsTable g
+      LEFT JOIN $membersTable m ON m.groupId = g.groupId
+      GROUP BY g.groupId, g.memberCount
+      HAVING COUNT(m.uniqueId) != g.memberCount
+      LIMIT 1
+    ''');
+    return badGroup.isNotEmpty;
   }
 
   // ---------------------------------------------------------------------
@@ -102,12 +145,8 @@ class DisplayGroupCache {
     Database db, {
     required String recordsTable,
   }) async {
-    final rows = await db.query(
-      recordsTable,
-      where: 'isTimeOnly = 0',
-    );
-    final plainRows =
-        rows.map((r) => Map<String, dynamic>.from(r)).toList();
+    final rows = await db.query(recordsTable, where: 'isTimeOnly = 0');
+    final plainRows = rows.map((r) => Map<String, dynamic>.from(r)).toList();
 
     final payload = plainRows.length > isolateRebuildThreshold
         ? await compute(buildDisplayGroupsPayload, plainRows)
@@ -142,24 +181,19 @@ class DisplayGroupCache {
 
   static void _addGroupToBatch(Batch batch, Map<String, dynamic> group) {
     final groupId = group['groupId'] as String;
-    batch.insert(
-      groupsTable,
-      {
-        'groupId': groupId,
-        'latestReceivedTimestamp': group['latestReceivedTimestamp'],
-        'memberCount': group['memberCount'],
-        'representativeUniqueId': group['representativeUniqueId'],
-        'summaryJson': group['summaryJson'],
-        'isUngroupable': group['isUngroupable'],
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    batch.insert(groupsTable, {
+      'groupId': groupId,
+      'latestReceivedTimestamp': group['latestReceivedTimestamp'],
+      'memberCount': group['memberCount'],
+      'representativeUniqueId': group['representativeUniqueId'],
+      'summaryJson': group['summaryJson'],
+      'isUngroupable': group['isUngroupable'],
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
     for (final id in group['memberIds'] as List) {
-      batch.insert(
-        membersTable,
-        {'uniqueId': id, 'groupId': groupId},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+      batch.insert(membersTable, {
+        'uniqueId': id,
+        'groupId': groupId,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
     }
   }
 
@@ -169,7 +203,7 @@ class DisplayGroupCache {
 
   /// Incrementally folds a newly inserted record into the cache.
   static Future<void> applyNewRecord(
-    Database db, {
+    DatabaseExecutor db, {
     required String recordsTable,
     required TrainRecord record,
   }) async {
@@ -180,149 +214,127 @@ class DisplayGroupCache {
     final trainKey = record.trainKey;
     final locoKey = record.locoKey;
 
-    await db.transaction((txn) async {
-      var candidateIds = <String>[];
-      if (trainKey != null || locoKey != null) {
-        final keyClauses = <String>[];
-        final keyArgs = <dynamic>[];
-        if (trainKey != null) {
-          keyClauses.add('r.trainKey = ?');
-          keyArgs.add(trainKey);
-        }
-        if (locoKey != null) {
-          keyClauses.add('r.locoKey = ?');
-          keyArgs.add(locoKey);
-        }
-        final rows = await txn.rawQuery(
-          '''
-          SELECT DISTINCT g.groupId, g.latestReceivedTimestamp
-          FROM $recordsTable r
-          INNER JOIN $membersTable m ON m.uniqueId = r.uniqueId
-          INNER JOIN $groupsTable g ON g.groupId = m.groupId
-          WHERE (${keyClauses.join(' OR ')})
-            AND g.latestReceivedTimestamp >= ?
-          ''',
-          [...keyArgs, ts - windowMs],
-        );
-        candidateIds = rows
-            .where((row) {
-              final latest =
-                  (row['latestReceivedTimestamp'] as num).toInt();
-              // The record must sit inside the window of the group too
-              // (guards against late / out-of-order arrivals).
-              return ts >= latest - windowMs;
-            })
-            .map((row) => row['groupId'].toString())
-            .toList();
+    var candidateIds = <String>[];
+    if (trainKey != null || locoKey != null) {
+      final keyClauses = <String>[];
+      final keyArgs = <dynamic>[];
+      if (trainKey != null) {
+        keyClauses.add('r.trainKey = ?');
+        keyArgs.add(trainKey);
       }
-
-      if (candidateIds.isEmpty) {
-        await _insertSingleGroup(txn, record);
-        return;
+      if (locoKey != null) {
+        keyClauses.add('r.locoKey = ?');
+        keyArgs.add(locoKey);
       }
-
-      // Preserve the surviving groupId so the card identity (groupKey) stays
-      // stable when an out-of-order (older) record folds into the group. The
-      // lexicographically smallest candidate groupId equals the oldest
-      // member's uniqueId, which is what a full rebuild would also pick — so
-      // incremental and rebuild paths agree in the common (in-order) case,
-      // and the incremental path is additionally stable on late arrivals.
-      final survivor = candidateIds.reduce(
-        (a, b) => a.compareTo(b) < 0 ? a : b,
-      );
-
-      final placeholders = List.filled(candidateIds.length, '?').join(',');
-      final memberRows = await txn.rawQuery(
+      final rows = await db.rawQuery(
         '''
+        SELECT DISTINCT g.groupId
+        FROM $recordsTable r
+        INNER JOIN $membersTable m ON m.uniqueId = r.uniqueId
+        INNER JOIN $groupsTable g ON g.groupId = m.groupId
+        WHERE (${keyClauses.join(' OR ')})
+          AND r.receivedTimestamp BETWEEN ? AND ?
+        ''',
+        [...keyArgs, ts - windowMs, ts + windowMs],
+      );
+      candidateIds = rows.map((row) => row['groupId'].toString()).toList();
+    }
+
+    if (candidateIds.isEmpty) {
+      await _insertSingleGroup(db, record);
+      return;
+    }
+
+    // Preserve the surviving groupId so the card identity (groupKey) stays
+    // stable when an out-of-order (older) record folds into the group. The
+    // lexicographically smallest candidate groupId equals the oldest
+    // member's uniqueId, which is what a full rebuild would also pick — so
+    // incremental and rebuild paths agree in the common (in-order) case,
+    // and the incremental path is additionally stable on late arrivals.
+    final survivor = candidateIds.reduce((a, b) => a.compareTo(b) < 0 ? a : b);
+
+    final placeholders = List.filled(candidateIds.length, '?').join(',');
+    final memberRows = await db.rawQuery('''
         SELECT r.* FROM $membersTable m
         INNER JOIN $recordsTable r ON r.uniqueId = m.uniqueId
         WHERE m.groupId IN ($placeholders)
-        ''',
-        candidateIds,
-      );
-      final members = <String, TrainRecord>{
-        for (final row in memberRows)
-          row['uniqueId'].toString(): TrainRecord.fromDatabaseJson(row),
-        record.uniqueId: record,
-      };
+        ''', candidateIds);
+    final members = <String, TrainRecord>{
+      for (final row in memberRows)
+        row['uniqueId'].toString(): TrainRecord.fromDatabaseJson(row),
+      record.uniqueId: record,
+    };
 
-      await txn.delete(
-        groupsTable,
-        where: 'groupId IN ($placeholders)',
-        whereArgs: candidateIds,
-      );
-      await txn.delete(
-        membersTable,
-        where: 'groupId IN ($placeholders)',
-        whereArgs: candidateIds,
-      );
+    await db.delete(
+      groupsTable,
+      where: 'groupId IN ($placeholders)',
+      whereArgs: candidateIds,
+    );
+    await db.delete(
+      membersTable,
+      where: 'groupId IN ($placeholders)',
+      whereArgs: candidateIds,
+    );
 
-      await _insertGroup(
-        txn,
-        members.values.toList(),
-        preserveGroupId: survivor,
-      );
-    });
+    await _insertGroup(db, members.values.toList(), preserveGroupId: survivor);
   }
 
   /// Incrementally removes deleted records from the cache; affected groups
   /// are recomputed from their remaining members.
   static Future<void> removeRecords(
-    Database db, {
+    DatabaseExecutor db, {
     required String recordsTable,
     required List<String> uniqueIds,
   }) async {
     if (uniqueIds.isEmpty) return;
 
-    await db.transaction((txn) async {
-      final placeholders = List.filled(uniqueIds.length, '?').join(',');
-      final groupRows = await txn.rawQuery(
+    final groupIds = <String>{};
+    for (final chunk in chunks(uniqueIds)) {
+      final placeholders = List.filled(chunk.length, '?').join(',');
+      final groupRows = await db.rawQuery(
         'SELECT DISTINCT groupId FROM $membersTable WHERE uniqueId IN ($placeholders)',
-        uniqueIds,
+        chunk,
       );
-      if (groupRows.isEmpty) return;
-      final groupIds =
-          groupRows.map((row) => row['groupId'].toString()).toList();
+      groupIds.addAll(groupRows.map((row) => row['groupId'].toString()));
+    }
+    if (groupIds.isEmpty) return;
 
-      await txn.delete(
+    for (final chunk in chunks(uniqueIds)) {
+      await db.delete(
         membersTable,
-        where: 'uniqueId IN ($placeholders)',
-        whereArgs: uniqueIds,
+        where: 'uniqueId IN (${List.filled(chunk.length, '?').join(',')})',
+        whereArgs: chunk,
       );
+    }
 
-      final groupPlaceholders = List.filled(groupIds.length, '?').join(',');
-      final memberRows = await txn.rawQuery(
-        '''
+    final groupIdList = groupIds.toList();
+    final groupPlaceholders = List.filled(groupIdList.length, '?').join(',');
+    final memberRows = await db.rawQuery('''
         SELECT m.groupId AS member_group_id, r.* FROM $membersTable m
         INNER JOIN $recordsTable r ON r.uniqueId = m.uniqueId
         WHERE m.groupId IN ($groupPlaceholders)
-        ''',
-        groupIds,
-      );
-      final membersByGroup = <String, List<TrainRecord>>{};
-      for (final row in memberRows) {
-        membersByGroup
-            .putIfAbsent(row['member_group_id'].toString(), () => [])
-            .add(TrainRecord.fromDatabaseJson(row));
-      }
+        ''', groupIdList);
+    final remaining = memberRows
+        .map(TrainRecord.fromDatabaseJson)
+        .toList(growable: false);
 
-      await txn.delete(
+    for (final chunk in chunks(groupIdList)) {
+      await db.delete(
         groupsTable,
-        where: 'groupId IN ($groupPlaceholders)',
-        whereArgs: groupIds,
+        where: 'groupId IN (${List.filled(chunk.length, '?').join(',')})',
+        whereArgs: chunk,
       );
+    }
 
-      for (final entry in membersByGroup.entries) {
-        if (entry.value.isEmpty) continue;
-        // Preserve the existing groupId so a delete never changes a
-        // surviving card's identity.
-        await _insertGroup(
-          txn,
-          entry.value,
-          preserveGroupId: entry.key,
-        );
-      }
-    });
+    if (remaining.isNotEmpty) {
+      await _insertGroup(
+        db,
+        remaining,
+        preserveGroupId: groupIdList.reduce(
+          (a, b) => a.compareTo(b) < 0 ? a : b,
+        ),
+      );
+    }
   }
 
   static Future<void> clear(DatabaseExecutor db) async {
@@ -334,25 +346,7 @@ class DisplayGroupCache {
     DatabaseExecutor db,
     TrainRecord record,
   ) async {
-    await db.insert(
-      groupsTable,
-      {
-        'groupId': record.uniqueId,
-        'latestReceivedTimestamp':
-            record.receivedTimestamp.millisecondsSinceEpoch,
-        'memberCount': 1,
-        'representativeUniqueId': record.uniqueId,
-        'summaryJson': '',
-        'isUngroupable':
-            (record.trainKey == null && record.locoKey == null) ? 1 : 0,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
-    await db.insert(
-      membersTable,
-      {'uniqueId': record.uniqueId, 'groupId': record.uniqueId},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await _insertPayload(db, _buildGroupPayload([record]));
   }
 
   static Future<void> _insertGroup(
@@ -361,38 +355,25 @@ class DisplayGroupCache {
     String? preserveGroupId,
   }) async {
     if (members.isEmpty) return;
-    if (members.length == 1) {
-      await _insertSingleGroup(db, members.first);
-      return;
-    }
-    final sorted = List<TrainRecord>.from(members)
-      ..sort((a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp));
-    final latest = sorted.first;
-    // Preserve an existing groupId when given (stable identity across folds
-    // and shrinks); otherwise derive from the oldest member (full rebuild),
-    // which keeps it stable as the group grows and collision-free against
-    // singles.
-    final groupId = preserveGroupId ?? sorted.last.uniqueId;
-    final summary = MergeService.buildSummaryRecord(sorted);
-    await db.insert(
-      groupsTable,
-      {
-        'groupId': groupId,
-        'latestReceivedTimestamp':
-            latest.receivedTimestamp.millisecondsSinceEpoch,
-        'memberCount': sorted.length,
-        'representativeUniqueId': latest.uniqueId,
-        'summaryJson': jsonEncode(summary.toTransferJson()),
-        'isUngroupable': 0,
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
+    await _insertPayload(
+      db,
+      _buildGroupPayload(members, groupId: preserveGroupId),
     );
-    for (final member in sorted) {
-      await db.insert(
-        membersTable,
-        {'uniqueId': member.uniqueId, 'groupId': groupId},
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+  }
+
+  static Future<void> _insertPayload(
+    DatabaseExecutor db,
+    Map<String, dynamic> group,
+  ) async {
+    final batch = db.batch();
+    _addGroupToBatch(batch, group);
+    await batch.commit(noResult: true);
+  }
+
+  static Iterable<List<T>> chunks<T>(List<T> values, [int size = 900]) sync* {
+    for (var start = 0; start < values.length; start += size) {
+      final end = (start + size < values.length) ? start + size : values.length;
+      yield values.sublist(start, end);
     }
   }
 
@@ -422,8 +403,7 @@ class DisplayGroupCache {
       );
       args.addAll([cursor.timestamp, cursor.timestamp, cursor.id]);
     }
-    final whereSql =
-        where.isEmpty ? '' : 'WHERE ${where.join(' AND ')}';
+    final whereSql = where.isEmpty ? '' : 'WHERE ${where.join(' AND ')}';
     final rows = await db.rawQuery(
       '''
       SELECT
@@ -507,8 +487,7 @@ class DisplayGroupCache {
     final groupJoin = hideUngroupable
         ? 'INNER JOIN $groupsTable g ON g.groupId = gm.groupId AND g.isUngroupable = 0'
         : '';
-    final result = await db.rawQuery(
-      '''
+    final result = await db.rawQuery('''
       WITH matched AS (
         SELECT r.uniqueId
         FROM $recordsTable r
@@ -518,9 +497,7 @@ class DisplayGroupCache {
       FROM $membersTable gm
       $groupJoin
       INNER JOIN matched m ON m.uniqueId = gm.uniqueId
-      ''',
-      searchWhereArgs,
-    );
+      ''', searchWhereArgs);
     return (result.first['cnt'] as num?)?.toInt() ?? 0;
   }
 
@@ -561,15 +538,12 @@ class DisplayGroupCache {
         .whereType<String>()
         .toList();
     final placeholders = List.filled(groupIds.length, '?').join(',');
-    final memberRows = await db.rawQuery(
-      '''
+    final memberRows = await db.rawQuery('''
       SELECT groupId, GROUP_CONCAT(uniqueId, '$_idSep') AS member_ids
       FROM $membersTable
       WHERE groupId IN ($placeholders)
       GROUP BY groupId
-      ''',
-      groupIds,
-    );
+      ''', groupIds);
     final membersByGroup = {
       for (final row in memberRows)
         row['groupId']?.toString(): row['member_ids']?.toString(),
@@ -597,8 +571,9 @@ class DisplayGroupCache {
             groupKey: groupId,
             latestRecord: record,
             summaryRecord: summary,
-            memberUniqueIds:
-                memberIds.isNotEmpty ? memberIds : [record.uniqueId],
+            memberUniqueIds: memberIds.isNotEmpty
+                ? memberIds
+                : [record.uniqueId],
           ),
         );
       } else {
@@ -637,9 +612,7 @@ class _MutableGroup {
 /// internally. Pure function — safe to call from an isolate. Shared by the
 /// full rebuild path ([buildDisplayGroupsPayload]) and the JSON import path
 /// ([prepareImportPayload]) so the two never diverge in grouping semantics.
-List<Map<String, dynamic>> groupRecordsIntoPayload(
-  List<TrainRecord> records,
-) {
+List<Map<String, dynamic>> groupRecordsIntoPayload(List<TrainRecord> records) {
   final windowMs = DisplayGroupCache.mergeWindow.inMilliseconds;
   final sorted = List<TrainRecord>.from(records)
     ..sort((a, b) => a.receivedTimestamp.compareTo(b.receivedTimestamp));
@@ -695,43 +668,36 @@ List<Map<String, dynamic>> groupRecordsIntoPayload(
 
   final payload = <Map<String, dynamic>>[];
 
-  Map<String, dynamic> singlePayload(TrainRecord record) {
-    return {
-      'groupId': record.uniqueId,
-      'latestReceivedTimestamp':
-          record.receivedTimestamp.millisecondsSinceEpoch,
-      'memberCount': 1,
-      'representativeUniqueId': record.uniqueId,
-      'summaryJson': '',
-      'isUngroupable':
-          (record.trainKey == null && record.locoKey == null) ? 1 : 0,
-      'memberIds': [record.uniqueId],
-    };
-  }
-
   for (final group in groups) {
     if (group.redirect != null || group.members.isEmpty) continue;
-    if (group.members.length == 1) {
-      payload.add(singlePayload(group.members.first));
-      continue;
-    }
-    final sortedMembers = List<TrainRecord>.from(group.members)
-      ..sort((a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp));
-    final latest = sortedMembers.first;
-    final oldest = sortedMembers.last;
-    final summary = MergeService.buildSummaryRecord(sortedMembers);
-    payload.add({
-      'groupId': oldest.uniqueId,
-      'latestReceivedTimestamp':
-          latest.receivedTimestamp.millisecondsSinceEpoch,
-      'memberCount': sortedMembers.length,
-      'representativeUniqueId': latest.uniqueId,
-      'summaryJson': jsonEncode(summary.toTransferJson()),
-      'isUngroupable': 0,
-      'memberIds': sortedMembers.map((r) => r.uniqueId).toList(),
-    });
+    payload.add(_buildGroupPayload(group.members));
   }
   return payload;
+}
+
+Map<String, dynamic> _buildGroupPayload(
+  List<TrainRecord> members, {
+  String? groupId,
+}) {
+  final sorted = List<TrainRecord>.from(members)
+    ..sort((a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp));
+  final latest = sorted.first;
+  final resolvedGroupId = groupId ?? sorted.last.uniqueId;
+  final isUngroupable =
+      sorted.length == 1 &&
+      sorted.first.trainKey == null &&
+      sorted.first.locoKey == null;
+  return {
+    'groupId': resolvedGroupId,
+    'latestReceivedTimestamp': latest.receivedTimestamp.millisecondsSinceEpoch,
+    'memberCount': sorted.length,
+    'representativeUniqueId': latest.uniqueId,
+    'summaryJson': sorted.length == 1
+        ? ''
+        : jsonEncode(MergeService.buildSummaryRecord(sorted).toTransferJson()),
+    'isUngroupable': isUngroupable ? 1 : 0,
+    'memberIds': sorted.map((record) => record.uniqueId).toList(),
+  };
 }
 
 /// Top-level entry for [compute] used by the full rebuild: builds the group
@@ -752,7 +718,9 @@ List<Map<String, dynamic>> buildDisplayGroupsPayload(
 /// - `groups`: `List<Map<String, dynamic>>` merge payload for
 ///   [DisplayGroupCache.applyPayload] (time-only records are stored but not
 ///   grouped, matching [DisplayGroupCache.rebuild]'s `WHERE isTimeOnly = 0`).
-Map<String, dynamic> prepareImportPayload(List<Map<String, dynamic>> rawRecords) {
+Map<String, dynamic> prepareImportPayload(
+  List<Map<String, dynamic>> rawRecords,
+) {
   final rows = <Map<String, dynamic>>[];
   final groupable = <TrainRecord>[];
   for (final raw in rawRecords) {

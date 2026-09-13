@@ -73,6 +73,7 @@ class ClassicSppChannelHandler private constructor(
                 candidate.connect()
                 if (generation.get() != token) {
                     candidate.close()
+                    completeError(result, "SPP_CONNECT_CANCELLED", "Classic SPP 连接已被新的请求取消")
                     return@execute
                 }
                 socket = candidate
@@ -83,6 +84,8 @@ class ClassicSppChannelHandler private constructor(
                 if (generation.get() == token) {
                     if (socket === candidate) socket = null
                     completeError(result, "SPP_CONNECT_FAILED", readableError(error))
+                } else {
+                    completeError(result, "SPP_CONNECT_CANCELLED", "Classic SPP 连接已被新的请求取消")
                 }
             }
         }

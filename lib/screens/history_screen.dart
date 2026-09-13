@@ -32,6 +32,7 @@ class HistoryScreenState extends State<HistoryScreen> {
   static const double _scrollThreshold = 200.0;
   static const int _searchDebounceMs = 300;
   static const int _minVisibleItems = 15;
+
   /// Cap on how many sub-records an expanded merged card renders. Details
   /// load newest-first (getRecordsByUniqueIds orders by receivedTimestamp
   /// DESC), so this keeps the most recent [_maxExpandedSubRecords] members
@@ -54,6 +55,7 @@ class HistoryScreenState extends State<HistoryScreen> {
   final Set<String> _selectedRecords = {};
   final Map<String, bool> _expandedStates = {};
   final Map<String, bool> _mergedDetailsLoading = {};
+
   /// groupKeys whose last [_loadMergedDetails] attempt threw. Caps the
   /// build-triggered self-heal in [_buildMergedRecordCard] to a single
   /// attempt per need-state so a persistently-failing DB query cannot
@@ -124,8 +126,9 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   void _setupSettingsListener() {
-    _settingsSubscription =
-        DatabaseService.instance.onSettingsChanged((settings) {
+    _settingsSubscription = DatabaseService.instance.onSettingsChanged((
+      settings,
+    ) {
       if (!mounted) return;
       final signature = _displaySettingsSignatureFrom(settings);
       if (signature == _displaySettingsSignature) return;
@@ -135,8 +138,9 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   void _setupRecordDeleteListener() {
-    _recordDeleteSubscription =
-        DatabaseService.instance.onRecordDeleted((deletedIds) {
+    _recordDeleteSubscription = DatabaseService.instance.onRecordDeleted((
+      deletedIds,
+    ) {
       if (!mounted) return;
       for (final id in deletedIds) {
         _selectedRecords.remove(id);
@@ -189,25 +193,28 @@ class HistoryScreenState extends State<HistoryScreen> {
   void _onSearchChanged(String value) {
     _searchDebounce?.cancel();
     final trimmed = value.trim();
-    _searchDebounce = Timer(const Duration(milliseconds: _searchDebounceMs), () async {
-      if (!mounted) return;
-      if (_searchQuery != trimmed) {
-        final retainFocus = trimmed.isEmpty && _searchFocusNode.hasFocus;
-        _searchQuery = trimmed;
-        if (trimmed.isNotEmpty) {
-          await _loadFirstPage(keepStaleResults: true);
-        } else {
-          await _loadFirstPage(keepStaleResults: false);
+    _searchDebounce = Timer(
+      const Duration(milliseconds: _searchDebounceMs),
+      () async {
+        if (!mounted) return;
+        if (_searchQuery != trimmed) {
+          final retainFocus = trimmed.isEmpty && _searchFocusNode.hasFocus;
+          _searchQuery = trimmed;
+          if (trimmed.isNotEmpty) {
+            await _loadFirstPage(keepStaleResults: true);
+          } else {
+            await _loadFirstPage(keepStaleResults: false);
+          }
+          if (retainFocus && mounted) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && !_searchFocusNode.hasFocus) {
+                _searchFocusNode.requestFocus();
+              }
+            });
+          }
         }
-        if (retainFocus && mounted) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && !_searchFocusNode.hasFocus) {
-              _searchFocusNode.requestFocus();
-            }
-          });
-        }
-      }
-    });
+      },
+    );
   }
 
   Future<void> _loadFirstPage({bool keepStaleResults = false}) async {
@@ -216,10 +223,14 @@ class HistoryScreenState extends State<HistoryScreen> {
     final query = _searchQuery;
 
     if (keepStaleResults) {
-      _currentOffset = 0;
-      _searchTotalCount = null;
-      _hasMoreRecords = true;
-      _isSearchRefreshing = true;
+      setState(() {
+        _isLoadingMore = false;
+        _currentOffset = 0;
+        _displayCursor = null;
+        _searchTotalCount = null;
+        _hasMoreRecords = true;
+        _isSearchRefreshing = true;
+      });
       _searchRefreshingNotifier.value = true;
     } else {
       setState(() {
@@ -257,12 +268,16 @@ class HistoryScreenState extends State<HistoryScreen> {
           limit: _batchSize,
           offset: 0,
         );
-        if (!mounted || generation != _searchGeneration || query != _searchQuery) {
+        if (!mounted ||
+            generation != _searchGeneration ||
+            query != _searchQuery) {
           return;
         }
 
         final total = await RecordsFeed.countSearch(query);
-        if (!mounted || generation != _searchGeneration || query != _searchQuery) {
+        if (!mounted ||
+            generation != _searchGeneration ||
+            query != _searchQuery) {
           return;
         }
 
@@ -339,7 +354,6 @@ class HistoryScreenState extends State<HistoryScreen> {
           _displayItems.addAll(fresh);
           _currentOffset += page.length;
           _hasMoreRecords = _computeHasMore(lastBatchSize: page.length);
-          _isLoadingMore = false;
         });
         _searchLoadedCountNotifier.value = _currentOffset;
         _ensureEnoughContent();
@@ -365,11 +379,14 @@ class HistoryScreenState extends State<HistoryScreen> {
         _displayItems.addAll(fresh);
         _displayCursor = result.nextCursor;
         _hasMoreRecords = result.nextCursor != null;
-        _isLoadingMore = false;
       });
       _ensureEnoughContent();
     } catch (e) {
-      if (mounted) {
+      if (mounted && generation == _searchGeneration) {
+        developer.log('加载记录分页失败：$e', name: 'HistoryScreen');
+      }
+    } finally {
+      if (mounted && generation == _searchGeneration) {
         setState(() => _isLoadingMore = false);
       }
     }
@@ -390,12 +407,9 @@ class HistoryScreenState extends State<HistoryScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
       final position = _scrollController.position;
-      final searchNeedsMore = _searchQuery.isNotEmpty &&
-          _searchTotalCount != null &&
-          _currentOffset < _searchTotalCount!;
-      final needsMore = position.maxScrollExtent <= 0 ||
-          _displayItems.length < _minVisibleItems ||
-          (searchNeedsMore && _displayItems.length < _searchTotalCount!);
+      final needsMore =
+          position.maxScrollExtent <= 0 ||
+          _displayItems.length < _minVisibleItems;
       if (needsMore) {
         _loadNextPage();
       }
@@ -427,8 +441,9 @@ class HistoryScreenState extends State<HistoryScreen> {
       if (item == null || !mounted || _searchQuery.isNotEmpty) return;
 
       final wasAtTop = _isAtTop;
-      final savedOffset =
-          _scrollController.hasClients ? _scrollController.offset : 0.0;
+      final savedOffset = _scrollController.hasClients
+          ? _scrollController.offset
+          : 0.0;
 
       setState(() {
         // Prepend the up-to-date display item. The keyset cursor is
@@ -456,7 +471,6 @@ class HistoryScreenState extends State<HistoryScreen> {
     }
   }
 
-
   static int _getCrossAxisCount(double width) {
     // Responsive grid: min 1 column, max 5, adapting to screen width.
     if (width >= 1600) return 5;
@@ -468,8 +482,7 @@ class HistoryScreenState extends State<HistoryScreen> {
 
   /// Test accessor for [_getCrossAxisCount].
   @visibleForTesting
-  static int crossAxisCountForWidth(double width) =>
-      _getCrossAxisCount(width);
+  static int crossAxisCountForWidth(double width) => _getCrossAxisCount(width);
 
   double _getMapHeight() {
     final width = MediaQuery.of(context).size.width;
@@ -479,17 +492,15 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Key _displayItemKey(Object item) {
-    if (item is TrainRecord) return ValueKey('t:${item.uniqueId}');
-    if (item is MergedTrainRecord) return ValueKey('m:${item.groupKey}');
-    return ValueKey(item.hashCode);
+    return ValueKey(_displayItemIdentity(item));
   }
 
   Widget _buildCardForItem(Object item) {
     final card = item is MergedTrainRecord
         ? _buildMergedRecordCard(item)
         : item is TrainRecord
-            ? _buildRecordCard(item, key: ValueKey(item.uniqueId))
-            : const SizedBox.shrink();
+        ? _buildRecordCard(item, key: ValueKey(item.uniqueId))
+        : const SizedBox.shrink();
     return RepaintBoundary(child: card);
   }
 
@@ -498,7 +509,8 @@ class HistoryScreenState extends State<HistoryScreen> {
       padding: EdgeInsets.symmetric(vertical: 16),
       child: Center(
         child: SizedBox(
-          width: 24, height: 24,
+          width: 24,
+          height: 24,
           child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blue),
         ),
       ),
@@ -536,10 +548,18 @@ class HistoryScreenState extends State<HistoryScreen> {
                 decoration: InputDecoration(
                   hintText: '搜索车次/机车...',
                   hintStyle: const TextStyle(color: Colors.grey, fontSize: 14),
-                  prefixIcon: const Icon(Icons.search, color: Colors.grey, size: 20),
+                  prefixIcon: const Icon(
+                    Icons.search,
+                    color: Colors.grey,
+                    size: 20,
+                  ),
                   suffixIcon: _searchController.text.isNotEmpty
                       ? IconButton(
-                          icon: const Icon(Icons.clear, color: Colors.grey, size: 20),
+                          icon: const Icon(
+                            Icons.clear,
+                            color: Colors.grey,
+                            size: 20,
+                          ),
                           onPressed: () {
                             _searchController.clear();
                             _searchFocusNode.unfocus();
@@ -549,7 +569,10 @@ class HistoryScreenState extends State<HistoryScreen> {
                       : null,
                   filled: true,
                   fillColor: const Color(0xFF1E1E1E),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(8),
                     borderSide: BorderSide.none,
@@ -574,14 +597,20 @@ class HistoryScreenState extends State<HistoryScreen> {
                     Expanded(
                       child: Text(
                         resultText,
-                        style: const TextStyle(color: Colors.grey, fontSize: 12),
+                        style: const TextStyle(
+                          color: Colors.grey,
+                          fontSize: 12,
+                        ),
                       ),
                     ),
                     if (isRefreshing)
                       const SizedBox(
                         width: 12,
                         height: 12,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.blue),
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: Colors.blue,
+                        ),
                       ),
                   ],
                 ),
@@ -637,17 +666,19 @@ class HistoryScreenState extends State<HistoryScreen> {
         // invisible slot that still reserves the column's width — used to keep
         // column alignment across the two overlayed rows below.
         Widget slot(int col, Object item, {bool visible = true}) => Expanded(
-              child: Padding(
-                padding: EdgeInsets.only(
-                    left: col > 0 ? 4.0 : 0, right: col < cols - 1 ? 4.0 : 0),
-                child: visible
-                    ? KeyedSubtree(
-                        key: _displayItemKey(item),
-                        child: _buildCardForItem(item),
-                      )
-                    : const SizedBox.shrink(),
-              ),
-            );
+          child: Padding(
+            padding: EdgeInsets.only(
+              left: col > 0 ? 4.0 : 0,
+              right: col < cols - 1 ? 4.0 : 0,
+            ),
+            child: visible
+                ? KeyedSubtree(
+                    key: _displayItemKey(item),
+                    child: _buildCardForItem(item),
+                  )
+                : const SizedBox.shrink(),
+          ),
+        );
 
         // Detect whether any card in this row is expanded.
         var hasExpanded = false;
@@ -721,10 +752,7 @@ class HistoryScreenState extends State<HistoryScreen> {
           );
         }
 
-        return Padding(
-          padding: const EdgeInsets.only(bottom: 8.0),
-          child: row,
-        );
+        return Padding(padding: const EdgeInsets.only(bottom: 8.0), child: row);
       },
     );
   }
@@ -743,28 +771,38 @@ class HistoryScreenState extends State<HistoryScreen> {
       return const Center(child: CircularProgressIndicator());
     }
     if (!_isInitialLoading && _displayItems.isEmpty) {
-      return Column(children: [
-        _buildSearchBar(),
-        Expanded(
-          child: Center(
-            child: _isSearchRefreshing
-                ? const CircularProgressIndicator(color: Colors.blue)
-                : const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(Icons.history, size: 64, color: Colors.grey),
-                    SizedBox(height: 16),
-                    Text('暂无记录', style: TextStyle(color: Colors.white, fontSize: 18))
-                  ]),
+      return Column(
+        children: [
+          _buildSearchBar(),
+          Expanded(
+            child: Center(
+              child: _isSearchRefreshing
+                  ? const CircularProgressIndicator(color: Colors.blue)
+                  : const Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.history, size: 64, color: Colors.grey),
+                        SizedBox(height: 16),
+                        Text(
+                          '暂无记录',
+                          style: TextStyle(color: Colors.white, fontSize: 18),
+                        ),
+                      ],
+                    ),
+            ),
           ),
-        ),
-      ]);
+        ],
+      );
     }
     final screenWidth = MediaQuery.of(context).size.width;
     final crossAxisCount = _getCrossAxisCount(screenWidth);
 
-    return Column(children: [
-      _buildSearchBar(),
-      Expanded(child: _buildRecordList(crossAxisCount)),
-    ]);
+    return Column(
+      children: [
+        _buildSearchBar(),
+        Expanded(child: _buildRecordList(crossAxisCount)),
+      ],
+    );
   }
 
   Future<void> _loadMergedDetails(MergedTrainRecord merged) async {
@@ -801,8 +839,9 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Widget _buildMergedRecordCard(MergedTrainRecord mergedRecord) {
-    final bool isSelected = mergedRecord.memberUniqueIds
-        .any((id) => _selectedRecords.contains(id));
+    final bool isSelected = mergedRecord.memberUniqueIds.any(
+      (id) => _selectedRecords.contains(id),
+    );
     final isExpanded = _expandedStates[mergedRecord.groupKey] ?? false;
     // Self-heal an already-expanded merged card whose instance was swapped
     // for a fresh one. This happens when a new record merges INTO the
@@ -845,87 +884,91 @@ class HistoryScreenState extends State<HistoryScreen> {
       });
     }
     final displayRecord = mergedRecord.summaryRecord;
-    return Card(
-        key: ValueKey(mergedRecord.groupKey),
-        color: isSelected && _isEditMode
-            ? const Color(0xFF2E2E2E)
-            : const Color(0xFF1E1E1E),
-        elevation: 1,
-        margin: const EdgeInsets.only(bottom: 8.0),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8.0),
-            side: BorderSide(
-                color: isSelected && _isEditMode
-                    ? Colors.blue
-                    : Colors.transparent,
-                width: 2.0)),
-        child: InkWell(
-            borderRadius: BorderRadius.circular(8.0),
-            onTap: () {
-              if (_isEditMode) {
-                setState(() {
-                  final allIdsInGroup = mergedRecord.memberUniqueIds.toSet();
-                  if (isSelected) {
-                    _selectedRecords.removeAll(allIdsInGroup);
-                  } else {
-                    _selectedRecords.addAll(allIdsInGroup);
-                  }
-                  widget.onSelectionChanged();
-                });
-              } else {
-                if (isExpanded) {
-                  final mapId = mergedRecord.memberUniqueIds.join('_');
-                  setState(() {
-                    _expandedStates[mergedRecord.groupKey] = false;
-                    _mapOptimalZoom.remove(mapId);
-                    _mapCalculating.remove(mapId);
-                  });
-                } else {
-                  setState(() {
-                    _expandedStates[mergedRecord.groupKey] = true;
-                    _mergedDetailsLoadFailed.remove(mergedRecord.groupKey);
-                  });
-                  _loadMergedDetails(mergedRecord);
-                }
-              }
-            },
-            onLongPress: () {
-              if (!_isEditMode) {
-                setEditMode(true);
-              }
-              setState(() {
-                _selectedRecords.addAll(mergedRecord.memberUniqueIds);
-                widget.onSelectionChanged();
-              });
-            },
-            child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: isExpanded
-                        ? MainAxisAlignment.start
-                        : MainAxisAlignment.spaceBetween,
-                    children: [
-                      _buildRecordHeader(displayRecord, isMerged: true),
-                      if (mergedRecord.recordCount > 1)
-                        Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(
-                            '共 ${mergedRecord.recordCount} 条 · 点击展开',
-                            style: const TextStyle(
-                              color: Colors.grey,
-                              fontSize: 11,
-                            ),
-                          ),
-                        ),
-                      _buildPositionAndSpeed(displayRecord),
-                      _buildLocoInfo(displayRecord),
-                      if (isExpanded) _buildMergedExpandedContent(mergedRecord)
-                    ]))));
+    return _buildSelectableCard(
+      key: ValueKey(mergedRecord.groupKey),
+      isSelected: isSelected,
+      onTap: () {
+        if (_isEditMode) {
+          setState(() {
+            final allIdsInGroup = mergedRecord.memberUniqueIds.toSet();
+            if (isSelected) {
+              _selectedRecords.removeAll(allIdsInGroup);
+            } else {
+              _selectedRecords.addAll(allIdsInGroup);
+            }
+            widget.onSelectionChanged();
+          });
+        } else if (isExpanded) {
+          final mapId = mergedRecord.memberUniqueIds.join('_');
+          setState(() {
+            _expandedStates[mergedRecord.groupKey] = false;
+            _mapOptimalZoom.remove(mapId);
+            _mapCalculating.remove(mapId);
+          });
+        } else {
+          setState(() {
+            _expandedStates[mergedRecord.groupKey] = true;
+            _mergedDetailsLoadFailed.remove(mergedRecord.groupKey);
+          });
+          _loadMergedDetails(mergedRecord);
+        }
+      },
+      onLongPress: () {
+        if (!_isEditMode) setEditMode(true);
+        setState(() {
+          _selectedRecords.addAll(mergedRecord.memberUniqueIds);
+          widget.onSelectionChanged();
+        });
+      },
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: isExpanded
+              ? MainAxisAlignment.start
+              : MainAxisAlignment.spaceBetween,
+          children: [
+            _buildRecordHeader(displayRecord, isMerged: true),
+            if (mergedRecord.recordCount > 1)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  '共 ${mergedRecord.recordCount} 条 · 点击展开',
+                  style: const TextStyle(color: Colors.grey, fontSize: 11),
+                ),
+              ),
+            _buildPositionAndSpeed(displayRecord),
+            _buildLocoInfo(displayRecord),
+            if (isExpanded) _buildMergedExpandedContent(mergedRecord),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _buildMergedExpandedContent(MergedTrainRecord mergedRecord) {
     final loading = _mergedDetailsLoading[mergedRecord.groupKey] ?? false;
+    final failed = _mergedDetailsLoadFailed.contains(mergedRecord.groupKey);
+    if (failed && !mergedRecord.hasLoadedDetails) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text('明细加载失败', style: TextStyle(color: Colors.white70)),
+            TextButton(
+              onPressed: () {
+                setState(
+                  () => _mergedDetailsLoadFailed.remove(mergedRecord.groupKey),
+                );
+                _loadMergedDetails(mergedRecord);
+              },
+              child: const Text('重试'),
+            ),
+          ],
+        ),
+      );
+    }
     if (loading ||
         (!mergedRecord.hasLoadedDetails && mergedRecord.recordCount > 1)) {
       return const Padding(
@@ -934,7 +977,10 @@ class HistoryScreenState extends State<HistoryScreen> {
           child: SizedBox(
             width: 24,
             height: 24,
-            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blue),
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.blue,
+            ),
           ),
         ),
       );
@@ -953,8 +999,9 @@ class HistoryScreenState extends State<HistoryScreen> {
       children: [
         _buildExpandedMapForAll(details, mergedRecord.groupKey),
         const Divider(color: Colors.white24, height: 24),
-        ...shownDetails.map((record) =>
-            _buildSubRecordItem(record, mergedRecord.latestRecord)),
+        ...shownDetails.map(
+          (record) => _buildSubRecordItem(record, mergedRecord.latestRecord),
+        ),
         if (truncated)
           Padding(
             padding: const EdgeInsets.only(top: 8.0),
@@ -987,8 +1034,10 @@ class HistoryScreenState extends State<HistoryScreen> {
               if (differingInfo.isNotEmpty)
                 Text(
                   differingInfo,
-                  style:
-                      const TextStyle(color: Color(0xFF81D4FA), fontSize: 12),
+                  style: const TextStyle(
+                    color: Color(0xFF81D4FA),
+                    fontSize: 12,
+                  ),
                 ),
             ],
           ),
@@ -1023,8 +1072,9 @@ class HistoryScreenState extends State<HistoryScreen> {
     final latestLoco = latest.loco.trim();
 
     final trainDiff = train.isNotEmpty && train != latestTrain ? train : "";
-    final locoDiff =
-        loco.isNotEmpty && loco != latestLoco ? _formatLocoInfo(record) : "";
+    final locoDiff = loco.isNotEmpty && loco != latestLoco
+        ? _formatLocoInfo(record)
+        : "";
 
     if (trainDiff.isNotEmpty && locoDiff.isNotEmpty) {
       return "$trainDiff $locoDiff";
@@ -1041,8 +1091,9 @@ class HistoryScreenState extends State<HistoryScreen> {
     if (record.route.isNotEmpty && record.route != "<NUL>") {
       parts.add(record.route);
     }
-    if (record.direction != 0) {
-      parts.add(record.direction == 1 ? "下" : "上");
+    final directionBadge = record.directionBadge;
+    if (directionBadge != null) {
+      parts.add(directionBadge);
     }
     if (record.position.isNotEmpty && record.position != "<NUL>") {
       final position = record.position;
@@ -1054,33 +1105,36 @@ class HistoryScreenState extends State<HistoryScreen> {
     return parts.join(' ');
   }
 
-  Widget _buildExpandedMapForAll(List<TrainRecord> records, String groupKey) {
-    final positions = records
-        .map((record) => _parsePosition(record.positionInfo))
-        .whereType<LatLng>()
-        .toList();
-    if (positions.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
-    final mapId = records.map((r) => r.uniqueId).join('_');
-    final bounds = LatLngBounds.fromPoints(positions);
-
+  Widget _buildMapSection({
+    required List<LatLng> positions,
+    required LatLng center,
+    required String mapId,
+    required String mapKey,
+    required double height,
+    required double containerWidth,
+    required bool multiMarker,
+  }) {
     if (!_mapOptimalZoom.containsKey(mapId) &&
         !(_mapCalculating[mapId] ?? false)) {
       _mapCalculating[mapId] = true;
 
-      _calculateOptimalZoomAsync(positions,
-              containerWidth: MediaQuery.of(context).size.width / _getCrossAxisCount(MediaQuery.of(context).size.width) - 40,
-              containerHeight: _getMapHeight())
+      _calculateOptimalZoomAsync(
+            positions,
+            containerWidth: containerWidth,
+            containerHeight: height,
+          )
           .then((optimalZoom) {
-        if (mounted) {
-          setState(() {
-            _mapOptimalZoom[mapId] = optimalZoom;
-            _mapCalculating[mapId] = false;
+            if (mounted) {
+              setState(() {
+                _mapOptimalZoom[mapId] = optimalZoom;
+                _mapCalculating[mapId] = false;
+              });
+            }
+          })
+          .catchError((error, stack) {
+            developer.log('计算合并地图缩放级别失败：$error', name: 'HistoryScreen');
+            _mapCalculating.remove(mapId);
           });
-        }
-      });
     }
 
     if (!_mapOptimalZoom.containsKey(mapId)) {
@@ -1102,53 +1156,58 @@ class HistoryScreenState extends State<HistoryScreen> {
 
     final zoomLevel = _mapOptimalZoom[mapId]!;
 
-    return Column(children: [
-      const SizedBox(height: 8),
-      Container(
-          height: _getMapHeight(),
+    return Column(
+      children: [
+        const SizedBox(height: 8),
+        Container(
+          height: height,
           margin: const EdgeInsets.symmetric(vertical: 4),
           decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8), color: Colors.grey[900]),
-          child: _DelayedMultiMarkerMap(
-            key: ValueKey('multi_map_${mapId}_$zoomLevel'),
+            borderRadius: BorderRadius.circular(8),
+            color: Colors.grey[900],
+          ),
+          child: _DelayedMap(
+            key: ValueKey(
+              '${multiMarker ? 'multi_map' : 'map'}_${mapId}_$zoomLevel',
+            ),
             positions: positions,
-            center: bounds.center,
+            center: center,
             zoom: zoomLevel,
-            groupKey: groupKey,
+            mapKey: mapKey,
+            multiMarker: multiMarker,
             currentUserLocation: _currentUserLocation,
-          ))
-    ]);
+          ),
+        ),
+      ],
+    );
   }
 
   Future<void> _requestLocationPermission() async {
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      return;
-    }
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) return;
 
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.deniedForever ||
+          permission == LocationPermission.denied) {
+        return;
+      }
 
-    if (permission == LocationPermission.deniedForever) {
-      return;
+      if (mounted) {
+        setState(() => _isLocationPermissionGranted = true);
+      }
+      await _getCurrentLocation();
+    } catch (e, stack) {
+      developer.log('请求定位权限失败：$e', name: 'HistoryScreen', stackTrace: stack);
     }
-
-    if (mounted) {
-      setState(() {
-        _isLocationPermissionGranted = true;
-      });
-    }
-
-    _getCurrentLocation();
   }
 
   Future<void> _getCurrentLocation() async {
     try {
-      final locationSettings = AndroidSettings(
+      const locationSettings = LocationSettings(
         accuracy: LocationAccuracy.high,
-        forceLocationManager: true,
       );
       Position position = await Geolocator.getCurrentPosition(
         locationSettings: locationSettings,
@@ -1159,7 +1218,9 @@ class HistoryScreenState extends State<HistoryScreen> {
           _currentUserLocation = LatLng(position.latitude, position.longitude);
         });
       }
-    } catch (e) {}
+    } catch (e, stack) {
+      developer.log('获取当前位置失败：$e', name: 'HistoryScreen', stackTrace: stack);
+    }
   }
 
   void _startLocationUpdates() {
@@ -1172,66 +1233,104 @@ class HistoryScreenState extends State<HistoryScreen> {
     });
   }
 
-  Widget _buildRecordCard(TrainRecord record,
-      {bool isSubCard = false, Key? key}) {
+  Widget _buildSelectableCard({
+    Key? key,
+    required bool isSelected,
+    required VoidCallback onTap,
+    required VoidCallback onLongPress,
+    required Widget child,
+  }) {
+    return Card(
+      key: key,
+      color: isSelected && _isEditMode
+          ? const Color(0xFF2E2E2E)
+          : const Color(0xFF1E1E1E),
+      elevation: 1,
+      margin: const EdgeInsets.only(bottom: 8.0),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8.0),
+        side: BorderSide(
+          color: isSelected && _isEditMode ? Colors.blue : Colors.transparent,
+          width: 2.0,
+        ),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8.0),
+        onTap: onTap,
+        onLongPress: onLongPress,
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildExpandedMapForAll(List<TrainRecord> records, String groupKey) {
+    final positions = records
+        .map((record) => _parsePosition(record.positionInfo))
+        .whereType<LatLng>()
+        .toList();
+    if (positions.isEmpty) return const SizedBox.shrink();
+
+    final mapId = records.map((r) => r.uniqueId).join('_');
+    final bounds = LatLngBounds.fromPoints(positions);
+    final width = MediaQuery.of(context).size.width;
+    return _buildMapSection(
+      positions: positions,
+      center: bounds.center,
+      mapId: mapId,
+      mapKey: MapStateService.instance.getMergedRecordMapKey(groupKey),
+      height: _getMapHeight(),
+      containerWidth: width / _getCrossAxisCount(width) - 40,
+      multiMarker: true,
+    );
+  }
+
+  Widget _buildRecordCard(TrainRecord record, {Key? key}) {
     final isSelected = _selectedRecords.contains(record.uniqueId);
     final isExpanded = _expandedStates[record.uniqueId] ?? false;
 
-    return Card(
-        key: key,
-        color: isSelected && _isEditMode
-            ? const Color(0xFF2E2E2E)
-            : const Color(0xFF1E1E1E),
-        elevation: isSubCard ? 0 : 1,
-        margin: EdgeInsets.only(bottom: isSubCard ? 4.0 : 8.0),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8.0),
-            side: BorderSide(
-                color: isSelected && _isEditMode
-                    ? Colors.blue
-                    : Colors.transparent,
-                width: 2.0)),
-        child: InkWell(
-            borderRadius: BorderRadius.circular(8.0),
-            onTap: () {
-              if (_isEditMode) {
-                setState(() {
-                  if (isSelected) {
-                    _selectedRecords.remove(record.uniqueId);
-                  } else {
-                    _selectedRecords.add(record.uniqueId);
-                  }
-                  widget.onSelectionChanged();
-                });
-              } else {
-                setState(() {
-                  _expandedStates[record.uniqueId] =
-                      !(_expandedStates[record.uniqueId] ?? false);
-                });
-              }
-            },
-            onLongPress: () {
-              if (!_isEditMode) {
-                setEditMode(true);
-              }
-              setState(() {
-                _selectedRecords.add(record.uniqueId);
-                widget.onSelectionChanged();
-              });
-            },
-            child: Padding(
-                padding: const EdgeInsets.all(16.0),
-                child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisAlignment: isExpanded
-                        ? MainAxisAlignment.start
-                        : MainAxisAlignment.spaceBetween,
-                    children: [
-                      _buildRecordHeader(record),
-                      _buildPositionAndSpeed(record),
-                      _buildLocoInfo(record),
-                      if (isExpanded) _buildExpandedContent(record),
-                    ]))));
+    return _buildSelectableCard(
+      key: key,
+      isSelected: isSelected,
+      onTap: () {
+        if (_isEditMode) {
+          setState(() {
+            if (isSelected) {
+              _selectedRecords.remove(record.uniqueId);
+            } else {
+              _selectedRecords.add(record.uniqueId);
+            }
+            widget.onSelectionChanged();
+          });
+        } else {
+          setState(() {
+            _expandedStates[record.uniqueId] =
+                !(_expandedStates[record.uniqueId] ?? false);
+          });
+        }
+      },
+      onLongPress: () {
+        if (!_isEditMode) setEditMode(true);
+        setState(() {
+          _selectedRecords.add(record.uniqueId);
+          widget.onSelectionChanged();
+        });
+      },
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: isExpanded
+              ? MainAxisAlignment.start
+              : MainAxisAlignment.spaceBetween,
+          children: [
+            _buildRecordHeader(record),
+            _buildPositionAndSpeed(record),
+            _buildLocoInfo(record),
+            if (isExpanded) _buildExpandedContent(record),
+          ],
+        ),
+      ),
+    );
   }
 
   Widget _buildRecordHeader(TrainRecord record, {bool isMerged = false}) {
@@ -1240,77 +1339,103 @@ class HistoryScreenState extends State<HistoryScreen> {
 
     if (record.fullTrainNumber.isEmpty && formattedLocoInfo.isEmpty) {
       return Text(
-          (record.time == "<NUL>" || record.time.isEmpty)
-              ? record.receivedTimestamp.toString().split(".")[0]
-              : record.time.split("\n")[0],
-          style: const TextStyle(fontSize: 11, color: Colors.grey),
-          overflow: TextOverflow.ellipsis);
+        (record.time == "<NUL>" || record.time.isEmpty)
+            ? record.receivedTimestamp.toString().split(".")[0]
+            : record.time.split("\n")[0],
+        style: const TextStyle(fontSize: 11, color: Colors.grey),
+        overflow: TextOverflow.ellipsis,
+      );
     }
 
     final hasTrainNumber = record.fullTrainNumber.isNotEmpty;
-    final hasDirection = record.direction == 1 || record.direction == 3;
+    final hasDirection = record.hasDirectionValue;
     final hasLocoInfo =
         formattedLocoInfo.isNotEmpty && formattedLocoInfo != "<NUL>";
     final shouldShowTrainRow = hasTrainNumber || hasDirection || hasLocoInfo;
 
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-        Flexible(
-            child: Text(
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Flexible(
+              child: Text(
                 (record.time == "<NUL>" || record.time.isEmpty)
                     ? record.receivedTimestamp.toString().split(".")[0]
                     : record.time.split("\n")[0],
                 style: const TextStyle(fontSize: 11, color: Colors.grey),
-                overflow: TextOverflow.ellipsis)),
-        if (trainType.isNotEmpty)
-          Flexible(
-              child: Text(trainType,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            if (trainType.isNotEmpty)
+              Flexible(
+                child: Text(
+                  trainType,
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
-                  overflow: TextOverflow.ellipsis))
-      ]),
-      if (shouldShowTrainRow) ...[
-        const SizedBox(height: 2),
-        Row(
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+          ],
+        ),
+        if (shouldShowTrainRow) ...[
+          const SizedBox(height: 2),
+          Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               Flexible(
-                  child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
                     if (hasTrainNumber)
                       Flexible(
-                          child: Text(record.fullTrainNumber,
-                              style: const TextStyle(
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.white),
-                              overflow: TextOverflow.ellipsis)),
+                        child: Text(
+                          record.fullTrainNumber,
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
                     if (hasTrainNumber && hasDirection)
                       const SizedBox(width: 6),
                     if (hasDirection)
                       Container(
-                          width: 20,
-                          height: 20,
-                          decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(2)),
-                          child: Center(
-                              child: Text(record.direction == 1 ? "下" : "上",
-                                  style: const TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.bold,
-                                      color: Colors.black))))
-                  ])),
+                        width: 20,
+                        height: 20,
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                        child: Center(
+                          child: Text(
+                            record.directionBadge!,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.black,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
               if (hasLocoInfo)
-                Text(formattedLocoInfo,
-                    style:
-                        const TextStyle(fontSize: 14, color: Colors.white70)),
-            ]),
-        const SizedBox(height: 2)
-      ]
-    ]);
+                Text(
+                  formattedLocoInfo,
+                  style: const TextStyle(fontSize: 14, color: Colors.white70),
+                ),
+            ],
+          ),
+          const SizedBox(height: 2),
+        ],
+      ],
+    );
   }
 
   Widget _buildLocoInfo(TrainRecord record) {
@@ -1318,120 +1443,103 @@ class HistoryScreenState extends State<HistoryScreen> {
     if (locoInfo == null || locoInfo.isEmpty) {
       return const SizedBox.shrink();
     }
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      const SizedBox(height: 4),
-      Text(locoInfo,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 4),
+        Text(
+          locoInfo,
           style: const TextStyle(fontSize: 14, color: Colors.white),
           maxLines: 1,
-          overflow: TextOverflow.ellipsis)
-    ]);
+          overflow: TextOverflow.ellipsis,
+        ),
+      ],
+    );
   }
 
   Widget _buildPositionAndSpeed(TrainRecord record) {
     final routeStr = record.route.trim();
     final position = record.position.trim();
     final speed = record.speed.trim();
-    final isValidRoute = routeStr.isNotEmpty &&
+    final isValidRoute =
+        routeStr.isNotEmpty &&
         !routeStr.runes.every((r) => r == '*'.runes.first);
-    final isValidPosition = position.isNotEmpty &&
-        !position.runes
-            .every((r) => r == '-'.runes.first || r == '.'.runes.first) &&
+    final isValidPosition =
+        position.isNotEmpty &&
+        !position.runes.every(
+          (r) => r == '-'.runes.first || r == '.'.runes.first,
+        ) &&
         position != "<NUL>";
-    final isValidSpeed = speed.isNotEmpty &&
-        !speed.runes
-            .every((r) => r == '*'.runes.first || r == '-'.runes.first) &&
+    final isValidSpeed =
+        speed.isNotEmpty &&
+        !speed.runes.every(
+          (r) => r == '*'.runes.first || r == '-'.runes.first,
+        ) &&
         speed != "NUL" &&
         speed != "<NUL>";
     if (!isValidRoute && !isValidPosition && !isValidSpeed) {
       return const SizedBox.shrink();
     }
     return Padding(
-        padding: const EdgeInsets.only(top: 4.0),
-        child:
-            Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      padding: const EdgeInsets.only(top: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
           if (isValidRoute || isValidPosition)
             Expanded(
-                child: Row(children: [
-              if (isValidRoute)
-                Flexible(
-                    child: Text(routeStr,
-                        style:
-                            const TextStyle(fontSize: 16, color: Colors.white),
-                        overflow: TextOverflow.ellipsis)),
-              if (isValidRoute && isValidPosition) const SizedBox(width: 4),
-              if (isValidPosition)
-                Flexible(
-                    child: Text(
+              child: Row(
+                children: [
+                  if (isValidRoute)
+                    Flexible(
+                      child: Text(
+                        routeStr,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          color: Colors.white,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  if (isValidRoute && isValidPosition) const SizedBox(width: 4),
+                  if (isValidPosition)
+                    Flexible(
+                      child: Text(
                         "${position.trim().endsWith('.') ? position.trim().substring(0, position.trim().length - 1) : position.trim()}K",
-                        style:
-                            const TextStyle(fontSize: 16, color: Colors.white),
-                        overflow: TextOverflow.ellipsis))
-            ])),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          color: Colors.white,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                ],
+              ),
+            ),
           if (isValidSpeed)
-            Text("${speed.replaceAll(' ', '')} km/h",
-                style: const TextStyle(fontSize: 16, color: Colors.white),
-                textAlign: TextAlign.right)
-        ]));
+            Text(
+              "${speed.replaceAll(' ', '')} km/h",
+              style: const TextStyle(fontSize: 16, color: Colors.white),
+              textAlign: TextAlign.right,
+            ),
+        ],
+      ),
+    );
   }
 
   Widget _buildExpandedContent(TrainRecord record) {
     final position = _parsePosition(record.positionInfo);
     final mapId = record.uniqueId;
 
-    if (position == null) {
-      return const SizedBox.shrink();
-    }
-
-    if (!_mapOptimalZoom.containsKey(mapId) &&
-        !(_mapCalculating[mapId] ?? false)) {
-      _mapCalculating[mapId] = true;
-
-      _calculateOptimalZoomAsync([position],
-              containerWidth: 400, containerHeight: 220)
-          .then((optimalZoom) {
-        if (mounted) {
-          setState(() {
-            _mapOptimalZoom[mapId] = optimalZoom;
-            _mapCalculating[mapId] = false;
-          });
-        }
-      });
-    }
-
-    if (!_mapOptimalZoom.containsKey(mapId)) {
-      return const Column(
-        children: [
-          SizedBox(height: 8),
-          SizedBox(
-            height: 228,
-            child: Center(
-              child: CircularProgressIndicator(
-                color: Colors.blue,
-                strokeWidth: 2,
-              ),
-            ),
-          ),
-        ],
-      );
-    }
-
-    final zoomLevel = _mapOptimalZoom[mapId]!;
-
-    return Column(children: [
-      const SizedBox(height: 8),
-      Container(
-          height: 220,
-          margin: const EdgeInsets.symmetric(vertical: 4),
-          decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8), color: Colors.grey[900]),
-          child: _DelayedMapWithMarker(
-            key: ValueKey('map_${mapId}_$zoomLevel'),
-            position: position,
-            zoom: zoomLevel,
-            recordId: record.uniqueId,
-            currentUserLocation: _currentUserLocation,
-          ))
-    ]);
+    if (position == null) return const SizedBox.shrink();
+    return _buildMapSection(
+      positions: [position],
+      center: position,
+      mapId: mapId,
+      mapKey: MapStateService.instance.getSingleRecordMapKey(record.uniqueId),
+      height: 220,
+      containerWidth: 400,
+      multiMarker: false,
+    );
   }
 
   LatLng? _parsePosition(String? positionInfo) {
@@ -1451,7 +1559,9 @@ class HistoryScreenState extends State<HistoryScreen> {
           return LatLng(lat, lng);
         }
       }
-    } catch (e) {}
+    } catch (e, stack) {
+      developer.log('解析坐标失败：$e', name: 'HistoryScreen', stackTrace: stack);
+    }
     return null;
   }
 
@@ -1469,8 +1579,9 @@ class HistoryScreenState extends State<HistoryScreen> {
       if (minuteIndex == -1) {
         return degrees;
       }
-      final minutes =
-          double.tryParse(dmsStr.substring(degreeIndex + 1, minuteIndex));
+      final minutes = double.tryParse(
+        dmsStr.substring(degreeIndex + 1, minuteIndex),
+      );
       if (minutes == null) {
         return degrees;
       }
@@ -1481,7 +1592,8 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<_BoundaryBox> _calculateBoundaryBoxParallel(
-      List<LatLng> positions) async {
+    List<LatLng> positions,
+  ) async {
     if (positions.length < 100) {
       return _calculateBoundaryBoxIsolate(positions);
     }
@@ -1494,8 +1606,11 @@ class HistoryScreenState extends State<HistoryScreen> {
       chunks.add(positions.sublist(i, end));
     }
 
-    final results = await Future.wait(chunks.map(
-        (chunk) => Isolate.run(() => _calculateBoundaryBoxIsolate(chunk))));
+    final results = await Future.wait(
+      chunks.map(
+        (chunk) => Isolate.run(() => _calculateBoundaryBoxIsolate(chunk)),
+      ),
+    );
 
     double minLat = results[0].minLat;
     double maxLat = results[0].maxLat;
@@ -1512,8 +1627,11 @@ class HistoryScreenState extends State<HistoryScreen> {
     return _BoundaryBox(minLat, maxLat, minLng, maxLng);
   }
 
-  Future<double> _calculateOptimalZoomAsync(List<LatLng> positions,
-      {required double containerWidth, required double containerHeight}) async {
+  Future<double> _calculateOptimalZoomAsync(
+    List<LatLng> positions, {
+    required double containerWidth,
+    required double containerHeight,
+  }) async {
     if (positions.length == 1) return 17.0;
 
     final boundaryBox = await _calculateBoundaryBoxParallel(positions);
@@ -1541,10 +1659,10 @@ class HistoryScreenState extends State<HistoryScreen> {
 
     final widthZoom =
         math.log((containerWidth * paddingRatio) / (widthWorld * 256.0)) /
-            math.log(2.0);
+        math.log(2.0);
     final heightZoom =
         math.log((containerHeight * paddingRatio) / (heightWorld * 256.0)) /
-            math.log(2.0);
+        math.log(2.0);
 
     final optimalZoom = math.min(widthZoom, heightZoom);
 
@@ -1577,184 +1695,43 @@ _BoundaryBox _calculateBoundaryBoxIsolate(List<LatLng> positions) {
   return _BoundaryBox(minLat, maxLat, minLng, maxLng);
 }
 
-class _DelayedMapWithMarker extends StatefulWidget {
-  final LatLng position;
-  final double zoom;
-  final String recordId;
-  final LatLng? currentUserLocation;
-
-  const _DelayedMapWithMarker({
-    super.key,
-    required this.position,
-    required this.zoom,
-    required this.recordId,
-    this.currentUserLocation,
-  });
-
-  @override
-  State<_DelayedMapWithMarker> createState() => _DelayedMapWithMarkerState();
-}
-
-class _DelayedMapWithMarkerState extends State<_DelayedMapWithMarker> {
-  late final MapController _mapController;
-  late final String _mapKey;
-  bool _isInitializing = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _mapController = MapController();
-    _mapKey = MapStateService.instance.getSingleRecordMapKey(widget.recordId);
-    _initializeMapState();
-  }
-
-  Future<void> _initializeMapState() async {
-    final savedState = await MapStateService.instance.getMapState(_mapKey);
-    if (savedState != null && mounted) {
-      _mapController.move(
-        LatLng(savedState.centerLat, savedState.centerLng),
-        savedState.zoom,
-      );
-      if (savedState.bearing != 0.0) {
-        _mapController.rotate(savedState.bearing);
-      }
-    }
-    if (mounted) {
-      setState(() {
-        _isInitializing = false;
-      });
-    }
-  }
-
-  void _onCameraMove() {
-    if (_isInitializing) {
-      return;
-    }
-
-    final camera = _mapController.camera;
-    final state = MapState(
-      zoom: camera.zoom,
-      centerLat: camera.center.latitude,
-      centerLng: camera.center.longitude,
-      bearing: camera.rotation,
-    );
-
-    MapStateService.instance.saveMapState(_mapKey, state);
-  }
-
-  @override
-  void dispose() {
-    _mapController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final markers = <Marker>[
-      Marker(
-        point: widget.position,
-        width: 24,
-        height: 24,
-        child: Container(
-          decoration: BoxDecoration(
-            color: Colors.red,
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.white, width: 1.5),
-          ),
-          child: const Icon(Icons.train, color: Colors.white, size: 12),
-        ),
-      ),
-    ];
-
-    if (widget.currentUserLocation != null) {
-      markers.add(
-        Marker(
-          point: widget.currentUserLocation!,
-          width: 24,
-          height: 24,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.blue,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 1.5),
-            ),
-            child: const Icon(
-              Icons.my_location,
-              color: Colors.white,
-              size: 12,
-            ),
-          ),
-        ),
-      );
-    }
-
-    if (_isInitializing) {
-      return FlutterMap(
-        options: MapOptions(
-          initialCenter: widget.position,
-          initialZoom: widget.zoom,
-          onPositionChanged: (position, hasGesture) => _onCameraMove(),
-        ),
-        mapController: _mapController,
-        children: [
-          TileLayer(
-              urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
-              userAgentPackageName: 'org.noxylva.lbjconsole'),
-          MarkerLayer(markers: markers),
-        ],
-      );
-    }
-
-    return FlutterMap(
-      options: MapOptions(
-        onPositionChanged: (position, hasGesture) => _onCameraMove(),
-      ),
-      mapController: _mapController,
-      children: [
-        TileLayer(
-            urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
-            userAgentPackageName: 'org.noxylva.lbjconsole'),
-        MarkerLayer(markers: markers),
-      ],
-    );
-  }
-}
-
-class _DelayedMultiMarkerMap extends StatefulWidget {
+class _DelayedMap extends StatefulWidget {
   final List<LatLng> positions;
   final LatLng center;
   final double zoom;
-  final String groupKey;
+  final String mapKey;
+  final bool multiMarker;
   final LatLng? currentUserLocation;
 
-  const _DelayedMultiMarkerMap({
+  const _DelayedMap({
     super.key,
     required this.positions,
     required this.center,
     required this.zoom,
-    required this.groupKey,
+    required this.mapKey,
+    this.multiMarker = false,
     this.currentUserLocation,
   });
 
   @override
-  State<_DelayedMultiMarkerMap> createState() => _DelayedMultiMarkerMapState();
+  State<_DelayedMap> createState() => _DelayedMapState();
 }
 
-class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
+class _DelayedMapState extends State<_DelayedMap> {
   late final MapController _mapController;
-  late final String _mapKey;
   bool _isInitializing = true;
 
   @override
   void initState() {
     super.initState();
     _mapController = MapController();
-    _mapKey = MapStateService.instance.getMergedRecordMapKey(widget.groupKey);
     _initializeMapState();
   }
 
   Future<void> _initializeMapState() async {
-    final savedState = await MapStateService.instance.getMapState(_mapKey);
+    final savedState = await MapStateService.instance.getMapState(
+      widget.mapKey,
+    );
     if (savedState != null && mounted) {
       _mapController.move(
         LatLng(savedState.centerLat, savedState.centerLng),
@@ -1763,8 +1740,6 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
       if (savedState.bearing != 0.0) {
         _mapController.rotate(savedState.bearing);
       }
-    } else if (mounted) {
-      _mapController.move(widget.center, widget.zoom);
     }
     if (mounted) {
       setState(() {
@@ -1786,7 +1761,7 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
       bearing: camera.rotation,
     );
 
-    MapStateService.instance.saveMapState(_mapKey, state);
+    MapStateService.instance.saveMapStateDebounced(widget.mapKey, state);
   }
 
   @override
@@ -1797,18 +1772,29 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
 
   @override
   Widget build(BuildContext context) {
-    final markers = <Marker>[
-      ...widget.positions.map((pos) => Marker(
-          point: pos,
-          width: 24,
-          height: 24,
-          child: Container(
-              decoration: BoxDecoration(
-                  color: Colors.red.withAlpha((255 * 0.8).round()),
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 1.5)),
-              child: const Icon(Icons.train, color: Colors.white, size: 12)))),
-    ];
+    final markers = widget.positions
+        .map(
+          (pos) => Marker(
+            point: pos,
+            width: 24,
+            height: 24,
+            child: Container(
+              decoration: widget.multiMarker
+                  ? BoxDecoration(
+                      color: Colors.red.withAlpha((255 * 0.8).round()),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 1.5),
+                    )
+                  : BoxDecoration(
+                      color: Colors.red,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white, width: 1.5),
+                    ),
+              child: const Icon(Icons.train, color: Colors.white, size: 12),
+            ),
+          ),
+        )
+        .toList();
 
     if (widget.currentUserLocation != null) {
       markers.add(
@@ -1822,11 +1808,7 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white, width: 1.5),
             ),
-            child: const Icon(
-              Icons.my_location,
-              color: Colors.white,
-              size: 12,
-            ),
+            child: const Icon(Icons.my_location, color: Colors.white, size: 12),
           ),
         ),
       );
@@ -1834,9 +1816,11 @@ class _DelayedMultiMarkerMapState extends State<_DelayedMultiMarkerMap> {
 
     return FlutterMap(
       options: MapOptions(
+        initialCenter: widget.center,
+        initialZoom: widget.zoom,
         onPositionChanged: (position, hasGesture) => _onCameraMove(),
-        minZoom: 8,
-        maxZoom: 18,
+        minZoom: widget.multiMarker ? 8 : null,
+        maxZoom: widget.multiMarker ? 18 : null,
       ),
       mapController: _mapController,
       children: [

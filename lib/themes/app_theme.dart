@@ -31,31 +31,75 @@ class AppTheme {
         unselectedItemColor: Colors.grey,
         type: BottomNavigationBarType.fixed,
       ),
+      navigationBarTheme: NavigationBarThemeData(
+        backgroundColor: const Color(0xFF121212),
+        indicatorColor: navigationIndicator,
+        indicatorShape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: const BorderSide(color: Colors.white54),
+        ),
+        iconTheme: WidgetStateProperty.resolveWith<IconThemeData?>(
+          (states) => IconThemeData(
+            color: states.contains(WidgetState.selected)
+                ? Colors.white
+                : Colors.white70,
+          ),
+        ),
+        labelTextStyle: WidgetStateProperty.resolveWith<TextStyle?>(
+          (states) => TextStyle(
+            color: states.contains(WidgetState.selected)
+                ? Colors.white
+                : Colors.white70,
+            fontWeight: states.contains(WidgetState.selected)
+                ? FontWeight.w700
+                : FontWeight.w500,
+          ),
+        ),
+      ),
       cardTheme: CardThemeData(
         color: const Color(0xFF1E1E1E),
         elevation: 2,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(8),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       ),
       textTheme: const TextTheme(
         headlineLarge: TextStyle(
-            color: Colors.white, fontSize: 32, fontWeight: FontWeight.bold),
+          color: Colors.white,
+          fontSize: 32,
+          fontWeight: FontWeight.bold,
+        ),
         headlineMedium: TextStyle(
-            color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
+          color: Colors.white,
+          fontSize: 28,
+          fontWeight: FontWeight.bold,
+        ),
         headlineSmall: TextStyle(
-            color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
+          color: Colors.white,
+          fontSize: 24,
+          fontWeight: FontWeight.bold,
+        ),
         titleLarge: TextStyle(
-            color: Colors.white, fontSize: 20, fontWeight: FontWeight.w600),
+          color: Colors.white,
+          fontSize: 20,
+          fontWeight: FontWeight.w600,
+        ),
         titleMedium: TextStyle(
-            color: Colors.white, fontSize: 18, fontWeight: FontWeight.w500),
+          color: Colors.white,
+          fontSize: 18,
+          fontWeight: FontWeight.w500,
+        ),
         titleSmall: TextStyle(
-            color: Colors.white, fontSize: 16, fontWeight: FontWeight.w500),
+          color: Colors.white,
+          fontSize: 16,
+          fontWeight: FontWeight.w500,
+        ),
         bodyLarge: TextStyle(color: Colors.white, fontSize: 16),
         bodyMedium: TextStyle(color: Colors.white70, fontSize: 14),
         bodySmall: TextStyle(color: Colors.white60, fontSize: 12),
         labelLarge: TextStyle(
-            color: Colors.white, fontSize: 14, fontWeight: FontWeight.w500),
+          color: Colors.white,
+          fontSize: 14,
+          fontWeight: FontWeight.w500,
+        ),
         labelMedium: TextStyle(color: Colors.white70, fontSize: 12),
         labelSmall: TextStyle(color: Colors.white60, fontSize: 10),
       ),
@@ -65,29 +109,32 @@ class AppTheme {
         thickness: 1,
       ),
       switchTheme: SwitchThemeData(
-        thumbColor: WidgetStateProperty.resolveWith<Color?>(
-            (Set<WidgetState> states) {
+        thumbColor: WidgetStateProperty.resolveWith<Color?>((
+          Set<WidgetState> states,
+        ) {
           if (states.contains(WidgetState.selected)) {
             return Colors.blue;
           }
           return Colors.grey;
         }),
-        trackColor: WidgetStateProperty.resolveWith<Color?>(
-            (Set<WidgetState> states) {
+        trackColor: WidgetStateProperty.resolveWith<Color?>((
+          Set<WidgetState> states,
+        ) {
           if (states.contains(WidgetState.selected)) {
-            return Colors.blue.withOpacity(0.5);
+            return Colors.blue.withValues(alpha: 0.5);
           }
-          return Colors.grey.withOpacity(0.5);
+          return Colors.grey.withValues(alpha: 0.5);
         }),
       ),
       dialogTheme: DialogThemeData(
         backgroundColor: const Color(0xFF1E1E1E),
         elevation: 8,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         titleTextStyle: const TextStyle(
-            color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+          color: Colors.white,
+          fontSize: 20,
+          fontWeight: FontWeight.bold,
+        ),
         contentTextStyle: const TextStyle(color: Colors.white70, fontSize: 16),
       ),
       floatingActionButtonTheme: const FloatingActionButtonThemeData(
@@ -100,21 +147,11 @@ class AppTheme {
   static const Color primaryBlack = Colors.black;
   static const Color secondaryBlack = Color(0xFF121212);
   static const Color tertiaryBlack = Color(0xFF1E1E1E);
-  static const Color dividerColor = Color(0xFF2A2A2A);
   static const Color textPrimary = Colors.white;
   static const Color textSecondary = Color(0xFFB3B3B3);
   static const Color textTertiary = Color(0xFF808080);
   static const Color accentBlue = Colors.blue;
-  static const Color accentBlueLight = Color(0xFF64B5F6);
-  static const Color errorRed = Color(0xFFCF6679);
-  static const Color successGreen = Color(0xFF4CAF50);
-  static const Color warningOrange = Color(0xFFFF9800);
-
-  static const TextStyle titleLarge = TextStyle(
-    fontSize: 20,
-    fontWeight: FontWeight.bold,
-    color: textPrimary,
-  );
+  static const Color navigationIndicator = Color(0xFF4A4A4A);
 
   static const TextStyle titleMedium = TextStyle(
     fontSize: 18,
@@ -132,42 +169,5 @@ class AppTheme {
     color: textSecondary,
   );
 
-  static const TextStyle caption = TextStyle(
-    fontSize: 12,
-    color: textTertiary,
-  );
-
-  static const TextStyle labelLarge = TextStyle(
-    fontSize: 14,
-    fontWeight: FontWeight.w500,
-    color: textPrimary,
-  );
-
-  static const double spacingXS = 4.0;
-  static const double spacingS = 8.0;
-  static const double spacingM = 16.0;
-  static const double spacingL = 24.0;
-  static const double spacingXL = 32.0;
-  static const double spacingXXL = 48.0;
-
-  static const double radiusS = 4.0;
-  static const double radiusM = 8.0;
-  static const double radiusL = 12.0;
-  static const double radiusXL = 16.0;
-
-  static List<BoxShadow> get cardShadow => [
-        BoxShadow(
-          color: Colors.black.withOpacity(0.3),
-          blurRadius: 8,
-          offset: const Offset(0, 2),
-        ),
-      ];
-
-  static List<BoxShadow> get buttonShadow => [
-        BoxShadow(
-          color: Colors.black.withOpacity(0.2),
-          blurRadius: 4,
-          offset: const Offset(0, 2),
-        ),
-      ];
+  static const TextStyle caption = TextStyle(fontSize: 12, color: textTertiary);
 }

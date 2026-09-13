@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'package:lbjconsole/util/csv_parser.dart';
 
 class TrainTypeUtil {
   static final List<_TrainTypePattern> _patterns = [];
@@ -8,23 +9,20 @@ class TrainTypeUtil {
     if (_initialized) return;
 
     try {
-      final csvData =
-          await rootBundle.loadString('assets/train_number_info.csv');
+      final csvData = await rootBundle.loadString(
+        'assets/train_number_info.csv',
+      );
       final lines = csvData.split('\n');
 
       for (final line in lines) {
         if (line.trim().isEmpty) continue;
 
-        final firstQuoteEnd = line.indexOf('"', 1);
-        if (firstQuoteEnd > 0 && firstQuoteEnd < line.length - 1) {
-          final regex = line.substring(1, firstQuoteEnd);
-          final remainingPart = line.substring(firstQuoteEnd + 1).trim();
-
-          if (remainingPart.startsWith(',"') && remainingPart.endsWith('"')) {
-            final type = remainingPart.substring(2, remainingPart.length - 1);
-            try {
-              _patterns.add(_TrainTypePattern(RegExp(regex), type));
-            } catch (e) {}
+        final fields = parseCsvLine(line);
+        if (fields.length >= 2) {
+          try {
+            _patterns.add(_TrainTypePattern(RegExp(fields[0]), fields[1]));
+          } catch (e) {
+            // Ignore malformed asset rows and keep loading valid rows.
           }
         }
       }
@@ -46,8 +44,9 @@ class TrainTypeUtil {
       return null;
     }
 
-    final actualTrain =
-        lbjClassTrimmed == "NA" ? trainTrimmed : lbjClassTrimmed + trainTrimmed;
+    final actualTrain = lbjClassTrimmed == "NA"
+        ? trainTrimmed
+        : lbjClassTrimmed + trainTrimmed;
 
     for (final pattern in _patterns) {
       if (pattern.regex.hasMatch(actualTrain)) {

@@ -29,7 +29,7 @@ class RecordsFeed {
   RecordsFeed._();
 
   static Future<({bool mergeEnabled, bool hideUngroupable})>
-      _displaySettings() async {
+  _displaySettings() async {
     final settings = await DatabaseService.instance.getAllSettings() ?? {};
     return (
       mergeEnabled: (settings['mergeRecordsEnabled'] ?? 0) == 1,
@@ -78,6 +78,7 @@ class RecordsFeed {
       query: query,
       limit: limit,
       offset: offset,
+      hideUngroupable: settings.hideUngroupable,
     );
     return records.cast<Object>();
   }
@@ -91,7 +92,10 @@ class RecordsFeed {
         hideUngroupable: settings.hideUngroupable,
       );
     }
-    return DatabaseService.instance.countSearchResults(query);
+    return DatabaseService.instance.countSearchResults(
+      query,
+      hideUngroupable: settings.hideUngroupable,
+    );
   }
 
   /// The up-to-date display item containing [record], or null when the
@@ -100,10 +104,16 @@ class RecordsFeed {
     if (record.isTimeOnly) return null;
     final settings = await _displaySettings();
     if (!settings.mergeEnabled) {
+      if (settings.hideUngroupable &&
+          record.trainKey == null &&
+          record.locoKey == null) {
+        return null;
+      }
       return record;
     }
-    final item =
-        await DatabaseService.instance.displayItemContaining(record.uniqueId);
+    final item = await DatabaseService.instance.displayItemContaining(
+      record.uniqueId,
+    );
     if (item == null) return null;
     if (settings.hideUngroupable &&
         item is TrainRecord &&

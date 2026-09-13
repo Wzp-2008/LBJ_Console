@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:lbjconsole/models/train_record.dart';
@@ -17,24 +16,31 @@ class NotificationService {
 
   /// User intent: whether the user wants notifications (settings toggle).
   bool _notificationsEnabled = true;
+
   /// System capability: whether the OS currently allows this app to post
   /// notifications. On Android 13+ this reflects the POST_NOTIFICATIONS
   /// runtime permission. Cached here and refreshed on init / request.
   bool _permissionGranted = false;
-
-  final StreamController<bool> _settingsController =
-      StreamController<bool>.broadcast();
-  Stream<bool> get settingsStream => _settingsController.stream;
+  bool _initialized = false;
 
   Future<void> initialize() async {
+    if (_initialized) return;
     const AndroidInitializationSettings initializationSettingsAndroid =
         AndroidInitializationSettings('@mipmap/ic_launcher');
+    const darwinSettings = DarwinInitializationSettings();
 
     const InitializationSettings initializationSettings =
         InitializationSettings(
-            android: initializationSettingsAndroid,
-            windows: WindowsInitializationSettings(appName: "LBJReceiver", appUserModelId: "LBJReceiver", guid: "194022DA-0502-4B90-8D31-14B3ECE27391")
-    );
+          android: initializationSettingsAndroid,
+          iOS: darwinSettings,
+          macOS: darwinSettings,
+          linux: LinuxInitializationSettings(defaultActionName: '打开'),
+          windows: WindowsInitializationSettings(
+            appName: 'LBJ Console',
+            appUserModelId: 'LBJConsole',
+            guid: '194022DA-0502-4B90-8D31-14B3ECE27391',
+          ),
+        );
 
     await _notificationsPlugin.initialize(
       settings: initializationSettings,
@@ -45,7 +51,7 @@ class NotificationService {
 
     // Reflect the actual system permission (Android 13+ may have it denied).
     _permissionGranted = await _systemNotificationsEnabled();
-    _settingsController.add(_permissionGranted);
+    _initialized = true;
   }
 
   Future<void> _createNotificationChannel() async {
@@ -60,7 +66,8 @@ class NotificationService {
 
     await _notificationsPlugin
         .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
+          AndroidFlutterLocalNotificationsPlugin
+        >()
         ?.createNotificationChannel(channel);
   }
 
@@ -72,20 +79,18 @@ class NotificationService {
   Future<bool> requestPermission() async {
     if (!Platform.isAndroid) {
       _permissionGranted = true;
-      _settingsController.add(_permissionGranted);
       return true;
     }
     final android = _notificationsPlugin
         .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>();
+          AndroidFlutterLocalNotificationsPlugin
+        >();
     if (android == null) {
       _permissionGranted = false;
-      _settingsController.add(_permissionGranted);
       return false;
     }
     final granted = await android.requestNotificationsPermission() ?? false;
     _permissionGranted = granted;
-    _settingsController.add(_permissionGranted);
     return granted;
   }
 
@@ -94,7 +99,8 @@ class NotificationService {
     if (!Platform.isAndroid) return true;
     final android = _notificationsPlugin
         .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>();
+          AndroidFlutterLocalNotificationsPlugin
+        >();
     return await android?.areNotificationsEnabled() ?? false;
   }
 
@@ -113,17 +119,19 @@ class NotificationService {
 
     final AndroidNotificationDetails androidPlatformChannelSpecifics =
         AndroidNotificationDetails(
-      channelId,
-      channelName,
-      channelDescription: channelDescription,
-      importance: Importance.high,
-      priority: Priority.high,
-      ticker: 'ticker',
-      styleInformation: BigTextStyleInformation(body),
-    );
+          channelId,
+          channelName,
+          channelDescription: channelDescription,
+          importance: Importance.high,
+          priority: Priority.high,
+          ticker: 'ticker',
+          styleInformation: BigTextStyleInformation(body),
+        );
 
-    final NotificationDetails platformChannelSpecifics =
-        NotificationDetails(android: androidPlatformChannelSpecifics);
+    final NotificationDetails platformChannelSpecifics = NotificationDetails(
+      android: androidPlatformChannelSpecifics,
+      windows: const WindowsNotificationDetails(),
+    );
 
     await _notificationsPlugin.show(
       id: _notificationId++,
@@ -170,18 +178,9 @@ class NotificationService {
 
   Future<void> enableNotifications(bool enable) async {
     _notificationsEnabled = enable;
-    _settingsController.add(_notificationsEnabled);
   }
 
   Future<bool> isNotificationEnabled() async {
     return _notificationsEnabled;
-  }
-
-  Future<void> cancelAllNotifications() async {
-    await _notificationsPlugin.cancelAll();
-  }
-
-  void dispose() {
-    _settingsController.close();
   }
 }

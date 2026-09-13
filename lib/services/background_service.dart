@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 import 'dart:io';
 import 'dart:ui';
 
@@ -11,10 +12,42 @@ const String _notificationChannelId = 'lbj_console_channel';
 const String _notificationChannelName = 'LBJ Console 后台服务';
 const String _notificationChannelDescription = '保持蓝牙连接稳定';
 const int _notificationId = 114514;
+const AndroidNotificationChannel _backgroundNotificationChannel =
+    AndroidNotificationChannel(
+      _notificationChannelId,
+      _notificationChannelName,
+      description: _notificationChannelDescription,
+      importance: Importance.low,
+      enableLights: false,
+      enableVibration: false,
+      playSound: false,
+    );
+
+NotificationDetails _backgroundNotificationDetails() {
+  return const NotificationDetails(
+    android: AndroidNotificationDetails(
+      _notificationChannelId,
+      _notificationChannelName,
+      channelDescription: _notificationChannelDescription,
+      icon: '@mipmap/ic_launcher',
+      ongoing: true,
+      autoCancel: false,
+      importance: Importance.low,
+      priority: Priority.low,
+      enableLights: false,
+      enableVibration: false,
+      playSound: false,
+      onlyAlertOnce: true,
+      setAsGroupSummary: false,
+      groupKey: 'lbj_console_group',
+      visibility: NotificationVisibility.public,
+      category: AndroidNotificationCategory.service,
+    ),
+  );
+}
 
 @pragma('vm:entry-point')
 class BackgroundService {
-  static final FlutterBackgroundService _service = FlutterBackgroundService();
   static bool _isInitialized = false;
 
   static Future<void> initialize() async {
@@ -25,20 +58,11 @@ class BackgroundService {
     final flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
 
     if (Platform.isAndroid) {
-      const AndroidNotificationChannel channel = AndroidNotificationChannel(
-        _notificationChannelId,
-        _notificationChannelName,
-        description: _notificationChannelDescription,
-        importance: Importance.low,
-        enableLights: false,
-        enableVibration: false,
-        playSound: false,
-      );
-
       await flutterLocalNotificationsPlugin
           .resolvePlatformSpecificImplementation<
-              AndroidFlutterLocalNotificationsPlugin>()
-          ?.createNotificationChannel(channel);
+            AndroidFlutterLocalNotificationsPlugin
+          >()
+          ?.createNotificationChannel(_backgroundNotificationChannel);
     }
 
     await service.configure(
@@ -65,16 +89,6 @@ class BackgroundService {
   static void _onStart(ServiceInstance service) async {
     DartPluginRegistrant.ensureInitialized();
 
-    if (service is AndroidServiceInstance) {
-      service.on('setAsForeground').listen((event) {
-        service.setAsForegroundService();
-      });
-
-      service.on('setAsBackground').listen((event) {
-        service.setAsBackgroundService();
-      });
-    }
-
     service.on('stopService').listen((event) {
       service.stopSelf();
     });
@@ -88,47 +102,25 @@ class BackgroundService {
             FlutterLocalNotificationsPlugin();
 
         try {
-          const AndroidNotificationChannel channel = AndroidNotificationChannel(
-            _notificationChannelId,
-            _notificationChannelName,
-            description: _notificationChannelDescription,
-            importance: Importance.low,
-            enableLights: false,
-            enableVibration: false,
-            playSound: false,
-          );
-
           await flutterLocalNotificationsPlugin
               .resolvePlatformSpecificImplementation<
-                  AndroidFlutterLocalNotificationsPlugin>()
-              ?.createNotificationChannel(channel);
+                AndroidFlutterLocalNotificationsPlugin
+              >()
+              ?.createNotificationChannel(_backgroundNotificationChannel);
 
           await flutterLocalNotificationsPlugin.show(
             id: _notificationId,
             title: 'LBJ Console',
             body: '蓝牙连接监控中',
-            notificationDetails: const NotificationDetails(
-              android: AndroidNotificationDetails(
-                _notificationChannelId,
-                _notificationChannelName,
-                channelDescription: _notificationChannelDescription,
-                icon: '@mipmap/ic_launcher',
-                ongoing: true,
-                autoCancel: false,
-                importance: Importance.low,
-                priority: Priority.low,
-                enableLights: false,
-                enableVibration: false,
-                playSound: false,
-                onlyAlertOnce: true,
-                setAsGroupSummary: false,
-                groupKey: 'lbj_console_group',
-                visibility: NotificationVisibility.public,
-                category: AndroidNotificationCategory.service,
-              ),
-            ),
+            notificationDetails: _backgroundNotificationDetails(),
           );
-        } catch (e) {}
+        } catch (e, stack) {
+          developer.log(
+            '后台服务通知初始化失败：$e',
+            name: 'BackgroundService',
+            stackTrace: stack,
+          );
+        }
       }
     }
 
@@ -146,28 +138,15 @@ class BackgroundService {
               id: _notificationId,
               title: 'LBJ Console',
               body: isConnected ? '蓝牙已连接 - $deviceStatus' : '蓝牙未连接 - 自动重连中',
-              notificationDetails: const NotificationDetails(
-                android: AndroidNotificationDetails(
-                  _notificationChannelId,
-                  _notificationChannelName,
-                  channelDescription: _notificationChannelDescription,
-                  icon: '@mipmap/ic_launcher',
-                  ongoing: true,
-                  autoCancel: false,
-                  importance: Importance.low,
-                  priority: Priority.low,
-                  enableLights: false,
-                  enableVibration: false,
-                  playSound: false,
-                  onlyAlertOnce: true,
-                  setAsGroupSummary: false,
-                  groupKey: 'lbj_console_group',
-                  visibility: NotificationVisibility.public,
-                  category: AndroidNotificationCategory.service,
-                ),
-              ),
+              notificationDetails: _backgroundNotificationDetails(),
             );
-          } catch (e) {}
+          } catch (e, stack) {
+            developer.log(
+              '后台服务通知更新失败：$e',
+              name: 'BackgroundService',
+              stackTrace: stack,
+            );
+          }
         }
       }
     });
@@ -208,15 +187,5 @@ class BackgroundService {
     if (Platform.isWindows) return false;
     final service = FlutterBackgroundService();
     return await service.isRunning();
-  }
-
-  static void setForegroundMode(bool isForeground) {
-    if (Platform.isWindows) return;
-    final service = FlutterBackgroundService();
-    if (isForeground) {
-      service.invoke('setAsForeground');
-    } else {
-      service.invoke('setAsBackground');
-    }
   }
 }
