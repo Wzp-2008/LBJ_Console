@@ -32,16 +32,12 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Cache Flutter build and Dart tool state
+      - name: Cache Flutter dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.pub-cache
-            .dart_tool
-            build
-            android/.dart_tool
-            android/.gradle
-          key: flutter-android-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: flutter-android-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties', 'third_party/flutter_classic_bluetooth/**') }}
           restore-keys: |
             flutter-android-${{ runner.os }}-
 
@@ -100,14 +96,12 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Cache Flutter build and Dart tool state
+      - name: Cache Flutter dependencies
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.LOCALAPPDATA }}\Pub\Cache
-            .dart_tool
-            build
-          key: flutter-windows-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'windows/**/*.cmake', 'windows/**/*.vcxproj*') }}
+          key: flutter-windows-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'windows/**/*.cmake', 'windows/**/*.vcxproj*', 'third_party/flutter_classic_bluetooth/**') }}
           restore-keys: |
             flutter-windows-${{ runner.os }}-
 
