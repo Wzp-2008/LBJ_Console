@@ -798,54 +798,105 @@ class _RescueDevicePickerDialog extends StatefulWidget {
 }
 
 class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
-  List<ClassicBluetoothDevice> _devices = const [];
+  late final ClassicSppDiscoverySession _discovery;
+  final _deviceScrollController = ScrollController();
+  StreamSubscription<List<ClassicBluetoothDevice>>? _discoverySubscription;
+  List<ClassicBluetoothDevice> _pairedDevices = const [];
+  List<ClassicBluetoothDevice> _unpairedDevices = const [];
   String? _selectedAddress;
-  String _status = '正在搜索经典蓝牙设备…';
+  String _status = '准备搜索经典蓝牙设备…';
   String? _errorMessage;
-  bool _loading = true;
+  bool _loading = false;
+  bool _canRescan = false;
   bool _connecting = false;
+  int _scanGeneration = 0;
 
   @override
   void initState() {
     super.initState();
-    _loadDevices();
+    _discovery = ClassicSppDiscoverySession();
+    _discoverySubscription = _discovery.updates.listen(_applyDevices);
+    unawaited(_startScan());
   }
 
-  Future<void> _loadDevices() async {
-    if (_loading && _devices.isNotEmpty) return;
+  @override
+  void dispose() {
+    _discoverySubscription?.cancel();
+    _deviceScrollController.dispose();
+    unawaited(_discovery.dispose());
+    super.dispose();
+  }
+
+  void _applyDevices(List<ClassicBluetoothDevice> devices) {
+    if (!mounted) return;
+    final paired = devices.where((device) => device.isPaired).toList();
+    final unpaired = devices.where((device) => !device.isPaired).toList();
+    setState(() {
+      _pairedDevices = paired;
+      _unpairedDevices = unpaired;
+      if (_selectedAddress != null &&
+          !devices.any((device) => device.address == _selectedAddress)) {
+        _selectedAddress = null;
+      }
+      if (_loading && _errorMessage == null) {
+        _status = unpaired.isEmpty
+            ? '正在搜索未配对设备…'
+            : '正在搜索未配对设备，已发现 ${unpaired.length} 台';
+      }
+    });
+  }
+
+  Future<void> _startScan() async {
+    if (_loading || _connecting) return;
+    final generation = ++_scanGeneration;
     setState(() {
       _loading = true;
+      _canRescan = false;
       _errorMessage = null;
-      _status = '正在搜索经典蓝牙设备…';
+      _unpairedDevices = const [];
+      if (_selectedAddress != null &&
+          !_pairedDevices.any((device) => device.address == _selectedAddress)) {
+        _selectedAddress = null;
+      }
+      _status = '正在加载已配对设备…';
     });
     try {
-      final devices = await ClassicSppService.discoverDevices(
-        timeout: const Duration(seconds: 10),
-      );
-      if (!mounted) return;
+      await _discovery.start(timeout: const Duration(seconds: 16));
+      if (!mounted || generation != _scanGeneration) return;
       setState(() {
-        _devices = devices;
         _loading = false;
-        _selectedAddress =
-            devices.any((device) => device.address == _selectedAddress)
-            ? _selectedAddress
-            : null;
-        _status = devices.isEmpty ? '未发现蓝牙设备' : '请选择要救砖的设备';
+        _canRescan = true;
+        _status = _pairedDevices.isEmpty && _unpairedDevices.isEmpty
+            ? '未发现蓝牙设备'
+            : '请选择要救砖的设备';
       });
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || generation != _scanGeneration) return;
       setState(() {
         _loading = false;
+        _canRescan = true;
         _errorMessage = '设备搜索失败：$error';
         _status = '设备搜索失败';
       });
     }
   }
 
+  Future<void> _stopScanForSelection() async {
+    if (!_loading) return;
+    ++_scanGeneration;
+    await _discovery.stop();
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _canRescan = true;
+      _status = '扫描已停止，请确认设备后继续';
+    });
+  }
+
   ClassicBluetoothDevice? get _selectedDevice {
     final address = _selectedAddress;
     if (address == null) return null;
-    for (final device in _devices) {
+    for (final device in [..._pairedDevices, ..._unpairedDevices]) {
       if (device.address == address) return device;
     }
     return null;
@@ -855,6 +906,10 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
     final device = _selectedDevice;
     if (device == null || _connecting) return;
 
+    if (_loading) {
+      await _stopScanForSelection();
+    }
+    if (!mounted) return;
     setState(() {
       _connecting = true;
       _errorMessage = null;
@@ -890,8 +945,11 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
     }
   }
 
-  Widget _buildDeviceGroup(String title, bool paired) {
-    final devices = _devices.where((device) => device.isPaired == paired);
+  Widget _buildDeviceGroup(
+    String title,
+    List<ClassicBluetoothDevice> devices, {
+    required bool searching,
+  }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -905,6 +963,7 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
         ...devices.map(
           (device) => RadioListTile<String>(
             value: device.address,
+            selected: _selectedAddress == device.address,
             title: Text(device.displayName),
             subtitle: Text(
               '${device.address}\n'
@@ -917,13 +976,19 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
             ),
             dense: true,
             contentPadding: EdgeInsets.zero,
+            tileColor: Colors.transparent,
+            selectedTileColor: Colors.transparent,
+            hoverColor: Colors.transparent,
             enabled: !_connecting,
           ),
         ),
-        if (!devices.any((_) => true))
-          const Padding(
+        if (devices.isEmpty)
+          Padding(
             padding: EdgeInsets.symmetric(vertical: 4),
-            child: Text('暂无设备', style: TextStyle(color: Colors.white54)),
+            child: Text(
+              searching ? '正在扫描…' : '暂无设备',
+              style: const TextStyle(color: Colors.white54),
+            ),
           ),
       ],
     );
@@ -947,29 +1012,35 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 child: Text(_errorMessage ?? _status),
               ),
-              if (_loading)
-                const Expanded(
-                  child: Center(child: CircularProgressIndicator()),
-                )
-              else
-                Expanded(
-                  child: Scrollbar(
-                    child: RadioGroup<String>(
-                      groupValue: _selectedAddress,
-                      onChanged: (address) {
-                        if (!_connecting && address != null) {
-                          setState(() => _selectedAddress = address);
-                        }
-                      },
-                      child: ListView(
-                        children: [
-                          _buildDeviceGroup('已配对设备', true),
-                          _buildDeviceGroup('未配对设备', false),
-                        ],
-                      ),
+              Expanded(
+                child: Scrollbar(
+                  controller: _deviceScrollController,
+                  child: RadioGroup<String>(
+                    groupValue: _selectedAddress,
+                    onChanged: (address) {
+                      if (!_connecting && address != null) {
+                        setState(() => _selectedAddress = address);
+                        if (_loading) unawaited(_stopScanForSelection());
+                      }
+                    },
+                    child: ListView(
+                      controller: _deviceScrollController,
+                      children: [
+                        _buildDeviceGroup(
+                          '已配对设备',
+                          _pairedDevices,
+                          searching: false,
+                        ),
+                        _buildDeviceGroup(
+                          '未配对设备',
+                          _unpairedDevices,
+                          searching: _loading,
+                        ),
+                      ],
                     ),
                   ),
                 ),
+              ),
             ],
           ),
         ),
@@ -979,8 +1050,10 @@ class _RescueDevicePickerDialogState extends State<_RescueDevicePickerDialog> {
             child: const Text('取消'),
           ),
           TextButton(
-            onPressed: _loading || _connecting ? null : _loadDevices,
-            child: const Text('重新搜索'),
+            onPressed: !_canRescan || _loading || _connecting
+                ? null
+                : _startScan,
+            child: const Text('重新扫描'),
           ),
           FilledButton(
             onPressed: selected == null || _loading || _connecting

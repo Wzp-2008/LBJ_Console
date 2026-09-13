@@ -33,6 +33,137 @@ class ClassicBluetoothDevice {
   );
 }
 
+/// A live Classic Bluetooth discovery session used by the rescue picker.
+/// Paired devices are emitted first, then each inquiry result updates the
+/// snapshot so the UI does not have to wait for the whole radio inquiry.
+class ClassicSppDiscoverySession {
+  ClassicSppDiscoverySession({FlutterClassicBluetooth? bluetooth})
+    : _bluetooth = bluetooth ?? FlutterClassicBluetooth();
+
+  final FlutterClassicBluetooth _bluetooth;
+  final _updates = StreamController<List<ClassicBluetoothDevice>>.broadcast();
+  final _devices = <String, BtcDevice>{};
+  final _pairedAddresses = <String>{};
+  StreamSubscription<BtcDevice>? _resultsSubscription;
+  StreamSubscription<bool>? _stateSubscription;
+  Timer? _timer;
+  Completer<void>? _scanCompleter;
+  bool _nativeStarted = false;
+  bool _scanning = false;
+  bool _disposed = false;
+
+  Stream<List<ClassicBluetoothDevice>> get updates => _updates.stream;
+  bool get isScanning => _scanning;
+
+  Future<void> start({Duration timeout = const Duration(seconds: 16)}) async {
+    if (_disposed) throw StateError('蓝牙扫描会话已释放');
+    await stop();
+
+    final completer = Completer<void>();
+    _scanCompleter = completer;
+    _scanning = true;
+    _devices.clear();
+    _pairedAddresses.clear();
+    _resultsSubscription = _bluetooth.discoveryResults.listen(_onResult);
+    _stateSubscription = _bluetooth.discoveryState.listen((discovering) {
+      BleDiagnostics.log('Classic discovery state=$discovering');
+      // Windows delivers the final discovery state and device results through
+      // separate event channels. Do not cancel the result subscription from
+      // the state event: a result queued by the native inquiry can arrive just
+      // after the false state event and would otherwise be lost. The timer (or
+      // an explicit user stop) owns the session lifetime.
+    });
+
+    try {
+      final paired = await _bluetooth.getPairedDevices();
+      if (!_scanning) return completer.future;
+      BleDiagnostics.log('Classic discovery paired=${paired.length}');
+      for (final device in paired) {
+        _pairedAddresses.add(device.address);
+        _devices[device.address] = device;
+      }
+      _emit();
+
+      await _bluetooth.startDiscovery();
+      _nativeStarted = true;
+      BleDiagnostics.log('Classic discovery started');
+      if (!_scanning) {
+        await _stopNativeDiscovery();
+        return completer.future;
+      }
+      _timer = Timer(timeout, () => unawaited(stop()));
+    } catch (_) {
+      await stop();
+      rethrow;
+    }
+    return completer.future;
+  }
+
+  Future<void> stop() async {
+    _timer?.cancel();
+    _timer = null;
+    _scanning = false;
+    await _stopNativeDiscovery();
+    final resultsSubscription = _resultsSubscription;
+    _resultsSubscription = null;
+    await resultsSubscription?.cancel();
+    final stateSubscription = _stateSubscription;
+    _stateSubscription = null;
+    await stateSubscription?.cancel();
+    final completer = _scanCompleter;
+    _scanCompleter = null;
+    if (completer != null && !completer.isCompleted) completer.complete();
+  }
+
+  Future<void> _stopNativeDiscovery() async {
+    if (!_nativeStarted) return;
+    _nativeStarted = false;
+    try {
+      await _bluetooth.stopDiscovery();
+    } catch (error, stack) {
+      BleDiagnostics.log('停止经典蓝牙扫描失败', error, stack);
+    }
+  }
+
+  void _onResult(BtcDevice device) {
+    if (!_scanning) return;
+    BleDiagnostics.log(
+      'Classic discovery result address=${device.address} '
+      'name=${device.displayName} bond=${device.bondState.name}',
+    );
+    final previous = _devices[device.address];
+    _devices[device.address] = previous == null
+        ? device
+        : previous.mergedWith(device);
+    if (device.bondState == BtcBondState.bonded) {
+      _pairedAddresses.add(device.address);
+    }
+    _emit();
+  }
+
+  void _emit() {
+    final devices = _devices.values
+        .map(
+          (device) => ClassicBluetoothDevice(
+            device: device,
+            isPaired:
+                _pairedAddresses.contains(device.address) ||
+                device.bondState == BtcBondState.bonded,
+          ),
+        )
+        .toList();
+    devices.sort(ClassicSppService.compareDevices);
+    if (!_updates.isClosed) _updates.add(devices);
+  }
+
+  Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
+    await stop();
+    await _updates.close();
+  }
+}
+
 class ClassicSppService {
   static Future<ClassicSppConnection> connect(String address) async {
     if (Platform.isAndroid) return _AndroidSppConnection.open(address);
@@ -51,7 +182,14 @@ class ClassicSppService {
 
     final native = FlutterClassicBluetooth();
     final paired = await native.getPairedDevices();
-    final discovered = await native.scan(timeout: timeout);
+    // The Windows plugin issues a native inquiry with a roughly 10-second
+    // radio timeout. Leave extra time before stopping discovery, otherwise
+    // the plugin discards inquiry results that arrive at the boundary.
+    final discovered = await native.scan(
+      timeout: Platform.isWindows
+          ? timeout + const Duration(seconds: 6)
+          : timeout,
+    );
     final byAddress = <String, BtcDevice>{};
     for (final device in paired) {
       byAddress[device.address] = device;
@@ -74,14 +212,19 @@ class ClassicSppService {
           ),
         )
         .toList();
-    result.sort((a, b) {
-      if (a.isPaired != b.isPaired) return a.isPaired ? -1 : 1;
-      if (a.hasSppService != b.hasSppService) {
-        return a.hasSppService ? -1 : 1;
-      }
-      return a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
-    });
+    result.sort(compareDevices);
     return result;
+  }
+
+  static int compareDevices(
+    ClassicBluetoothDevice a,
+    ClassicBluetoothDevice b,
+  ) {
+    if (a.isPaired != b.isPaired) return a.isPaired ? -1 : 1;
+    if (a.hasSppService != b.hasSppService) {
+      return a.hasSppService ? -1 : 1;
+    }
+    return a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
   }
 
   static Future<bool> pair(String address) {
