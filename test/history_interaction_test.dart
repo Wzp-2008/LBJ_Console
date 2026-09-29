@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:geolocator/geolocator.dart';
@@ -46,6 +47,8 @@ void main() {
   testWidgets(
     'maps locate only while expanded and foreground; live merges keep expansion',
     (tester) async {
+      final locationSupported = defaultTargetPlatform != TargetPlatform.linux;
+      final expectedStart = locationSupported ? 1 : 0;
       final originalLocation = GeolocatorPlatform.instance;
       final location = FakeLocation();
       final cacheDirectory = Directory.systemTemp.createTempSync(
@@ -118,7 +121,7 @@ void main() {
         location.permissionRequest.complete(LocationPermission.whileInUse);
         await drain();
         await drain();
-        expect(location.starts, 1);
+        expect(location.starts, expectedStart);
         final map = tester.widget<FlutterMap>(find.byType(FlutterMap));
         expect(map.options.initialZoom, 12);
         expect(map.options.initialRotation, 10);
@@ -139,24 +142,28 @@ void main() {
         expect(find.text('共 2 条 · 点击展开'), findsOneWidget);
         expect(
           location.starts,
-          1,
+          expectedStart,
           reason: 'Live singleton-to-group transition stays expanded',
         );
         active = false;
         await tester.pumpWidget(screen());
         await drain();
-        expect(location.stops, 1, reason: 'Settings page must stop location');
+        expect(
+          location.stops,
+          expectedStart,
+          reason: 'Settings page must stop location',
+        );
         active = true;
         await tester.pumpWidget(screen());
         await drain();
-        expect(location.starts, 2);
+        expect(location.starts, 2 * expectedStart);
         tester.binding.handleAppLifecycleStateChanged(
           AppLifecycleState.inactive,
         );
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
         await drain();
-        expect(location.stops, 2);
+        expect(location.stops, 2 * expectedStart);
         tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
         tester.binding.handleAppLifecycleStateChanged(
           AppLifecycleState.inactive,
@@ -165,12 +172,15 @@ void main() {
           AppLifecycleState.resumed,
         );
         await drain();
-        expect(location.starts, 3);
+        expect(location.starts, 3 * expectedStart);
         // Collapse the merged card, which has an outer identity key m:a.
         await tester.tap(find.text('共 2 条 · 点击展开'));
         await tester.pump();
         await drain();
-        expect(location.stops, 3);
+        expect(location.stops, 3 * expectedStart);
+        if (!locationSupported) {
+          expect(location.checks, 0, reason: 'Linux has no location backend');
+        }
         expect(tester.takeException(), isNull);
       } finally {
         await tester.pumpWidget(const SizedBox.shrink());
@@ -186,5 +196,10 @@ void main() {
         GeolocatorPlatform.instance = originalLocation;
       }
     },
+    variant: TargetPlatformVariant({
+      TargetPlatform.android,
+      TargetPlatform.windows,
+      TargetPlatform.linux,
+    }),
   );
 }

@@ -1,8 +1,8 @@
 import 'dart:math' as math;
 import 'dart:isolate';
 import 'dart:async';
-import 'dart:io';
 import 'dart:developer' as developer;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -1300,7 +1300,7 @@ class HistoryScreenState extends State<HistoryScreen>
     if (_locationSubscription == null &&
         !_locationStarting &&
         !_locationAttempted &&
-        !Platform.isLinux) {
+        defaultTargetPlatform != TargetPlatform.linux) {
       _locationAttempted = true;
       unawaited(_startLocationUpdates());
     }
