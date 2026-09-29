@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'dart:isolate';
 import 'dart:async';
+import 'dart:io';
 import 'dart:developer' as developer;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -16,18 +17,21 @@ import '../services/map_state_service.dart';
 class HistoryScreen extends StatefulWidget {
   final Function(bool isEditing) onEditModeChanged;
   final Function() onSelectionChanged;
+  final bool active;
 
   const HistoryScreen({
     super.key,
     required this.onEditModeChanged,
     required this.onSelectionChanged,
+    this.active = true,
   });
 
   @override
   HistoryScreenState createState() => HistoryScreenState();
 }
 
-class HistoryScreenState extends State<HistoryScreen> {
+class HistoryScreenState extends State<HistoryScreen>
+    with WidgetsBindingObserver {
   static const int _batchSize = 100;
   static const double _scrollThreshold = 200.0;
   static const int _searchDebounceMs = 300;
@@ -37,8 +41,8 @@ class HistoryScreenState extends State<HistoryScreen> {
   /// load newest-first (getRecordsByUniqueIds orders by receivedTimestamp
   /// DESC), so this keeps the most recent [_maxExpandedSubRecords] members
   /// and shows a "仅显示前 N 条" hint when a group is larger — a very large
-  /// group otherwise renders an enormous scroll list. The expanded map still
-  /// plots every member's position regardless of this cap.
+  /// group otherwise renders an enormous scroll list. The map samples up to
+  /// 1000 distinct positions across the full group, independently of this cap.
   static const int _maxExpandedSubRecords = 100;
 
   final List<Object> _displayItems = [];
@@ -83,8 +87,13 @@ class HistoryScreenState extends State<HistoryScreen> {
   final Map<String, bool> _mapCalculating = {};
 
   LatLng? _currentUserLocation;
-  bool _isLocationPermissionGranted = false;
-  Timer? _locationTimer;
+  StreamSubscription<Position>? _locationSubscription;
+  bool _locationStarting = false;
+  bool _locationAttempted = false;
+  int _locationGeneration = 0;
+  bool _foreground = true;
+  bool _firstPageLoading = false;
+  bool _needsRecordReload = false;
 
   int getSelectedCount() => _selectedRecords.length;
   Set<String> getSelectedRecordIds() => _selectedRecords;
@@ -105,13 +114,22 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   @override
+  void didUpdateWidget(covariant HistoryScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !oldWidget.active && _needsRecordReload) {
+      _needsRecordReload = false;
+      unawaited(_loadFirstPage());
+    }
+  }
+
+  @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _scrollController.addListener(_onScroll);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         _loadFirstPage();
-        _startLocationUpdates();
         _setupRecordDeleteListener();
         _setupSettingsListener();
       }
@@ -142,18 +160,26 @@ class HistoryScreenState extends State<HistoryScreen> {
       deletedIds,
     ) {
       if (!mounted) return;
+      if (deletedIds.isEmpty) {
+        _selectedRecords.clear();
+        _expandedStates.clear();
+        _mapOptimalZoom.clear();
+      }
       for (final id in deletedIds) {
         _selectedRecords.remove(id);
         _expandedStates.remove(id);
       }
+      widget.onSelectionChanged();
       _loadFirstPage();
     });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    ++_locationGeneration;
     _scrollController.dispose();
-    _locationTimer?.cancel();
+    _locationSubscription?.cancel();
     _searchDebounce?.cancel();
     _scrollLoadDebounce?.cancel();
     _searchController.dispose();
@@ -218,6 +244,8 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _loadFirstPage({bool keepStaleResults = false}) async {
+    if (!mounted) return;
+    _firstPageLoading = true;
     _searchDebounce?.cancel();
     final generation = ++_searchGeneration;
     final query = _searchQuery;
@@ -254,6 +282,7 @@ class HistoryScreenState extends State<HistoryScreen> {
 
     try {
       final settingsMap = await DatabaseService.instance.getAllSettings() ?? {};
+      if (!mounted || generation != _searchGeneration) return;
       _displaySettingsSignature = _displaySettingsSignatureFrom(settingsMap);
 
       if (query.isNotEmpty) {
@@ -326,11 +355,13 @@ class HistoryScreenState extends State<HistoryScreen> {
         });
         _searchRefreshingNotifier.value = false;
       }
+    } finally {
+      if (generation == _searchGeneration) _firstPageLoading = false;
     }
   }
 
   Future<void> _loadNextPage() async {
-    if (_isLoadingMore || !_hasMoreRecords) return;
+    if (_firstPageLoading || _isLoadingMore || !_hasMoreRecords) return;
     setState(() => _isLoadingMore = true);
     final generation = _searchGeneration;
     final isSearch = _searchQuery.isNotEmpty;
@@ -421,24 +452,46 @@ class HistoryScreenState extends State<HistoryScreen> {
         ? newItem.memberUniqueIds.toSet()
         : {(newItem as TrainRecord).uniqueId};
     final identity = _displayItemIdentity(newItem);
+    var expanded = false;
     _displayItems.removeWhere((existing) {
-      if (_displayItemIdentity(existing) == identity) return true;
-      if (existing is TrainRecord) return memberIds.contains(existing.uniqueId);
-      if (existing is MergedTrainRecord) {
-        return existing.memberUniqueIds.any(memberIds.contains);
+      final intersects =
+          _displayItemIdentity(existing) == identity ||
+          (existing is TrainRecord && memberIds.contains(existing.uniqueId)) ||
+          (existing is MergedTrainRecord &&
+              existing.memberUniqueIds.any(memberIds.contains));
+      if (intersects) {
+        final oldKey = existing is MergedTrainRecord
+            ? existing.groupKey
+            : (existing as TrainRecord).uniqueId;
+        expanded = (_expandedStates.remove(oldKey) ?? false) || expanded;
+        _mergedDetailsLoadFailed.remove(oldKey);
       }
-      return false;
+      return intersects;
     });
+    final newKey = newItem is MergedTrainRecord
+        ? newItem.groupKey
+        : (newItem as TrainRecord).uniqueId;
+    if (expanded) _expandedStates[newKey] = true;
   }
 
   Future<void> addNewRecord(TrainRecord newRecord) async {
     try {
       if (!mounted || _searchQuery.isNotEmpty) return;
+      if (!widget.active || !_foreground) {
+        _needsRecordReload = true;
+        return;
+      }
+      final generation = _searchGeneration;
 
       // The record is already merged into the cache by insertRecord; just
       // fetch the up-to-date display item that contains it.
       final item = await RecordsFeed.itemContaining(newRecord);
-      if (item == null || !mounted || _searchQuery.isNotEmpty) return;
+      if (item == null ||
+          !mounted ||
+          _searchQuery.isNotEmpty ||
+          generation != _searchGeneration) {
+        return;
+      }
 
       final wasAtTop = _isAtTop;
       final savedOffset = _scrollController.hasClients
@@ -449,7 +502,29 @@ class HistoryScreenState extends State<HistoryScreen> {
         // Prepend the up-to-date display item. The keyset cursor is
         // unaffected: newer items live above it and are never re-fetched.
         _removeIntersectingItems(item);
-        _displayItems.insert(0, item);
+        final incoming = item is MergedTrainRecord
+            ? item.latestRecord
+            : item as TrainRecord;
+        final index = _displayItems.indexWhere((other) {
+          final record = other is MergedTrainRecord
+              ? other.latestRecord
+              : other as TrainRecord;
+          final time = incoming.receivedTimestamp.compareTo(
+            record.receivedTimestamp,
+          );
+          if (time != 0) return time > 0;
+          if (_displaySettingsSignature?.startsWith('1|') == true) {
+            final a = item is MergedTrainRecord
+                ? item.groupKey
+                : incoming.uniqueId;
+            final b = other is MergedTrainRecord
+                ? other.groupKey
+                : record.uniqueId;
+            return a.compareTo(b) < 0;
+          }
+          return incoming.uniqueId.compareTo(record.uniqueId) > 0;
+        });
+        _displayItems.insert(index < 0 ? _displayItems.length : index, item);
       });
 
       if (wasAtTop) {
@@ -767,6 +842,9 @@ class HistoryScreenState extends State<HistoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _syncLocationUpdates();
+    });
     if (_isInitialLoading && _displayItems.isEmpty) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -808,6 +886,7 @@ class HistoryScreenState extends State<HistoryScreen> {
   Future<void> _loadMergedDetails(MergedTrainRecord merged) async {
     if (!mounted || merged.hasLoadedDetails || merged.recordCount <= 1) return;
     if (_mergedDetailsLoading[merged.groupKey] == true) return;
+    final generation = _searchGeneration;
 
     setState(() => _mergedDetailsLoading[merged.groupKey] = true);
 
@@ -815,7 +894,11 @@ class HistoryScreenState extends State<HistoryScreen> {
       final loaded = await DatabaseService.instance.getRecordsByUniqueIds(
         merged.memberUniqueIds,
       );
-      if (!mounted) return;
+      if (!mounted ||
+          generation != _searchGeneration ||
+          !_displayItems.contains(merged)) {
+        return;
+      }
       if (loaded.length < merged.memberUniqueIds.length) {
         // Short result (no throw): some members are missing from
         // train_records — an orphaned cache member, or a record deleted
@@ -830,7 +913,11 @@ class HistoryScreenState extends State<HistoryScreen> {
       }
     } catch (e) {
       developer.log('loadMergedDetails error: $e', name: 'HistoryScreen');
-      _mergedDetailsLoadFailed.add(merged.groupKey);
+      if (mounted &&
+          generation == _searchGeneration &&
+          _displayItems.contains(merged)) {
+        _mergedDetailsLoadFailed.add(merged.groupKey);
+      }
     } finally {
       if (mounted) {
         setState(() => _mergedDetailsLoading.remove(merged.groupKey));
@@ -899,7 +986,7 @@ class HistoryScreenState extends State<HistoryScreen> {
             widget.onSelectionChanged();
           });
         } else if (isExpanded) {
-          final mapId = mergedRecord.memberUniqueIds.join('_');
+          final mapId = mergedRecord.groupKey;
           setState(() {
             _expandedStates[mergedRecord.groupKey] = false;
             _mapOptimalZoom.remove(mapId);
@@ -989,7 +1076,7 @@ class HistoryScreenState extends State<HistoryScreen> {
     final details = mergedRecord.records;
     // Cap the rendered sub-record list so a very large group doesn't produce
     // a huge scroll list. Details are newest-first, so this keeps the most
-    // recent members; the map above still plots every member's position.
+    // recent members; the map above samples positions across the full group.
     final bool truncated = details.length > _maxExpandedSubRecords;
     final List<TrainRecord> shownDetails = truncated
         ? details.sublist(0, _maxExpandedSubRecords)
@@ -1167,9 +1254,7 @@ class HistoryScreenState extends State<HistoryScreen> {
             color: Colors.grey[900],
           ),
           child: _DelayedMap(
-            key: ValueKey(
-              '${multiMarker ? 'multi_map' : 'map'}_${mapId}_$zoomLevel',
-            ),
+            key: ValueKey(mapKey),
             positions: positions,
             center: center,
             zoom: zoomLevel,
@@ -1182,55 +1267,96 @@ class HistoryScreenState extends State<HistoryScreen> {
     );
   }
 
-  Future<void> _requestLocationPermission() async {
-    try {
-      if (!await Geolocator.isLocationServiceEnabled()) return;
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
+    _syncLocationUpdates();
+    if (_foreground && widget.active && _needsRecordReload) {
+      _needsRecordReload = false;
+      unawaited(_loadFirstPage());
+    }
+  }
 
+  bool get _needsLocation =>
+      mounted &&
+      widget.active &&
+      _foreground &&
+      _displayItems.any(
+        (item) =>
+            _isCardExpanded(item) &&
+            (item is MergedTrainRecord ? item.records : [item as TrainRecord])
+                .any((record) => _parsePosition(record.positionInfo) != null),
+      );
+
+  void _syncLocationUpdates() {
+    if (!_needsLocation) {
+      _locationAttempted = false;
+      ++_locationGeneration;
+      final subscription = _locationSubscription;
+      _locationSubscription = null;
+      unawaited(subscription?.cancel());
+      return;
+    }
+    if (_locationSubscription == null &&
+        !_locationStarting &&
+        !_locationAttempted &&
+        !Platform.isLinux) {
+      _locationAttempted = true;
+      unawaited(_startLocationUpdates());
+    }
+  }
+
+  Future<void> _startLocationUpdates() async {
+    _locationStarting = true;
+    final generation = ++_locationGeneration;
+    bool current() => generation == _locationGeneration && _needsLocation;
+    try {
+      if (!await Geolocator.isLocationServiceEnabled() || !current()) return;
       var permission = await Geolocator.checkPermission();
+      if (!current()) return;
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
       }
-      if (permission == LocationPermission.deniedForever ||
-          permission == LocationPermission.denied) {
+      if (!current() ||
+          permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
         return;
       }
-
-      if (mounted) {
-        setState(() => _isLocationPermissionGranted = true);
-      }
-      await _getCurrentLocation();
-    } catch (e, stack) {
-      developer.log('请求定位权限失败：$e', name: 'HistoryScreen', stackTrace: stack);
-    }
-  }
-
-  Future<void> _getCurrentLocation() async {
-    try {
-      const locationSettings = LocationSettings(
-        accuracy: LocationAccuracy.high,
+      _locationSubscription =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.medium,
+              distanceFilter: 25,
+            ),
+          ).listen(
+            (position) {
+              if (!current()) return;
+              final location = LatLng(position.latitude, position.longitude);
+              if (_currentUserLocation == location) return;
+              setState(() => _currentUserLocation = location);
+            },
+            onError: (Object error, StackTrace stack) {
+              developer.log(
+                '定位更新失败：$error',
+                name: 'HistoryScreen',
+                stackTrace: stack,
+              );
+            },
+          );
+    } catch (error, stack) {
+      developer.log(
+        '启动地图定位失败：$error',
+        name: 'HistoryScreen',
+        stackTrace: stack,
       );
-      Position position = await Geolocator.getCurrentPosition(
-        locationSettings: locationSettings,
-      );
-
-      if (mounted) {
-        setState(() {
-          _currentUserLocation = LatLng(position.latitude, position.longitude);
-        });
+    } finally {
+      _locationStarting = false;
+      // Permission dialogs can briefly background the app while this request
+      // is pending. Resume a cancelled attempt after that dialog completes.
+      if (generation != _locationGeneration && _needsLocation) {
+        _syncLocationUpdates();
       }
-    } catch (e, stack) {
-      developer.log('获取当前位置失败：$e', name: 'HistoryScreen', stackTrace: stack);
     }
-  }
-
-  void _startLocationUpdates() {
-    _requestLocationPermission();
-
-    _locationTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
-      if (_isLocationPermissionGranted) {
-        _getCurrentLocation();
-      }
-    });
   }
 
   Widget _buildSelectableCard({
@@ -1264,13 +1390,25 @@ class HistoryScreenState extends State<HistoryScreen> {
   }
 
   Widget _buildExpandedMapForAll(List<TrainRecord> records, String groupKey) {
-    final positions = records
+    final allPositions = records
         .map((record) => _parsePosition(record.positionInfo))
         .whereType<LatLng>()
+        .toSet()
         .toList();
+    // Repeated coordinates need one marker. Bound painting cost for long
+    // sessions while sampling the entire track, including both endpoints.
+    const maxMarkers = 1000;
+    final positions = allPositions.length <= maxMarkers
+        ? allPositions
+        : List.generate(
+            maxMarkers,
+            (i) =>
+                allPositions[(i * (allPositions.length - 1) / (maxMarkers - 1))
+                    .round()],
+          );
     if (positions.isEmpty) return const SizedBox.shrink();
 
-    final mapId = records.map((r) => r.uniqueId).join('_');
+    final mapId = groupKey;
     final bounds = LatLngBounds.fromPoints(positions);
     final width = MediaQuery.of(context).size.width;
     return _buildMapSection(
@@ -1555,6 +1693,10 @@ class HistoryScreenState extends State<HistoryScreen> {
         final lng = _parseDmsCoordinate(parts[1]);
         if (lat != null &&
             lng != null &&
+            lat.isFinite &&
+            lng.isFinite &&
+            lat.abs() <= 90 &&
+            lng.abs() <= 180 &&
             (lat.abs() > 0.001 || lng.abs() > 0.001)) {
           return LatLng(lat, lng);
         }
@@ -1582,10 +1724,8 @@ class HistoryScreenState extends State<HistoryScreen> {
       final minutes = double.tryParse(
         dmsStr.substring(degreeIndex + 1, minuteIndex),
       );
-      if (minutes == null) {
-        return degrees;
-      }
-      return degrees + (minutes / 60.0);
+      if (minutes == null || minutes < 0 || minutes >= 60) return null;
+      return degrees + (degrees < 0 ? -minutes : minutes) / 60.0;
     } catch (e) {
       return null;
     }
@@ -1720,6 +1860,7 @@ class _DelayedMap extends StatefulWidget {
 class _DelayedMapState extends State<_DelayedMap> {
   late final MapController _mapController;
   bool _isInitializing = true;
+  MapState? _savedState;
 
   @override
   void initState() {
@@ -1732,15 +1873,9 @@ class _DelayedMapState extends State<_DelayedMap> {
     final savedState = await MapStateService.instance.getMapState(
       widget.mapKey,
     );
-    if (savedState != null && mounted) {
-      _mapController.move(
-        LatLng(savedState.centerLat, savedState.centerLng),
-        savedState.zoom,
-      );
-      if (savedState.bearing != 0.0) {
-        _mapController.rotate(savedState.bearing);
-      }
-    }
+    // A MapController cannot move before FlutterMap has attached. Restore
+    // through initial options after loading instead of racing its first frame.
+    _savedState = savedState;
     if (mounted) {
       setState(() {
         _isInitializing = false;
@@ -1772,6 +1907,9 @@ class _DelayedMapState extends State<_DelayedMap> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isInitializing) {
+      return const Center(child: CircularProgressIndicator());
+    }
     final markers = widget.positions
         .map(
           (pos) => Marker(
@@ -1816,9 +1954,14 @@ class _DelayedMapState extends State<_DelayedMap> {
 
     return FlutterMap(
       options: MapOptions(
-        initialCenter: widget.center,
-        initialZoom: widget.zoom,
-        onPositionChanged: (position, hasGesture) => _onCameraMove(),
+        initialCenter: _savedState == null
+            ? widget.center
+            : LatLng(_savedState!.centerLat, _savedState!.centerLng),
+        initialZoom: _savedState?.zoom ?? widget.zoom,
+        initialRotation: _savedState?.bearing ?? 0,
+        onPositionChanged: (position, hasGesture) {
+          if (hasGesture) _onCameraMove();
+        },
         minZoom: widget.multiMarker ? 8 : null,
         maxZoom: widget.multiMarker ? 18 : null,
       ),

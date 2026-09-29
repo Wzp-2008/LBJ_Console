@@ -31,10 +31,9 @@ class DisplayPageResult {
 /// Pre-computed merge groups in SQLite.
 ///
 /// The merge rule is fixed: records sharing a train number OR a locomotive
-/// number are grouped together (union semantics) using session windows — a
-/// record joins a group when it arrives within 1 hour of the group's latest
-/// member, so a continuous transmission stream stays in one group no matter
-/// how long it lasts; a gap larger than 1 hour starts a new group.
+/// number are grouped when matching-key observations are at most 1 hour
+/// apart. Transitive connections join groups, but unrelated keys do not
+/// extend the lifetime of an old train/locomotive key.
 /// Time-only records never enter the cache. The cache is updated
 /// incrementally on insert/delete; a full rebuild only happens on data
 /// import or schema migration.
@@ -253,6 +252,52 @@ class DisplayGroupCache {
     // and the incremental path is additionally stable on late arrivals.
     final survivor = candidateIds.reduce((a, b) => a.compareTo(b) < 0 ? a : b);
 
+    // Live reception normally appends to one group. Its cached summary is a
+    // sufficient accumulator: do not deserialize and rewrite every member.
+    if (candidateIds.length == 1) {
+      final rows = await db.query(
+        groupsTable,
+        where: 'groupId = ?',
+        whereArgs: [survivor],
+      );
+      final group = rows.single;
+      final latestTs = (group['latestReceivedTimestamp'] as num).toInt();
+      final latestId = group['representativeUniqueId'] as String;
+      if (ts > latestTs ||
+          (ts == latestTs && record.uniqueId.compareTo(latestId) > 0)) {
+        final cached = group['summaryJson'] as String;
+        final previous = cached.isNotEmpty
+            ? TrainRecord.fromDatabaseJson(
+                jsonDecode(cached) as Map<String, dynamic>,
+              )
+            : TrainRecord.fromDatabaseJson(
+                (await db.query(
+                  recordsTable,
+                  where: 'uniqueId = ?',
+                  whereArgs: [latestId],
+                )).single,
+              );
+        final summary = MergeService.buildSummaryRecord([record, previous]);
+        await db.update(
+          groupsTable,
+          {
+            'latestReceivedTimestamp': ts,
+            'representativeUniqueId': record.uniqueId,
+            'memberCount': (group['memberCount'] as num).toInt() + 1,
+            'summaryJson': jsonEncode(summary.toTransferJson()),
+            'isUngroupable': 0,
+          },
+          where: 'groupId = ?',
+          whereArgs: [survivor],
+        );
+        await db.insert(membersTable, {
+          'uniqueId': record.uniqueId,
+          'groupId': survivor,
+        });
+        return;
+      }
+    }
+
     final placeholders = List.filled(candidateIds.length, '?').join(',');
     final memberRows = await db.rawQuery('''
         SELECT r.* FROM $membersTable m
@@ -308,15 +353,20 @@ class DisplayGroupCache {
     }
 
     final groupIdList = groupIds.toList();
-    final groupPlaceholders = List.filled(groupIdList.length, '?').join(',');
-    final memberRows = await db.rawQuery('''
+    final remainingByGroup = <String, List<TrainRecord>>{};
+    for (final chunk in chunks(groupIdList)) {
+      final groupPlaceholders = List.filled(chunk.length, '?').join(',');
+      final memberRows = await db.rawQuery('''
         SELECT m.groupId AS member_group_id, r.* FROM $membersTable m
         INNER JOIN $recordsTable r ON r.uniqueId = m.uniqueId
         WHERE m.groupId IN ($groupPlaceholders)
-        ''', groupIdList);
-    final remaining = memberRows
-        .map(TrainRecord.fromDatabaseJson)
-        .toList(growable: false);
+        ''', chunk);
+      for (final row in memberRows) {
+        remainingByGroup
+            .putIfAbsent(row['member_group_id'] as String, () => [])
+            .add(TrainRecord.fromDatabaseJson(row));
+      }
+    }
 
     for (final chunk in chunks(groupIdList)) {
       await db.delete(
@@ -324,16 +374,21 @@ class DisplayGroupCache {
         where: 'groupId IN (${List.filled(chunk.length, '?').join(',')})',
         whereArgs: chunk,
       );
+      await db.delete(
+        membersTable,
+        where: 'groupId IN (${List.filled(chunk.length, '?').join(',')})',
+        whereArgs: chunk,
+      );
     }
 
-    if (remaining.isNotEmpty) {
-      await _insertGroup(
-        db,
-        remaining,
-        preserveGroupId: groupIdList.reduce(
-          (a, b) => a.compareTo(b) < 0 ? a : b,
-        ),
-      );
+    for (final entry in remainingByGroup.entries) {
+      final payload = groupRecordsIntoPayload(entry.value);
+      // Keep identity when deletion leaves a connected group. A removed
+      // bridge can create multiple components, each with its own identity.
+      if (payload.length == 1) payload.single['groupId'] = entry.key;
+      for (final group in payload) {
+        await _insertPayload(db, group);
+      }
     }
   }
 
@@ -615,11 +670,16 @@ class _MutableGroup {
 List<Map<String, dynamic>> groupRecordsIntoPayload(List<TrainRecord> records) {
   final windowMs = DisplayGroupCache.mergeWindow.inMilliseconds;
   final sorted = List<TrainRecord>.from(records)
-    ..sort((a, b) => a.receivedTimestamp.compareTo(b.receivedTimestamp));
+    ..sort((a, b) {
+      final time = a.receivedTimestamp.compareTo(b.receivedTimestamp);
+      return time != 0 ? time : a.uniqueId.compareTo(b.uniqueId);
+    });
 
   final groups = <_MutableGroup>[];
   final activeByTrain = <String, _MutableGroup>{};
   final activeByLoco = <String, _MutableGroup>{};
+  final lastTrainTimestamp = <String, int>{};
+  final lastLocoTimestamp = <String, int>{};
 
   _MutableGroup resolve(_MutableGroup group) {
     var current = group;
@@ -634,15 +694,19 @@ List<Map<String, dynamic>> groupRecordsIntoPayload(List<TrainRecord> records) {
     final trainKey = record.trainKey;
     final locoKey = record.locoKey;
 
-    _MutableGroup? pick(_MutableGroup? group) {
-      if (group == null) return null;
+    _MutableGroup? pick(_MutableGroup? group, int? lastTimestamp) {
+      if (group == null || lastTimestamp == null) return null;
+      if (ts - lastTimestamp > windowMs) return null;
       final resolved = resolve(group);
-      if (ts - resolved.latestTs > windowMs) return null;
       return resolved;
     }
 
-    final byTrain = trainKey != null ? pick(activeByTrain[trainKey]) : null;
-    final byLoco = locoKey != null ? pick(activeByLoco[locoKey]) : null;
+    final byTrain = trainKey != null
+        ? pick(activeByTrain[trainKey], lastTrainTimestamp[trainKey])
+        : null;
+    final byLoco = locoKey != null
+        ? pick(activeByLoco[locoKey], lastLocoTimestamp[locoKey])
+        : null;
 
     _MutableGroup target;
     if (byTrain == null && byLoco == null) {
@@ -662,8 +726,14 @@ List<Map<String, dynamic>> groupRecordsIntoPayload(List<TrainRecord> records) {
       target.add(record);
     }
 
-    if (trainKey != null) activeByTrain[trainKey] = target;
-    if (locoKey != null) activeByLoco[locoKey] = target;
+    if (trainKey != null) {
+      activeByTrain[trainKey] = target;
+      lastTrainTimestamp[trainKey] = ts;
+    }
+    if (locoKey != null) {
+      activeByLoco[locoKey] = target;
+      lastLocoTimestamp[locoKey] = ts;
+    }
   }
 
   final payload = <Map<String, dynamic>>[];
@@ -680,7 +750,10 @@ Map<String, dynamic> _buildGroupPayload(
   String? groupId,
 }) {
   final sorted = List<TrainRecord>.from(members)
-    ..sort((a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp));
+    ..sort((a, b) {
+      final time = b.receivedTimestamp.compareTo(a.receivedTimestamp);
+      return time != 0 ? time : b.uniqueId.compareTo(a.uniqueId);
+    });
   final latest = sorted.first;
   final resolvedGroupId = groupId ?? sorted.last.uniqueId;
   final isUngroupable =

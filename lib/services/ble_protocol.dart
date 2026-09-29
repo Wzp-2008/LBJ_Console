@@ -1,6 +1,19 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+/// Failed reconnects progressively give the radio time to sleep.
+class BleReconnectBackoff {
+  int _attempt = 0;
+
+  Duration nextDelay() {
+    final seconds = 15 * (1 << _attempt);
+    if (_attempt < 3) _attempt++;
+    return Duration(seconds: seconds);
+  }
+
+  void reset() => _attempt = 0;
+}
+
 bool shouldReconnectBle({
   required String? savedAddress,
   required bool adapterOn,

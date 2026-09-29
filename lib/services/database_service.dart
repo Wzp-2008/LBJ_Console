@@ -26,7 +26,7 @@ class DatabaseService {
   DatabaseService._internal();
 
   static const String _databaseName = 'train_database';
-  static const _databaseVersion = 20;
+  static const _databaseVersion = 21;
 
   static const String trainRecordsTable = 'train_records';
   static const String trainRecordsFtsTable = 'train_records_fts';
@@ -171,6 +171,10 @@ class DatabaseService {
     }
     if (oldVersion < 20) {
       await _createDeviceBoardHistoryTable(db);
+    }
+    if (oldVersion < 21) {
+      // Repair stale key windows and groups corrupted by multi-group deletes.
+      await DisplayGroupCache.rebuild(db, recordsTable: trainRecordsTable);
     }
   }
 
@@ -841,9 +845,10 @@ END)''';
         );
         records.addAll(rows.map(TrainRecord.fromDatabaseJson));
       }
-      records.sort(
-        (a, b) => b.receivedTimestamp.compareTo(a.receivedTimestamp),
-      );
+      records.sort((a, b) {
+        final time = b.receivedTimestamp.compareTo(a.receivedTimestamp);
+        return time != 0 ? time : b.uniqueId.compareTo(a.uniqueId);
+      });
       return records;
     });
   }

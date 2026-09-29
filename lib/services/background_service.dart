@@ -49,10 +49,21 @@ NotificationDetails _backgroundNotificationDetails() {
 @pragma('vm:entry-point')
 class BackgroundService {
   static bool _isInitialized = false;
+  static Future<void>? _initializing;
+  static StreamSubscription<bool>? _connectionSubscription;
+  static StreamSubscription<Map<String, dynamic>?>? _statusRequestSubscription;
 
   static Future<void> initialize() async {
-    if (_isInitialized) return;
+    if (!Platform.isAndroid || _isInitialized) return;
+    final pending = _initializing ??= _configure();
+    try {
+      await pending;
+    } finally {
+      _initializing = null;
+    }
+  }
 
+  static Future<void> _configure() async {
     final service = FlutterBackgroundService();
 
     final flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
@@ -68,7 +79,8 @@ class BackgroundService {
     await service.configure(
       androidConfiguration: AndroidConfiguration(
         onStart: _onStart,
-        autoStart: true,
+        autoStart: false,
+        autoStartOnBoot: false,
         isForegroundMode: true,
         notificationChannelId: _notificationChannelId,
         initialNotificationTitle: 'LBJ Console',
@@ -82,74 +94,58 @@ class BackgroundService {
       ),
     );
 
+    _connectionSubscription ??= BLEService().connectionStream.listen(
+      (_) => _publishStatus(),
+    );
+    _statusRequestSubscription ??= service
+        .on('requestStatus')
+        .listen((_) => _publishStatus());
     _isInitialized = true;
+  }
+
+  static void _publishStatus() {
+    final ble = BLEService();
+    FlutterBackgroundService().invoke('updateStatus', {
+      'body': ble.isConnected ? '蓝牙已连接 - ${ble.deviceStatus}' : '蓝牙未连接，等待重连',
+    });
   }
 
   @pragma('vm:entry-point')
   static void _onStart(ServiceInstance service) async {
     DartPluginRegistrant.ensureInitialized();
-
-    service.on('stopService').listen((event) {
-      service.stopSelf();
-    });
-
-    BLEService().initialize();
-
-    if (service is AndroidServiceInstance) {
-      await Future.delayed(const Duration(seconds: 1));
-      if (await service.isForegroundService()) {
-        final flutterLocalNotificationsPlugin =
-            FlutterLocalNotificationsPlugin();
-
-        try {
-          await flutterLocalNotificationsPlugin
-              .resolvePlatformSpecificImplementation<
-                AndroidFlutterLocalNotificationsPlugin
-              >()
-              ?.createNotificationChannel(_backgroundNotificationChannel);
-
-          await flutterLocalNotificationsPlugin.show(
-            id: _notificationId,
-            title: 'LBJ Console',
-            body: '蓝牙连接监控中',
-            notificationDetails: _backgroundNotificationDetails(),
-          );
-        } catch (e, stack) {
-          developer.log(
-            '后台服务通知初始化失败：$e',
-            name: 'BackgroundService',
-            stackTrace: stack,
-          );
-        }
-      }
-    }
-
-    Timer.periodic(const Duration(seconds: 30), (timer) async {
-      if (service is AndroidServiceInstance) {
-        if (await service.isForegroundService()) {
-          try {
-            final bleService = BLEService();
-            final isConnected = bleService.isConnected;
-            final deviceStatus = bleService.deviceStatus;
-
-            final flutterLocalNotificationsPlugin =
-                FlutterLocalNotificationsPlugin();
-            await flutterLocalNotificationsPlugin.show(
-              id: _notificationId,
-              title: 'LBJ Console',
-              body: isConnected ? '蓝牙已连接 - $deviceStatus' : '蓝牙未连接 - 自动重连中',
-              notificationDetails: _backgroundNotificationDetails(),
-            );
-          } catch (e, stack) {
-            developer.log(
-              '后台服务通知更新失败：$e',
-              name: 'BackgroundService',
-              stackTrace: stack,
-            );
-          }
-        }
+    // This isolate only keeps Android's foreground service alive. The main
+    // isolate owns BLE, its database and reconnect policy; a second singleton
+    // here cannot share that state and would contend for the same adapter.
+    StreamSubscription<Map<String, dynamic>?>? statusSubscription;
+    StreamSubscription<Map<String, dynamic>?>? stopSubscription;
+    String? lastBody;
+    var stopped = false;
+    statusSubscription = service.on('updateStatus').listen((event) async {
+      final body = event?['body'] as String?;
+      if (stopped || body == null || body == lastBody) return;
+      lastBody = body;
+      try {
+        await FlutterLocalNotificationsPlugin().show(
+          id: _notificationId,
+          title: 'LBJ Console',
+          body: body,
+          notificationDetails: _backgroundNotificationDetails(),
+        );
+      } catch (error, stack) {
+        developer.log(
+          '后台服务通知更新失败：$error',
+          name: 'BackgroundService',
+          stackTrace: stack,
+        );
       }
     });
+    stopSubscription = service.on('stopService').listen((_) async {
+      stopped = true;
+      await statusSubscription?.cancel();
+      await stopSubscription?.cancel();
+      await service.stopSelf();
+    });
+    service.invoke('requestStatus');
   }
 
   @pragma('vm:entry-point')
@@ -158,33 +154,25 @@ class BackgroundService {
   }
 
   static Future<void> startService() async {
-    if (Platform.isWindows) return;
+    if (!Platform.isAndroid || !BLEService().isConnected) return;
+    await NotificationService.instance.requestPermission();
     await initialize();
     final service = FlutterBackgroundService();
 
-    if (Platform.isAndroid) {
-      // The foreground service needs a persistent notification; on Android
-      // 13+ that requires the POST_NOTIFICATIONS runtime permission, so
-      // request it before starting (covers both the settings toggle and the
-      // auto-start path in MainScreen).
-      await NotificationService.instance.requestPermission();
-      final isRunning = await service.isRunning();
-      if (!isRunning) {
-        service.startService();
-      }
-    } else if (Platform.isIOS) {
-      service.startService();
+    if (!await service.isRunning()) {
+      await service.startService();
     }
+    _publishStatus();
   }
 
   static Future<void> stopService() async {
-    if (Platform.isWindows) return;
+    if (!Platform.isAndroid) return;
     final service = FlutterBackgroundService();
     service.invoke('stopService');
   }
 
   static Future<bool> isRunning() async {
-    if (Platform.isWindows) return false;
+    if (!Platform.isAndroid) return false;
     final service = FlutterBackgroundService();
     return await service.isRunning();
   }

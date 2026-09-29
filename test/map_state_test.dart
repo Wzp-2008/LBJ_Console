@@ -53,6 +53,12 @@ void main() {
       MapState(zoom: 9, centerLat: 4, centerLng: 5, bearing: 6),
     );
 
+    final immediate = await service.getMapState(key);
+    expect(
+      immediate?.zoom,
+      9,
+      reason: 'Reopening before the debounce must restore the latest camera',
+    );
     await Future<void>.delayed(const Duration(milliseconds: 400));
     final loaded = await service.getMapState(key);
     expect(loaded?.zoom, 9);

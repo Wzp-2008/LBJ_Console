@@ -39,7 +39,7 @@ class ClassicSppChannelHandler private constructor(
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
-            "connect" -> connect(call.argument<String>("address"), result)
+            "connect" -> connect(call.argument<String>("address"), call.argument<Int>("sessionId") ?: 0, result)
             "write" -> write(call.argument<ByteArray>("data"), result)
             "disconnect" -> {
                 closeCurrentSocket()
@@ -50,7 +50,8 @@ class ClassicSppChannelHandler private constructor(
     }
 
     @SuppressLint("MissingPermission")
-    private fun connect(address: String?, result: MethodChannel.Result) {
+    @Synchronized
+    private fun connect(address: String?, sessionId: Int, result: MethodChannel.Result) {
         if (address.isNullOrBlank()) {
             result.error("INVALID_ADDRESS", "缺少 Classic Bluetooth 设备地址", null)
             return
@@ -69,20 +70,29 @@ class ClassicSppChannelHandler private constructor(
                 adapter.cancelDiscovery()
                 val device = adapter.getRemoteDevice(address)
                 candidate = device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
-                socket = candidate
+                synchronized(this@ClassicSppChannelHandler) {
+                    if (generation.get() != token) {
+                        throw IOException("Classic SPP 连接已取消")
+                    }
+                    socket = candidate
+                }
                 candidate.connect()
                 if (generation.get() != token) {
                     candidate.close()
                     completeError(result, "SPP_CONNECT_CANCELLED", "Classic SPP 连接已被新的请求取消")
                     return@execute
                 }
-                socket = candidate
                 completeSuccess(result)
-                readLoop(candidate, token)
+                readLoop(candidate, token, sessionId)
             } catch (error: Exception) {
                 try { candidate?.close() } catch (_: Exception) {}
-                if (generation.get() == token) {
-                    if (socket === candidate) socket = null
+                val stillCurrent = synchronized(this@ClassicSppChannelHandler) {
+                    if (generation.get() == token) {
+                        if (socket === candidate) socket = null
+                        true
+                    } else false
+                }
+                if (stillCurrent) {
                     completeError(result, "SPP_CONNECT_FAILED", readableError(error))
                 } else {
                     completeError(result, "SPP_CONNECT_CANCELLED", "Classic SPP 连接已被新的请求取消")
@@ -91,7 +101,7 @@ class ClassicSppChannelHandler private constructor(
         }
     }
 
-    private fun readLoop(activeSocket: BluetoothSocket, token: Int) {
+    private fun readLoop(activeSocket: BluetoothSocket, token: Int, sessionId: Int) {
         executor.execute {
             val buffer = ByteArray(8192)
             try {
@@ -100,19 +110,27 @@ class ClassicSppChannelHandler private constructor(
                     if (count < 0) break
                     if (count > 0) {
                         val data = buffer.copyOf(count)
-                        mainHandler.post { channel.invokeMethod("data", data) }
+                        mainHandler.post {
+                            channel.invokeMethod("data", mapOf("sessionId" to sessionId, "data" to data))
+                        }
                     }
                 }
             } catch (error: IOException) {
                 if (generation.get() == token) {
-                    mainHandler.post { channel.invokeMethod("error", readableError(error)) }
+                    mainHandler.post {
+                        channel.invokeMethod("error", mapOf("sessionId" to sessionId, "message" to readableError(error)))
+                    }
                 }
             } finally {
-                if (generation.compareAndSet(token, token + 1)) {
-                    socket = null
-                    try { activeSocket.close() } catch (_: Exception) {}
-                    mainHandler.post { channel.invokeMethod("disconnected", null) }
+                synchronized(this@ClassicSppChannelHandler) {
+                    if (generation.compareAndSet(token, token + 1)) {
+                        if (socket === activeSocket) socket = null
+                        mainHandler.post {
+                            channel.invokeMethod("disconnected", mapOf("sessionId" to sessionId))
+                        }
+                    }
                 }
+                try { activeSocket.close() } catch (_: Exception) {}
             }
         }
     }
@@ -140,6 +158,7 @@ class ClassicSppChannelHandler private constructor(
         }
     }
 
+    @Synchronized
     private fun closeCurrentSocket() {
         generation.incrementAndGet()
         closeSocketOnly()

@@ -14,6 +14,7 @@ class FakeMain implements MainOtaTransport {
   final connection = StreamController<bool>.broadcast(sync: true);
   final commands = <String>[];
   bool disconnectOnStart = true;
+  bool errorBeforeReceiving = false;
   @override
   bool connected = true;
   @override
@@ -26,6 +27,9 @@ class FakeMain implements MainOtaTransport {
   Future<void> control(String command) async {
     commands.add(command);
     if (command.startsWith('OTA_START')) {
+      if (errorBeforeReceiving) {
+        status.add({'state': 'error', 'code': 'invalid_size'});
+      }
       status.add({'state': 'receiving'});
       if (disconnectOnStart) {
         connected = false;
@@ -46,6 +50,9 @@ class FakeSpp implements SppOtaTransport {
   final commands = <String>[];
   final frames = <List<int>>[];
   bool disconnectOnData = false;
+  bool hangWrite = false;
+  bool hangFinish = false;
+  bool hangClose = false;
   bool finishError = false;
   bool finishSilent = false;
   bool sendReceivingStatus = true;
@@ -76,6 +83,7 @@ class FakeSpp implements SppOtaTransport {
         status.add({'state': 'receiving', 'received': 0, 'total': ackTotal});
       }
     } else if (command == 'FINISH' && !finishSilent) {
+      if (hangFinish) return Completer<void>().future;
       status.add({'state': 'verifying'});
       status.add(
         finishError
@@ -90,6 +98,7 @@ class FakeSpp implements SppOtaTransport {
   @override
   Future<void> write(List<int> frame) async {
     frames.add(frame);
+    if (hangWrite) return Completer<void>().future;
     if (errorOnFirstFrame && frames.length == 1) {
       status.add({'state': 'error', 'code': 'queue_full'});
       // Keep the write pending briefly so the OTA runner must observe the
@@ -116,6 +125,7 @@ class FakeSpp implements SppOtaTransport {
   @override
   Future<void> close() async {
     closed = true;
+    if (hangClose) return Completer<void>().future;
     if (connected) {
       connected = false;
       disconnect.add(null);
@@ -137,6 +147,66 @@ void main() {
     stateTimeout: const Duration(milliseconds: 100),
     finishTimeout: const Duration(milliseconds: 100),
   );
+
+  test('reconnect backoff caps radio activity and resets after success', () {
+    final backoff = BleReconnectBackoff();
+    expect(List.generate(6, (_) => backoff.nextDelay().inSeconds), [
+      15,
+      30,
+      60,
+      120,
+      120,
+      120,
+    ]);
+    backoff.reset();
+    expect(backoff.nextDelay(), const Duration(seconds: 15));
+  });
+
+  test(
+    'Main terminal error cannot be cleared by a later receiving status',
+    () async {
+      final main = FakeMain()..errorBeforeReceiving = true;
+      final spp = FakeSpp();
+      try {
+        await expectLater(
+          runner(main, spp).run(Stream.value([1]), 1, hash),
+          throwsA(isA<StateError>()),
+        );
+        expect(spp.commands, isEmpty);
+      } finally {
+        await main.dispose();
+        await spp.dispose();
+      }
+    },
+  );
+
+  for (final phase in ['write', 'finish', 'close']) {
+    test('SPP $phase cannot leave OTA pending indefinitely', () async {
+      final spp = FakeSpp()
+        ..hangWrite = phase == 'write'
+        ..hangFinish = phase == 'finish'
+        ..hangClose = phase == 'close';
+      final transfer = SppRecoveryOta(
+        connectSpp: () async => spp,
+        stateTimeout: const Duration(milliseconds: 40),
+        ackTimeout: const Duration(milliseconds: 40),
+        frameDelay: Duration.zero,
+      );
+      try {
+        final result = transfer
+            .run(Stream.value([1]), 1, hash)
+            .timeout(const Duration(seconds: 1));
+        if (phase == 'close') {
+          await result;
+        } else {
+          await expectLater(result, throwsA(isA<TimeoutException>()));
+        }
+        expect(spp.closed, isTrue);
+      } finally {
+        await spp.dispose();
+      }
+    });
+  }
 
   test(
     'First launch is manual; remembered MAC permits reconnect only when idle',

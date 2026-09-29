@@ -65,6 +65,8 @@ class MapStateService {
   }
 
   void saveMapStateDebounced(String key, MapState state) {
+    // Collapse/reopen may happen before the disk debounce fires.
+    _memoryCache[key] = state;
     _pendingStates[key] = state;
     _saveTimers[key]?.cancel();
     _saveTimers[key] = Timer(const Duration(milliseconds: 250), () {

@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 import 'package:lbjconsole/models/firmware_board.dart';
 
 import 'ble_service.dart';
+import 'classic_spp_service.dart';
 import 'ble_diagnostics.dart';
 import 'file_share_api.dart';
 import 'http_download.dart';
@@ -89,6 +90,23 @@ class FirmwareOtaService {
     void Function(double progress)? onProgress,
     void Function(Map<String, dynamic> state)? onState,
   }) async {
+    if (!ClassicSppService.isSupported) {
+      throw UnsupportedError('当前平台不支持 Classic Bluetooth SPP OTA');
+    }
+    if (!_bleService.isConnected) throw StateError('请先连接蓝牙设备');
+    final targetAddress = _bleService.connectedDeviceAddress;
+    void checkTarget() {
+      if (!_bleService.isConnected ||
+          _bleService.connectedDeviceAddress != targetAddress) {
+        throw StateError('下载期间蓝牙设备已变更，请重新检查固件');
+      }
+      final reportedBoard = _bleService.firmwareBoard;
+      if (reportedBoard != null && reportedBoard != update.board) {
+        throw StateError('固件型号与已连接设备不一致');
+      }
+    }
+
+    checkTarget();
     final downloaded = await _fetchFirmware(
       update,
       logMessage: 'Download firmware',
@@ -97,6 +115,7 @@ class FirmwareOtaService {
     );
     final firmware = downloaded.$1;
     final digest = downloaded.$2;
+    checkTarget();
     await _bleService.startFirmwareOta(
       firmware,
       sha256: digest,

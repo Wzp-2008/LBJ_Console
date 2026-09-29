@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_classic_bluetooth/flutter_classic_bluetooth.dart';
 
 import 'ble_diagnostics.dart';
@@ -169,6 +170,13 @@ class ClassicSppDiscoverySession {
 }
 
 class ClassicSppService {
+  static bool get isSupported => Platform.isAndroid || Platform.isWindows;
+
+  @visibleForTesting
+  static Future<ClassicSppConnection> connectAndroidForTesting(
+    String address,
+  ) => _AndroidSppConnection.open(address);
+
   static Future<ClassicSppConnection> connect(String address) async {
     if (Platform.isAndroid) return _AndroidSppConnection.open(address);
     if (Platform.isWindows) return _WindowsSppConnection.open(address);
@@ -249,11 +257,14 @@ class _AndroidSppConnection implements ClassicSppConnection {
   _AndroidSppConnection._();
 
   static const _channel = MethodChannel('lbjconsole/classic_spp');
+  static int _nextSessionId = 0;
+  final int _sessionId = _nextSessionId++;
   static _AndroidSppConnection? _active;
   final _data = StreamController<List<int>>();
   final _disconnected = StreamController<void>.broadcast();
   bool _connected = false;
   bool _closed = false;
+  bool _remoteDisconnected = false;
 
   static Future<_AndroidSppConnection> open(String address) async {
     await _active?.close();
@@ -262,27 +273,37 @@ class _AndroidSppConnection implements ClassicSppConnection {
     _channel.setMethodCallHandler((call) async {
       final current = _active;
       if (current == null || current._closed) return;
+      final event = call.arguments;
+      if (event is! Map || event['sessionId'] != current._sessionId) return;
       switch (call.method) {
         case 'data':
-          current._data.add(List<int>.from(call.arguments as Uint8List));
+          current._data.add(List<int>.from(event['data'] as Uint8List));
           break;
         case 'disconnected':
           current._markDisconnected();
           break;
         case 'error':
-          BleDiagnostics.log('Android SPP: ${call.arguments}');
+          BleDiagnostics.log('Android SPP: ${event['message']}');
           break;
       }
     });
     try {
       await _channel
-          .invokeMethod<void>('connect', {'address': address})
+          .invokeMethod<void>('connect', {
+            'address': address,
+            'sessionId': connection._sessionId,
+          })
           .timeout(const Duration(seconds: 30));
+      if (connection._remoteDisconnected || connection._closed) {
+        throw StateError('Classic SPP 在连接完成前已断开');
+      }
       connection._connected = true;
       return connection;
     } catch (_) {
       try {
-        await _channel.invokeMethod<void>('disconnect');
+        if (identical(_active, connection)) {
+          await _channel.invokeMethod<void>('disconnect');
+        }
       } catch (_) {}
       connection._closed = true;
       if (identical(_active, connection)) _active = null;
@@ -296,6 +317,7 @@ class _AndroidSppConnection implements ClassicSppConnection {
   }
 
   void _markDisconnected() {
+    _remoteDisconnected = true;
     if (!_connected) return;
     _connected = false;
     _disconnected.add(null);
@@ -309,9 +331,14 @@ class _AndroidSppConnection implements ClassicSppConnection {
   bool get isConnected => _connected && !_closed;
 
   @override
-  Future<void> write(List<int> bytes) => _channel
-      .invokeMethod<void>('write', {'data': Uint8List.fromList(bytes)})
-      .timeout(const Duration(seconds: 20));
+  Future<void> write(List<int> bytes) {
+    if (!isConnected || !identical(_active, this)) {
+      throw StateError('Classic SPP 已断开');
+    }
+    return _channel
+        .invokeMethod<void>('write', {'data': Uint8List.fromList(bytes)})
+        .timeout(const Duration(seconds: 20));
+  }
 
   @override
   Future<void> close() async {
@@ -319,10 +346,13 @@ class _AndroidSppConnection implements ClassicSppConnection {
     _closed = true;
     _connected = false;
     try {
-      await _channel.invokeMethod<void>('disconnect');
+      if (identical(_active, this)) {
+        await _channel.invokeMethod<void>('disconnect');
+      }
     } catch (_) {}
     if (identical(_active, this)) _active = null;
-    await _data.close();
+    // No listener is attached yet when a pending open is superseded.
+    unawaited(_data.close());
     await _disconnected.close();
   }
 }
@@ -435,11 +465,13 @@ class _ClassicSppOtaTransport implements SppOtaTransport {
             if (!_ready.isCompleted) _ready.complete();
             continue;
           }
-          BleDiagnostics.log('SPP receive: $line');
           if (!line.startsWith('{')) continue;
           final decoded = jsonDecode(line);
           if (decoded is! Map) continue;
           final message = Map<String, dynamic>.from(decoded);
+          if (message['state'] != 'ack') {
+            BleDiagnostics.log('SPP receive: $line');
+          }
           if (message['state'] == 'idle' && !_ready.isCompleted) {
             _ready.complete();
           }
@@ -487,7 +519,6 @@ class _ClassicSppOtaTransport implements SppOtaTransport {
 
   @override
   Future<void> write(List<int> frame) async {
-    BleDiagnostics.log('SPP data write ${frame.length} bytes');
     await connection.write(frame);
   }
 

@@ -344,7 +344,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
           ),
           const SizedBox(height: 16),
-          Platform.isWindows
+          !Platform.isAndroid
               ? const SizedBox()
               : Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -374,7 +374,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ),
                   ],
                 ),
-          SizedBox(height: Platform.isWindows ? 0 : 16),
+          SizedBox(height: Platform.isAndroid ? 16 : 0),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [

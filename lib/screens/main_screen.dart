@@ -81,12 +81,14 @@ class _LastReceivedTimeWidget extends StatefulWidget {
       _LastReceivedTimeWidgetState();
 }
 
-class _LastReceivedTimeWidgetState extends State<_LastReceivedTimeWidget> {
+class _LastReceivedTimeWidgetState extends State<_LastReceivedTimeWidget>
+    with WidgetsBindingObserver {
   Timer? _timer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _startTimer();
   }
 
@@ -101,13 +103,33 @@ class _LastReceivedTimeWidgetState extends State<_LastReceivedTimeWidget> {
 
   void _startTimer() {
     _timer?.cancel();
-    if (widget.lastReceivedTime != null && widget.isConnected) {
-      _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (widget.lastReceivedTime != null &&
+        widget.isConnected &&
+        (lifecycle == null || lifecycle == AppLifecycleState.resumed)) {
+      final elapsed = DateTime.now()
+          .difference(widget.lastReceivedTime!)
+          .inSeconds;
+      final interval = elapsed >= 86400
+          ? 86400
+          : elapsed >= 3600
+          ? 3600
+          : elapsed >= 60
+          ? 60
+          : 1;
+      _timer = Timer(Duration(seconds: interval - elapsed % interval), () {
         if (mounted) {
           setState(() {});
+          _startTimer();
         }
       });
     }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _startTimer();
+    if (state == AppLifecycleState.resumed && mounted) setState(() {});
   }
 
   String _formatTime() {
@@ -130,6 +152,7 @@ class _LastReceivedTimeWidgetState extends State<_LastReceivedTimeWidget> {
   @override
   void dispose() {
     _timer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -636,12 +659,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _checkAndStartBackgroundService() async {
-    final settings = await DatabaseService.instance.getAllSettings() ?? {};
-    final backgroundServiceEnabled =
-        (settings['backgroundServiceEnabled'] ?? 0) == 1;
-
-    if (backgroundServiceEnabled) {
-      await BackgroundService.startService();
+    try {
+      final settings = await DatabaseService.instance.getAllSettings() ?? {};
+      if ((settings['backgroundServiceEnabled'] ?? 0) == 1) {
+        await BackgroundService.startService();
+      }
+    } catch (error, stack) {
+      developer.log('后台服务启动失败：$error', name: 'MainScreen', stackTrace: stack);
     }
   }
 
@@ -659,6 +683,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   void _setupConnectionListener() {
     _connectionSubscription = _bleService.connectionStream.listen((connected) {
+      if (connected) unawaited(_checkAndStartBackgroundService());
       if (mounted) {
         setState(() {
           _isConnected = connected;
@@ -687,6 +712,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _bleService.onAppResume();
+      _loadRecordCount();
     }
   }
 
@@ -718,9 +744,18 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   void _processRecord(TrainRecord record) {
-    _notificationService.showTrainNotification(record);
+    unawaited(
+      _notificationService.showTrainNotification(record).catchError((
+        Object error,
+        StackTrace stack,
+      ) {
+        developer.log('发送列车通知失败：$error', name: 'MainScreen', stackTrace: stack);
+      }),
+    );
     _historyScreenKey.currentState?.addNewRecord(record);
-    _scheduleRecordCountRefresh();
+    if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+      _scheduleRecordCountRefresh();
+    }
   }
 
   void _showConnectionDialog() {
@@ -728,16 +763,17 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     showDialog(
       context: context,
       barrierDismissible: true,
-      builder: (context) =>
-          _PixelPerfectBluetoothDialog(
-            bleService: _bleService,
-            sessionFirmwareBoard: _sessionFirmwareBoard,
-          ),
+      builder: (context) => _PixelPerfectBluetoothDialog(
+        bleService: _bleService,
+        sessionFirmwareBoard: _sessionFirmwareBoard,
+      ),
     ).then((_) {
+      unawaited(
+        _bleService.stopScan().catchError((Object error, StackTrace stack) {
+          BleDiagnostics.log('关闭蓝牙扫描失败', error, stack);
+        }),
+      );
       _bleService.setAutoConnectBlocked(false);
-      if (!_bleService.isManualDisconnect) {
-        _bleService.ensureConnection();
-      }
     });
   }
 
@@ -867,6 +903,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     final pages = [
       HistoryScreen(
         key: _historyScreenKey,
+        active: _currentIndex == 0,
         onEditModeChanged: _handleHistoryEditModeChanged,
         onSelectionChanged: _handleSelectionChanged,
       ),
@@ -906,12 +943,15 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
         ),
         selectedIndex: _currentIndex,
         onDestinationSelected: (index) {
+          if (_currentIndex == index) return;
           if (index == 0) {
-            _historyScreenKey.currentState?.reloadRecords();
             _loadRecordCount();
           }
           setState(() {
-            if (_isHistoryEditMode) _isHistoryEditMode = false;
+            if (_isHistoryEditMode) {
+              _historyScreenKey.currentState?.setEditMode(false);
+              _isHistoryEditMode = false;
+            }
             _currentIndex = index;
           });
         },
@@ -1003,9 +1043,10 @@ class _RescueDevicePickerDialogState extends State<RescueDevicePickerDialog> {
     final visibleCount =
         _visiblePairedDevices.length + _visibleUnpairedDevices.length;
     if (scanning) {
-      final recoveryCount = [..._pairedDevices, ..._unpairedDevices]
-          .where((device) => device.isRecoveryDevice)
-          .length;
+      final recoveryCount = [
+        ..._pairedDevices,
+        ..._unpairedDevices,
+      ].where((device) => device.isRecoveryDevice).length;
       _status = _showAllDevices
           ? '正在搜索蓝牙设备，已发现 $allCount 台'
           : '正在搜索救砖设备，已发现 $recoveryCount 台匹配设备（全部设备 $allCount 台）';

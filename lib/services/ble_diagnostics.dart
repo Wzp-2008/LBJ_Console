@@ -13,7 +13,7 @@ class BleDiagnostics {
     final line =
         '${DateTime.now().toIso8601String()} [BLE] $message'
         '${error == null ? '' : ' | $error'}${stack == null ? '' : '\n$stack'}';
-    debugPrint(line);
+    if (kDebugMode) debugPrint(line);
     developer.log(message, name: 'LBJ.BLE', error: error, stackTrace: stack);
     _pending = _pending
         .then((_) async {
@@ -24,7 +24,7 @@ class BleDiagnostics {
           await file.writeAsString(
             '$line\n',
             mode: FileMode.append,
-            flush: true,
+            flush: error != null,
           );
         })
         .catchError((Object e) {

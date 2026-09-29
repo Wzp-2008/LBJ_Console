@@ -103,17 +103,13 @@ Future<int> _waitForSppAck({
   required int expectedReceived,
   required Duration timeout,
   required Future<Object> terminalError,
+  required Future<void> Function() waitForAck,
 }) async {
-  final watch = Stopwatch()..start();
-  while (pendingAcks.isEmpty) {
-    final remaining = timeout - watch.elapsed;
-    if (remaining <= Duration.zero) {
-      throw SppAckTimeoutException(expectedReceived, timeout);
-    }
-    final wait = remaining < const Duration(milliseconds: 20)
-        ? remaining
-        : const Duration(milliseconds: 20);
-    await _raceSppOperation(Future<void>.delayed(wait), terminalError);
+  if (pendingAcks.isEmpty) {
+    await _raceSppOperation(waitForAck(), terminalError).timeout(
+      timeout,
+      onTimeout: () => throw SppAckTimeoutException(expectedReceived, timeout),
+    );
   }
 
   final received = pendingAcks.removeAt(0);
@@ -168,6 +164,7 @@ Future<void> _runSppTransfer({
   Object? error;
   var success = false;
   final pendingAcks = <int>[];
+  Completer<void>? ackAvailable;
   final terminalError = Completer<Object>();
   var remoteFailure = false;
 
@@ -183,7 +180,7 @@ Future<void> _runSppTransfer({
 
   void handleState(Map<String, dynamic> state) {
     lastState = state;
-    log?.call('OTA status=$state');
+    if (state['state'] != 'ack') log?.call('OTA status=$state');
     final stateError = _otaStateError(state);
     if (stateError != null) {
       error = stateError;
@@ -205,10 +202,17 @@ Future<void> _runSppTransfer({
           ),
         );
       } else {
+        if (pendingAcks.isNotEmpty) {
+          fail(StateError('Updater 在发送下一块数据前重复发送 ACK'));
+          return;
+        }
         pendingAcks.add(received);
+        final waiting = ackAvailable;
+        ackAvailable = null;
+        waiting?.complete();
       }
     }
-    onState?.call(state);
+    if (state['state'] != 'ack') onState?.call(state);
   }
 
   Future<void> waitFor(bool Function() condition, Duration timeout) async {
@@ -267,12 +271,15 @@ Future<void> _runSppTransfer({
     disconnectSubscription = spp.disconnected.listen((_) {
       if (!success) fail(StateError(otaErrorLabel('disconnected')));
     });
-    await spp.ready.timeout(stateTimeout);
+    await _raceSppOperation(
+      spp.ready,
+      terminalError.future,
+    ).timeout(stateTimeout);
 
     lastState = null;
     emit('receiving');
     await _raceSppOperation(
-      spp.control('OTA_START $total $sha256'),
+      spp.control('OTA_START $total $sha256').timeout(stateTimeout),
       terminalError.future,
     );
     final receivingWatch = Stopwatch()..start();
@@ -302,7 +309,7 @@ Future<void> _runSppTransfer({
         throw StateError('固件文件在传输时发生变化');
       }
       await _raceSppOperation(
-        spp.write(otaSppFrame(payload)),
+        spp.write(otaSppFrame(payload)).timeout(ackTimeout),
         terminalError.future,
       );
       sent += payload.length;
@@ -311,6 +318,7 @@ Future<void> _runSppTransfer({
         expectedReceived: sent,
         timeout: ackTimeout,
         terminalError: terminalError.future,
+        waitForAck: () => (ackAvailable ??= Completer<void>()).future,
       );
       onProgress?.call(sent / total);
       if (frameDelay > Duration.zero) {
@@ -324,14 +332,17 @@ Future<void> _runSppTransfer({
     if (sent != total) throw StateError('固件文件读取不完整');
 
     emit('verifying');
-    await _raceSppOperation(spp.control('FINISH'), terminalError.future);
+    await _raceSppOperation(
+      spp.control('FINISH').timeout(stateTimeout),
+      terminalError.future,
+    );
     await waitFor(() => success, finishTimeout);
     emit('success');
   } catch (value) {
     final ackTimedOut = value is SppAckTimeoutException;
     if (ackTimedOut && spp?.connected == true) {
       try {
-        await spp!.close();
+        await spp!.close().timeout(stateTimeout);
       } catch (_) {}
     }
     if (spp?.connected == true &&
@@ -340,14 +351,18 @@ Future<void> _runSppTransfer({
         !ackTimedOut &&
         (phase == 'receiving' || phase == 'verifying')) {
       try {
-        await spp!.control('CANCEL');
+        await spp!.control('CANCEL').timeout(stateTimeout);
       } catch (_) {}
     }
     rethrow;
   } finally {
     await stateSubscription?.cancel();
     await disconnectSubscription?.cancel();
-    await spp?.close();
+    try {
+      await spp?.close().timeout(stateTimeout);
+    } catch (error) {
+      log?.call('SPP cleanup failed: $error');
+    }
   }
 }
 
@@ -467,7 +482,7 @@ class RecoveryOta {
   void _handleState(Map<String, dynamic> state) {
     _lastState = state;
     log?.call('OTA status=$state');
-    _error = _otaStateError(state);
+    _error ??= _otaStateError(state);
   }
 
   Future<void> run(Stream<List<int>> firmware, int total, String sha256) async {
@@ -487,7 +502,7 @@ class RecoveryOta {
     });
     try {
       _emit('starting');
-      await mainTransport.control(start);
+      await mainTransport.control(start).timeout(stateTimeout);
       await _waitForOtaState(
         condition: () =>
             _lastState?['state'] == 'receiving' || mainDisconnected,
@@ -524,7 +539,7 @@ class RecoveryOta {
     } catch (error) {
       if (!mainDisconnected && mainTransport.connected) {
         try {
-          await mainTransport.control('CANCEL');
+          await mainTransport.control('CANCEL').timeout(stateTimeout);
         } catch (_) {}
       }
       rethrow;

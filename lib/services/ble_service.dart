@@ -77,6 +77,9 @@ class BLEService {
   bool _isAutoConnectBlocked = false;
 
   Timer? _heartbeatTimer;
+  final _reconnectBackoff = BleReconnectBackoff();
+  int _recordSequence = 0;
+  int _scanGeneration = 0;
   final BleJsonDecoder _dataDecoder = BleJsonDecoder();
   final BleJsonDecoder _otaDecoder = BleJsonDecoder();
   BluetoothCharacteristic? _otaControlCharacteristic;
@@ -85,6 +88,7 @@ class BLEService {
 
   Future<void> initialize() async {
     if (_initialized) return;
+    if (Platform.isLinux) return; // No Linux backend in flutter_blue_plus.
     _initialized = true;
     await _loadSettings();
     BleDiagnostics.log(
@@ -94,19 +98,31 @@ class BLEService {
       BleDiagnostics.log('Adapter state=$state');
       _adapterOn = state == BluetoothAdapterState.on;
       if (state == BluetoothAdapterState.on) {
+        _reconnectBackoff.reset();
         ensureConnection();
       } else {
         _onDisconnected(attemptReconnect: false);
-        stopScan();
+        unawaited(
+          stopScan().catchError((Object error, StackTrace stack) {
+            BleDiagnostics.log('Stop scan failed', error, stack);
+          }),
+        );
       }
     });
-    _startHeartbeat();
     ensureConnection();
   }
 
   void _startHeartbeat() {
     _heartbeatTimer?.cancel();
-    _heartbeatTimer = Timer.periodic(const Duration(seconds: 7), (timer) {
+    if (!_adapterOn ||
+        isConnected ||
+        _isManualDisconnect ||
+        _isAutoConnectBlocked ||
+        _otaActive) {
+      return;
+    }
+    _heartbeatTimer = Timer(_reconnectBackoff.nextDelay(), () {
+      _heartbeatTimer = null;
       ensureConnection();
     });
   }
@@ -132,6 +148,11 @@ class BLEService {
       blocked: _isAutoConnectBlocked,
       otaActive: _otaActive,
     )) {
+      return;
+    }
+    if (_heartbeatTimer?.isActive == true) return;
+    if (FlutterBluePlus.isScanningNow) {
+      _startHeartbeat();
       return;
     }
     _tryReconnectDirectly();
@@ -161,6 +182,10 @@ class BLEService {
     } catch (e, stack) {
       BleDiagnostics.log("Reconnect failed", e, stack);
       _isConnecting = false;
+    } finally {
+      if (!isConnected && _heartbeatTimer?.isActive != true) {
+        _startHeartbeat();
+      }
     }
   }
 
@@ -168,14 +193,18 @@ class BLEService {
     Duration? timeout,
     Function(List<BluetoothDevice>)? onScanResults,
   }) async {
+    if (Platform.isLinux) throw UnsupportedError('当前平台没有可用的 BLE 后端');
+    final generation = ++_scanGeneration;
     BleDiagnostics.log('BLE scan start timeout=${timeout ?? 'default'}');
     if (FlutterBluePlus.isScanningNow) {
       await FlutterBluePlus.stopScan();
     }
 
-    _scanResultsSubscription?.cancel();
+    await _scanResultsSubscription?.cancel();
+    if (generation != _scanGeneration) return;
     final reportedAddresses = <String>{};
     _scanResultsSubscription = FlutterBluePlus.scanResults.listen((results) {
+      if (generation != _scanGeneration) return;
       final allFoundDevices = results.map((r) => r.device).toList();
 
       final newlyReported = <String>[];
@@ -206,8 +235,10 @@ class BLEService {
 
       for (var device in allFoundDevices) {
         if (_shouldAutoConnectTo(device)) {
-          stopScan();
-          connect(device).catchError((Object error, StackTrace stack) {
+          _connectScanResult(device).catchError((
+            Object error,
+            StackTrace stack,
+          ) {
             BleDiagnostics.log("Automatic connection failed", error, stack);
           });
           break;
@@ -216,12 +247,18 @@ class BLEService {
     });
 
     try {
-      await FlutterBluePlus.startScan(timeout: timeout);
+      await FlutterBluePlus.startScan(
+        timeout: timeout ?? const Duration(seconds: 10),
+      );
       BleDiagnostics.log(
         'BLE scan command accepted resultsSeen=${reportedAddresses.length}',
       );
     } catch (e, stack) {
       BleDiagnostics.log("Scan failed", e, stack);
+      if (generation == _scanGeneration) {
+        await _scanResultsSubscription?.cancel();
+        _scanResultsSubscription = null;
+      }
       rethrow;
     }
   }
@@ -231,9 +268,24 @@ class BLEService {
       _lastKnownDeviceAddress!.toUpperCase() ==
           device.remoteId.str.toUpperCase();
 
+  Future<void> _connectScanResult(BluetoothDevice device) async {
+    await stopScan();
+    if (_isAutoConnectBlocked || _isManualDisconnect || _otaActive) return;
+    await connect(device);
+  }
+
   Future<void> stopScan() async {
-    await FlutterBluePlus.stopScan();
-    _scanResultsSubscription?.cancel();
+    ++_scanGeneration;
+    final subscription = _scanResultsSubscription;
+    _scanResultsSubscription = null;
+    await subscription?.cancel();
+    if (Platform.isLinux) return;
+    try {
+      await FlutterBluePlus.stopScan();
+    } catch (error, stack) {
+      // Adapter shutdown can reject stopScan. Still finish GATT cleanup.
+      BleDiagnostics.log('Stop scan failed', error, stack);
+    }
     BleDiagnostics.log('BLE scan stop requested');
   }
 
@@ -272,11 +324,11 @@ class BLEService {
 
     try {
       await _connectionStateSubscription?.cancel();
-      var firstAndroidConnectionState = Platform.isAndroid;
+      var firstConnectionState = true;
       _connectionStateSubscription = device.connectionState.listen((state) {
-        if (firstAndroidConnectionState) {
-          firstAndroidConnectionState = false;
-          // Android immediately replays the state that existed when the
+        if (firstConnectionState) {
+          firstConnectionState = false;
+          // Backends replay the state that existed when the
           // listener was attached. A fresh attempt normally starts with this
           // value; it is not a real disconnect and must not invalidate the
           // attempt. If the replay is `connected`, keep processing later
@@ -450,7 +502,18 @@ class BLEService {
       }
 
       // Windows queries the negotiated size; it does not update mtuNow.
-      _negotiatedMtu = await device.requestMtu(247);
+      if (Platform.isAndroid || Platform.isWindows) {
+        try {
+          _negotiatedMtu = await device.requestMtu(247);
+        } catch (error, stack) {
+          // MTU negotiation failure must not prevent ordinary reception.
+          _negotiatedMtu = max(23, device.mtuNow);
+          BleDiagnostics.log('MTU negotiation unavailable', error, stack);
+        }
+      } else {
+        // CoreBluetooth negotiates MTU automatically and rejects requestMtu.
+        _negotiatedMtu = max(23, device.mtuNow);
+      }
       _checkConnectionAttempt(generation, device);
       BleDiagnostics.log(
         'GATT ready MAC=${device.remoteId.str} MTU=$_negotiatedMtu OTA=${otaControl != null}',
@@ -542,13 +605,16 @@ class BLEService {
 
     _isConnecting = false;
     _connectingDevice = null;
+    _startHeartbeat();
     // Heartbeat retries; do not recursively reconnect inside failure cleanup.
   }
 
   Future<void> connectManually(BluetoothDevice device) async {
+    if (_otaActive) throw StateError("固件升级期间不能切换设备");
     _isManualDisconnect = false;
     _isAutoConnectBlocked = false;
-    if (_otaActive) throw StateError("固件升级期间不能切换设备");
+    _heartbeatTimer?.cancel();
+    _reconnectBackoff.reset();
     await stopScan();
     await connect(device);
   }
@@ -620,6 +686,9 @@ class BLEService {
     void Function(Map<String, dynamic> state)? onState,
     void Function(double progress)? onProgress,
   }) async {
+    if (!ClassicSppService.isSupported) {
+      throw UnsupportedError('当前平台不支持 Classic Bluetooth SPP OTA');
+    }
     final address = _connectedDevice?.remoteId.str;
     if (!isConnected || _otaControlCharacteristic == null || address == null) {
       throw StateError('Main OTA 控制服务不可用，请先连接支持 OTA 的接收机');
@@ -746,7 +815,7 @@ class BLEService {
         final now = DateTime.now();
         final recordData = decoded;
         recordData['uniqueId'] =
-            '${now.millisecondsSinceEpoch}_${Random().nextInt(9999)}';
+            '${now.microsecondsSinceEpoch}_${_recordSequence++}';
         recordData['receivedTimestamp'] = now.millisecondsSinceEpoch;
 
         if (!recordData.containsKey('timestamp')) {
@@ -757,7 +826,6 @@ class BLEService {
         _lastReceivedTimeController.add(_lastReceivedTime);
 
         final trainRecord = TrainRecord.fromJson(recordData);
-        _dataController.add(trainRecord);
         unawaited(_persistRecord(trainRecord));
       }
     } catch (e, stack) {
@@ -768,6 +836,8 @@ class BLEService {
   Future<void> _persistRecord(TrainRecord record) async {
     try {
       await DatabaseService.instance.insertRecord(record);
+      // Consumers query the merge cache immediately, so publish after commit.
+      _dataController.add(record);
     } catch (e, stack) {
       BleDiagnostics.log('BLE 记录保存失败', e, stack);
     }
@@ -782,6 +852,8 @@ class BLEService {
   void _updateConnectionState(bool connected, String status) {
     _gattReady = connected;
     if (connected) {
+      _heartbeatTimer?.cancel();
+      _reconnectBackoff.reset();
       _deviceStatus = "已连接";
     } else {
       _deviceStatus = status;
@@ -798,11 +870,18 @@ class BLEService {
   }
 
   void onAppResume() {
+    _heartbeatTimer?.cancel();
+    _reconnectBackoff.reset();
     ensureConnection();
   }
 
   void setAutoConnectBlocked(bool blocked) {
     _isAutoConnectBlocked = blocked;
+    if (blocked) {
+      _heartbeatTimer?.cancel();
+    } else {
+      _startHeartbeat();
+    }
   }
 
   bool get isConnected =>
