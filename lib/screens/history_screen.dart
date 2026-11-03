@@ -1968,7 +1968,7 @@ class _DelayedMapState extends State<_DelayedMap> {
       mapController: _mapController,
       children: [
         TileLayer(
-          urlTemplate: 'https://tile-osm.mirror.wzpmc.email/{z}/{x}/{y}.png',
+          urlTemplate: 'https://tile-osm.mirror.wzpmc.win/{z}/{x}/{y}.png',
           userAgentPackageName: 'org.noxylva.lbjconsole',
         ),
         MarkerLayer(markers: markers),
